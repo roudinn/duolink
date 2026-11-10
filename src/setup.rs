@@ -215,7 +215,8 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
 fn write_script(path: &Path, body: &str) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
-    bytes.extend_from_slice(body.replace('\n', "\r\n").as_bytes());
+    // Normalise first: a CRLF checkout must not turn into CR CR LF.
+    bytes.extend_from_slice(body.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
     fs::write(path, bytes)?;
     Ok(())
 }
