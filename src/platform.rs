@@ -333,7 +333,7 @@ impl Route {
     }
 }
 
-fn tailscale_cli() -> Option<PathBuf> {
+pub fn tailscale_cli() -> Option<PathBuf> {
     [std::env::var_os("ProgramFiles"), std::env::var_os("ProgramW6432")]
         .into_iter()
         .flatten()

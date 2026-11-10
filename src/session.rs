@@ -41,7 +41,7 @@ pub enum Event {
     Finished { message: String, failed: bool },
 }
 
-struct Worker {
+pub(crate) struct Worker {
     events: Sender<Event>,
     cancelled: Arc<AtomicBool>,
 }
@@ -51,7 +51,7 @@ impl Worker {
         let _ = self.events.send(event);
     }
 
-    fn status(&self, message: impl Into<String>) {
+    pub(crate) fn status(&self, message: impl Into<String>) {
         self.emit(Event::Status(message.into()));
     }
 
@@ -75,7 +75,7 @@ impl Worker {
         });
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         ensure!(!self.cancelled.load(Ordering::Relaxed), "Сессия завершена.");
         Ok(())
     }
@@ -89,7 +89,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn start(run: impl FnOnce(&Worker, Receiver<bool>) -> Result<String> + Send + 'static) -> Self {
+    pub(crate) fn start(run: impl FnOnce(&Worker, Receiver<bool>) -> Result<String> + Send + 'static) -> Self {
         let (events, receiver) = mpsc::channel();
         let (decision, decisions) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -457,7 +457,7 @@ fn guest(
                 certificate,
                 mode,
             }) if stream.is_none() && valid_pem(&certificate) => {
-                let mode = preferences.mode(mode);
+                let mode = preferences.mode(mode, display_mode().ok());
                 ensure!(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Получен неверный режим видео."

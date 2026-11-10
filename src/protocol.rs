@@ -230,9 +230,9 @@ pub enum Reply {
 #[serde(rename_all = "snake_case")]
 pub enum Profile {
     /// Fastest encoder presets, Moonlight's reference bitrate.
+    #[default]
     Latency,
     /// Fast presets with extra bitrate headroom.
-    #[default]
     Balanced,
     /// Slower presets and a high bitrate for the cleanest image.
     Quality,

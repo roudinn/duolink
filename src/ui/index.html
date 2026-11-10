@@ -9,53 +9,85 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="top">
-    <span class="wordmark">DuoLink</span>
-    <div class="switch" role="tablist" aria-label="Роль">
-      <button type="button" id="host-tab" role="tab" aria-selected="true" aria-controls="host-panel" data-role="host">Хост<i id="host-dot" hidden></i></button>
-      <button type="button" id="guest-tab" role="tab" aria-selected="false" aria-controls="guest-panel" tabindex="-1" data-role="guest">Гость<i id="guest-dot" hidden></i></button>
+  <header class="bar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9.2" cy="12" r="5" class="fill"/><circle cx="14.8" cy="12" r="4.4" class="ring"/></svg>
+      DuoLink
     </div>
-    <button type="button" class="btn ghost" data-action="setup">Настройка</button>
+    <button type="button" class="icon-btn" data-action="settings" aria-label="Настройки" title="Настройки">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+    </button>
   </header>
 
   <main>
-    <!-- HOST -->
-    <section id="host-panel" role="tabpanel" aria-labelledby="host-tab">
-      <div id="host-form" class="stack">
-        <div class="field">
+    <!-- Home -->
+    <div id="home" class="column">
+      <section id="prepare" class="card" hidden>
+        <div class="card-head">
+          <h2>Подготовка</h2>
+          <span id="prepare-count" class="muted"></span>
+        </div>
+        <ul class="checklist">
+          <li id="c-engines"><span class="mark"></span><div><b>Движки стриминга</b><small>Sunshine и Moonlight</small></div><em></em></li>
+          <li id="c-vigem"><span class="mark"></span><div><b>Драйвер геймпада</b><small>Чтобы игра увидела второго игрока</small></div><em></em></li>
+          <li id="c-tailscale"><span class="mark"></span><div><b>Tailscale</b><small>Прямое соединение через интернет</small></div><em></em></li>
+          <li id="c-firewall"><span class="mark"></span><div><b>Брандмауэр</b><small>Порты только для вашей сети</small></div><em></em></li>
+        </ul>
+        <p id="setup-line" class="status-line" role="status" hidden></p>
+        <div class="actions">
+          <button type="button" id="install" class="btn primary wide" data-action="install">Установить всё</button>
+          <button type="button" id="login" class="btn wide" data-action="tailscale_login" hidden>Войти в Tailscale</button>
+        </div>
+      </section>
+
+      <section id="host-card" class="card">
+        <h2>Пригласить друга</h2>
+        <p class="muted">Друг увидит этот экран, услышит звук и подключит свой геймпад как второй контроллер.</p>
+        <div class="network">
           <label for="network">Сеть</label>
-          <div class="row">
-            <select id="network" aria-describedby="network-hint"><option>Поиск…</option></select>
-            <button type="button" class="btn square" data-action="refresh" title="Обновить список" aria-label="Обновить список сетей">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 3v3.5H10M13.2 6.5A5.5 5.5 0 1 0 13.5 9"/></svg>
-            </button>
-          </div>
-          <p id="network-hint" class="note"></p>
+          <select id="network"></select>
         </div>
+        <button type="button" id="host-start" class="btn primary wide" data-action="host_start">Создать сессию</button>
+        <p id="host-result" class="status-line" role="status" hidden></p>
+      </section>
 
-        <p id="driver-note" class="line warn" hidden>ViGEmBus не установлен — игра не увидит геймпад гостя. Откройте «Настройка».</p>
-
-        <div class="row end">
-          <button type="button" id="choose-test" class="btn ghost" data-action="local_test" hidden>Проверить на этом ПК</button>
-          <button type="button" id="host-start" class="btn primary" data-action="host_start" disabled>Создать сессию</button>
-        </div>
-        <p id="host-result" class="line" role="status" hidden></p>
-      </div>
-
-      <div id="host-session" class="stack" hidden>
-        <div class="state"><span id="host-state" class="tag"></span><span id="host-message" role="status"></span></div>
-
-        <div id="invitation" class="field" hidden>
-          <label for="invite-output">Код приглашения</label>
-          <div class="row">
-            <input id="invite-output" class="mono" readonly spellcheck="false">
-            <button type="button" id="copy-button" class="btn primary" data-action="copy">Копировать</button>
+      <section class="card">
+        <h2>Подключиться к другу</h2>
+        <form id="guest-form" class="stack">
+          <div class="code-field">
+            <input id="guest-code" class="mono" placeholder="Код приглашения" autocomplete="off" spellcheck="false" maxlength="256" aria-label="Код приглашения" aria-describedby="guest-result">
+            <button type="button" class="link" data-action="paste">Вставить</button>
           </div>
-          <p class="note">Одноразовый, действует 15 минут. Отправьте другу любым мессенджером.</p>
+          <div class="segmented" role="radiogroup" aria-label="Профиль">
+            <button type="button" role="radio" data-profile="latency">Задержка</button>
+            <button type="button" role="radio" data-profile="balanced">Баланс</button>
+            <button type="button" role="radio" data-profile="quality">Качество</button>
+          </div>
+          <p id="profile-note" class="muted small"></p>
+          <button type="submit" class="btn primary wide">Подключиться</button>
+          <p id="guest-result" class="status-line" role="status" hidden></p>
+        </form>
+      </section>
+    </div>
+
+    <!-- Live session (host and/or guest) -->
+    <div id="live" class="column" hidden>
+      <section id="host-live" class="session" hidden>
+        <span id="host-pill" class="pill"></span>
+        <h1 id="host-title"></h1>
+        <p id="host-message" class="muted" role="status"></p>
+
+        <div id="invitation" hidden>
+          <button type="button" id="code-box" class="code-box mono" data-action="copy" title="Нажмите, чтобы скопировать"></button>
+          <div class="row">
+            <button type="button" id="copy-button" class="btn primary" data-action="copy">Скопировать код</button>
+          </div>
+          <p class="muted small">Код одноразовый и действует 15 минут.</p>
         </div>
 
         <div id="approval" class="request" hidden>
-          <div><span class="note">Запрос на подключение</span><strong id="peer-name"></strong></div>
+          <small>Запрос на подключение</small>
+          <strong id="peer-name"></strong>
           <div class="row">
             <button type="button" class="btn" data-action="deny">Отклонить</button>
             <button type="button" class="btn primary" data-action="allow">Разрешить</button>
@@ -63,117 +95,58 @@
         </div>
 
         <dl id="host-facts" class="facts" hidden></dl>
+        <button type="button" id="host-stop" class="btn quiet-danger" data-action="host_stop">Завершить сессию</button>
+      </section>
 
-        <div class="row end">
-          <button type="button" id="host-stop" class="btn danger" data-action="host_stop">Завершить сессию</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- GUEST -->
-    <section id="guest-panel" role="tabpanel" aria-labelledby="guest-tab" hidden>
-      <form id="guest-form" class="stack">
-        <div class="field">
-          <label for="guest-code">Код приглашения</label>
-          <div class="row">
-            <input id="guest-code" class="mono" placeholder="DL1-…" autocomplete="off" spellcheck="false" maxlength="256" aria-describedby="guest-result">
-            <button type="button" class="btn" data-action="paste">Вставить</button>
-          </div>
-          <p id="guest-result" class="line" role="status" hidden></p>
-        </div>
-
-        <div class="field">
-          <span class="label" id="profile-label">Профиль</span>
-          <div class="segmented" role="radiogroup" aria-labelledby="profile-label">
-            <button type="button" role="radio" data-profile="latency">Задержка</button>
-            <button type="button" role="radio" data-profile="balanced">Баланс</button>
-            <button type="button" role="radio" data-profile="quality">Качество</button>
-          </div>
-          <p id="profile-note" class="note"></p>
-        </div>
-
-        <details id="video-options">
-          <summary>Видео <span id="summary-mode">как на экране хоста</span></summary>
-          <div class="grid">
-            <label>Ширина<input id="width" inputmode="numeric" placeholder="авто" maxlength="5"></label>
-            <label>Высота<input id="height" inputmode="numeric" placeholder="авто" maxlength="5"></label>
-            <label>FPS<input id="fps" inputmode="numeric" placeholder="авто" maxlength="3"></label>
-            <label>Мбит/с<input id="bitrate" inputmode="numeric" placeholder="авто" maxlength="3"></label>
-            <label class="wide">Кодек
-              <select id="codec">
-                <option value="auto">Авто (HEVC/AV1, если есть)</option>
-                <option value="h264">H.264</option>
-                <option value="hevc">HEVC</option>
-                <option value="av1">AV1</option>
-              </select>
-            </label>
-          </div>
-          <div class="checks">
-            <label><input id="yuv444" type="checkbox"> YUV 4:4:4 — чёткий текст, вдвое больше битрейт</label>
-            <label><input id="hdr" type="checkbox"> HDR</label>
-            <label><input id="windowed" type="checkbox"> Окно без рамки вместо эксклюзивного полноэкранного режима (+1 кадр DWM)</label>
-            <label><input id="stats" type="checkbox"> Статистика поверх игры</label>
-          </div>
-          <p class="note">Пустые поля — разрешение и частота основного экрана хоста. DuoLink ничего не урезает — предел задаёт Moonlight: 8K, 480 FPS, 500 Мбит/с.</p>
-        </details>
-
-        <div class="row end">
-          <button type="submit" class="btn primary">Подключиться</button>
-        </div>
-      </form>
-
-      <div id="guest-session" class="stack" hidden>
-        <div class="state"><span id="guest-state" class="tag"></span><span id="guest-message" role="status"></span></div>
+      <section id="guest-live" class="session" hidden>
+        <span id="guest-pill" class="pill"></span>
+        <h1 id="guest-title"></h1>
+        <p id="guest-message" class="muted" role="status"></p>
         <dl id="guest-facts" class="facts" hidden></dl>
-        <p id="guest-shortcut" class="note" hidden>В окне потока: <kbd>Ctrl+Alt+Shift+Q</kbd> — выйти, <kbd>Ctrl+Alt+Shift+S</kbd> — статистика.</p>
-        <div class="row end">
-          <button type="button" id="guest-stop" class="btn" data-action="guest_stop">Отменить</button>
-        </div>
-      </div>
-    </section>
+        <p id="guest-keys" class="muted small" hidden><kbd>Ctrl Alt Shift Q</kbd> выйти · <kbd>Ctrl Alt Shift S</kbd> статистика</p>
+        <button type="button" id="guest-stop" class="btn" data-action="guest_stop">Отключиться</button>
+      </section>
+    </div>
   </main>
 
-  <footer class="status">
-    <button type="button" data-action="setup" id="st-driver">ViGEmBus</button>
-    <button type="button" data-action="setup" id="st-vpn">Tailscale</button>
-    <button type="button" data-action="setup" id="st-hags">Планирование GPU</button>
-    <span class="spacer"></span>
-    <button type="button" data-action="logs">Журналы</button>
-    <span class="version">1.1</span>
-  </footer>
-
-  <dialog id="setup-dialog" aria-labelledby="setup-title">
+  <dialog id="settings" aria-labelledby="settings-title">
     <header>
-      <h2 id="setup-title">Настройка</h2>
-      <button type="button" class="btn ghost" data-action="close_setup" aria-label="Закрыть">Закрыть</button>
+      <h2 id="settings-title">Настройки</h2>
+      <button type="button" class="icon-btn" data-action="close_settings" aria-label="Закрыть">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+      </button>
     </header>
-    <div class="setup">
-      <div class="item">
-        <div><strong>Tailscale</strong> <span id="vpn-state" class="tag"></span>
-          <p>Игра из разных сетей. Поставьте на оба ПК и поделитесь хостом с другом. Должен быть «direct», а не DERP.</p></div>
-        <button type="button" class="btn" data-action="tailscale">Сайт</button>
+    <div class="sheet">
+      <h3>Видео для гостя</h3>
+      <p class="muted small">Пусто — автоматически: экран хоста, уменьшенный до вашего монитора. Предел Moonlight — 8K, 480 FPS, 500 Мбит/с.</p>
+      <div class="grid">
+        <label>Ширина<input id="width" inputmode="numeric" placeholder="авто" maxlength="5"></label>
+        <label>Высота<input id="height" inputmode="numeric" placeholder="авто" maxlength="5"></label>
+        <label>FPS<input id="fps" inputmode="numeric" placeholder="авто" maxlength="3"></label>
+        <label>Мбит/с<input id="bitrate" inputmode="numeric" placeholder="авто" maxlength="3"></label>
       </div>
-      <div class="item">
-        <div><strong>ViGEmBus</strong> <span id="driver-state" class="tag"></span>
-          <p>Виртуальный Xbox 360 для геймпада гостя. Нужен только хосту.</p></div>
-        <button type="button" class="btn" data-action="driver">Скачать</button>
+      <label class="select-label">Кодек
+        <select id="codec">
+          <option value="auto">Автоматически</option>
+          <option value="hevc">HEVC</option>
+          <option value="av1">AV1</option>
+          <option value="h264">H.264</option>
+        </select>
+      </label>
+      <div class="toggles">
+        <label class="toggle"><span><b>YUV 4:4:4</b><small>Чёткий текст, вдвое больше битрейт</small></span><input id="yuv444" type="checkbox" role="switch"></label>
+        <label class="toggle"><span><b>HDR</b><small>Если HDR включён на обоих мониторах</small></span><input id="hdr" type="checkbox" role="switch"></label>
+        <label class="toggle"><span><b>Окно без рамки</b><small>Удобнее Alt+Tab, но может добавить кадр задержки</small></span><input id="windowed" type="checkbox" role="switch"></label>
+        <label class="toggle"><span><b>Статистика</b><small>Задержка сети и декодирования поверх игры</small></span><input id="stats" type="checkbox" role="switch"></label>
       </div>
-      <div class="item">
-        <div><strong>Аппаратное планирование GPU</strong> <span id="hags-state" class="tag"></span>
-          <p>Даёт NVENC приоритет реального времени — меньше задержка кодирования под нагрузкой игры. Включите на хосте и перезагрузите ПК.</p></div>
-        <button type="button" class="btn" data-action="graphics">Параметры</button>
-      </div>
-      <div class="item">
-        <div><strong>Брандмауэр</strong>
-          <p>Открыть порты DuoLink на интерфейсе Tailscale хоста. Запросит права администратора.</p></div>
-        <button type="button" class="btn" data-action="firewall">Настроить</button>
+
+      <h3>Система</h3>
+      <div class="list">
+        <div class="item"><span><b>Аппаратное планирование GPU</b><small id="hags-note"></small></span><button type="button" class="btn small" data-action="graphics">Открыть</button></div>
+        <div class="item"><span><b>Доступ для друга</b><small>Поделитесь этим ПК в Tailscale, если у друга свой аккаунт</small></span><button type="button" class="btn small" data-action="sharing">Tailscale</button></div>
+        <div class="item"><span><b>Журналы</b><small id="version-note"></small></span><button type="button" class="btn small" data-action="logs">Открыть</button></div>
       </div>
     </div>
-    <p id="setup-result" class="line" role="status" hidden></p>
-    <footer>
-      <button type="button" class="btn ghost" data-action="refresh">Проверить снова</button>
-      <button type="button" class="btn primary" data-action="close_setup">Готово</button>
-    </footer>
   </dialog>
 
   <div id="toast" role="status" hidden></div>

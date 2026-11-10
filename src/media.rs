@@ -441,8 +441,11 @@ impl Preferences {
         })
     }
 
-    pub fn mode(self, host: Mode) -> Mode {
-        let (width, height) = self.resolution.unwrap_or((host.width, host.height));
+    /// Stream mode: explicit values win; otherwise the host's desktop, scaled
+    /// down (keeping its aspect) when the guest screen is smaller. Pixels the
+    /// guest cannot show only cost encode, network and decode time.
+    pub fn mode(self, host: Mode, guest: Option<Mode>) -> Mode {
+        let (width, height) = self.resolution.unwrap_or_else(|| fit(host, guest));
         Mode {
             width,
             height,
@@ -464,6 +467,19 @@ impl Preferences {
         let kbps = reference_bitrate(mode, self.yuv444) as f64 * scale;
         (kbps.round() as u32).clamp(500, MAX_BITRATE_KBPS)
     }
+}
+
+fn fit(host: Mode, guest: Option<Mode>) -> (u32, u32) {
+    let Some(guest) = guest.filter(|g| g.width > 0 && g.height > 0) else {
+        return (host.width, host.height);
+    };
+    let scale = (guest.width as f64 / host.width as f64)
+        .min(guest.height as f64 / host.height as f64);
+    if scale >= 1.0 {
+        return (host.width, host.height);
+    }
+    let even = |value: f64| ((value / 2.0).round() as u32 * 2).max(2);
+    (even(host.width as f64 * scale), even(host.height as f64 * scale))
 }
 
 /// Moonlight's default bitrate table, extrapolated linearly above 4K.
@@ -630,10 +646,15 @@ mod tests {
             height: 1080,
             fps: 144,
         };
-        assert_eq!(Preferences::parse(&form("", "", "", "")).unwrap().mode(mode), mode);
+        assert_eq!(Preferences::parse(&form("", "", "", "")).unwrap().mode(mode, None), mode);
+        let auto = Preferences::default();
+        let small = Mode { width: 1280, height: 800, fps: 60 };
+        assert_eq!(auto.mode(mode, Some(small)), Mode { width: 1280, height: 720, fps: 144 });
+        let big = Mode { width: 3840, height: 2160, fps: 60 };
+        assert_eq!(auto.mode(mode, Some(big)), mode);
         let custom = Preferences::parse(&form("7680", "4320", "240", "85")).unwrap();
         assert_eq!(
-            custom.mode(mode),
+            custom.mode(mode, Some(Mode { width: 1280, height: 720, fps: 60 })),
             Mode {
                 width: 7680,
                 height: 4320,
