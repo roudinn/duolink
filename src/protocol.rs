@@ -201,6 +201,8 @@ pub enum Request {
         token: [u8; 16],
         name: String,
         certificate: String,
+        #[serde(default)]
+        profile: Profile,
     },
     Ping,
     Leave,
@@ -221,6 +223,19 @@ pub enum Reply {
     Closed {
         reason: String,
     },
+}
+
+/// Encoder/bitrate trade-off chosen by the guest and applied on both ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Profile {
+    /// Fastest encoder presets, Moonlight's reference bitrate.
+    Latency,
+    /// Fast presets with extra bitrate headroom.
+    #[default]
+    Balanced,
+    /// Slower presets and a high bitrate for the cleanest image.
+    Quality,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

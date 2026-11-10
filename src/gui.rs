@@ -22,8 +22,8 @@ use wry::{
 };
 
 use crate::{
-    media::Preferences,
-    platform::{Network, data_dir, networks, open, vigem_present},
+    media::{Form, Preferences},
+    platform::{Network, data_dir, hags_enabled, networks, open, vigem_present},
     protocol::Invite,
     session::{Event, Session},
 };
@@ -32,6 +32,7 @@ const VIEW: &str = "duolink://localhost/index.html";
 const WINDOWS_VIEW: &str = "https://duolink.localhost/index.html";
 const TAILSCALE: &str = "https://tailscale.com/download/windows";
 const VIGEM: &str = "https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0";
+const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -47,16 +48,13 @@ enum Action {
     Copy,
     GuestStart {
         code: String,
-        width: String,
-        height: String,
-        fps: String,
-        bitrate: String,
-        stats: bool,
+        options: Form,
     },
     GuestStop,
     Paste,
     Tailscale,
     Driver,
+    Graphics,
     Firewall,
     Logs,
 }
@@ -82,6 +80,7 @@ struct Pane {
     peer: String,
     error: bool,
     code_error: bool,
+    facts: Vec<(&'static str, String)>,
     #[serde(skip)]
     session: Option<Session>,
 }
@@ -94,6 +93,12 @@ impl Pane {
         self.peer.clear();
         self.error = false;
         self.code_error = false;
+    }
+
+    fn begin(&mut self, session: Session, message: &str) {
+        self.set(Phase::Working, message);
+        self.facts.clear();
+        self.session = Some(session);
     }
 
     fn stop(&mut self) {
@@ -131,6 +136,12 @@ impl Pane {
             }
             match event {
                 Event::Status(message) => self.message = message,
+                Event::Fact(key, value) => {
+                    match self.facts.iter_mut().find(|(name, _)| *name == key) {
+                        Some(entry) => entry.1 = value,
+                        None => self.facts.push((key, value)),
+                    }
+                }
                 Event::Invite(code) => {
                     self.set(Phase::Invite, "Отправьте код другу. Вы подтвердите его запрос перед началом.");
                     self.code = code;
@@ -162,6 +173,7 @@ struct App {
     guest: Pane,
     networks: Vec<Network>,
     driver: bool,
+    hags: Option<bool>,
     setup_message: String,
     setup_error: bool,
     #[serde(skip)]
@@ -175,6 +187,7 @@ impl App {
             guest: Pane::default(),
             networks: networks(),
             driver: vigem_present(),
+            hags: hags_enabled(),
             setup_message: String::new(),
             setup_error: false,
             data,
@@ -195,6 +208,7 @@ impl App {
             Action::Refresh => {
                 self.networks = networks();
                 self.driver = vigem_present();
+                self.hags = hags_enabled();
                 self.setup_message.clear();
                 self.setup_error = false;
             }
@@ -204,8 +218,8 @@ impl App {
                     .iter()
                     .any(|network| network.address == address)
                 {
-                    self.host.set(Phase::Working, "Готовим приглашение…");
-                    self.host.session = Some(Session::host(self.data.clone(), address));
+                    self.host
+                        .begin(Session::host(self.data.clone(), address), "Готовим приглашение…");
                 } else {
                     self.host
                         .set(Phase::Idle, "Эта сеть недоступна. Обновите список сетей.");
@@ -224,20 +238,12 @@ impl App {
                     )?,
                 }
             }
-            Action::GuestStart {
-                code,
-                width,
-                height,
-                fps,
-                bitrate,
-                stats,
-            } if self.guest.session.is_none() => match Invite::decode(&code) {
-                Ok(invite) => match Preferences::parse(&width, &height, &fps, &bitrate, stats) {
-                    Ok(preferences) => {
-                        self.guest.set(Phase::Working, "Готовим подключение…");
-                        self.guest.session =
-                            Some(Session::guest(self.data.clone(), invite, preferences));
-                    }
+            Action::GuestStart { code, options } if self.guest.session.is_none() => match Invite::decode(&code) {
+                Ok(invite) => match Preferences::parse(&options) {
+                    Ok(preferences) => self.guest.begin(
+                        Session::guest(self.data.clone(), invite, preferences),
+                        "Готовим подключение…",
+                    ),
                     Err(error) => {
                         self.guest.set(Phase::Idle, error.to_string());
                         self.guest.error = true;
@@ -271,6 +277,7 @@ impl App {
             }
             Action::Tailscale => self.setup_result(open(OsStr::new(TAILSCALE))),
             Action::Driver => self.setup_result(open(OsStr::new(VIGEM))),
+            Action::Graphics => self.setup_result(open(OsStr::new(GRAPHICS))),
             Action::Firewall => self.setup_result(firewall()),
             Action::Logs => {
                 let directory = self.data.join("logs");
@@ -374,8 +381,8 @@ pub fn run() -> Result<()> {
     let window = WindowBuilder::new()
         .with_title("DuoLink")
         .with_theme(Some(Theme::Dark))
-        .with_inner_size(LogicalSize::new(680.0, 588.0))
-        .with_min_inner_size(LogicalSize::new(445.0, 418.0))
+        .with_inner_size(LogicalSize::new(720.0, 680.0))
+        .with_min_inner_size(LogicalSize::new(480.0, 460.0))
         .with_visible(false)
         .build(&event_loop)?;
     if let Some(monitor) = window.current_monitor() {
@@ -391,7 +398,7 @@ pub fn run() -> Result<()> {
     }
     let proxy = event_loop.create_proxy();
     let view = WebViewBuilder::new_with_web_context(&mut context)
-        .with_background_color((17, 21, 28, 255))
+        .with_background_color((16, 16, 18, 255))
         .with_theme(wry::Theme::Dark)
         .with_https_scheme(true)
         .with_default_context_menus(false)

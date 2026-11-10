@@ -21,7 +21,14 @@ use windows_sys::{
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
                 SetInformationJobObject,
             },
-            Threading::{CREATE_NO_WINDOW, CreateMutexW},
+            Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState},
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
+            Threading::{
+                CREATE_NO_WINDOW, CreateMutexW, HIGH_PRIORITY_CLASS,
+                PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+                ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+            },
         },
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     },
@@ -215,6 +222,28 @@ impl Process {
         Ok(Self { child, _job: job })
     }
 
+    /// Streaming engines run in the background on the host, where Windows 11
+    /// EcoQoS would otherwise park them on efficiency cores and coalesce their
+    /// timers. Raise the class and opt out of both throttles.
+    pub fn boost(&self) {
+        let handle = self.child.as_raw_handle();
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        unsafe {
+            SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
+            SetProcessInformation(
+                handle,
+                ProcessPowerThrottling,
+                (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+    }
+
     pub fn status(&mut self) -> Result<Option<ExitStatus>> {
         Ok(self.child.try_wait()?)
     }
@@ -245,5 +274,129 @@ pub fn run_tool(command: &mut Command, check: impl Fn() -> Result<()>) -> Result
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+/// Keeps the display and system awake while the calling thread holds it.
+/// Desktop Duplication stops delivering frames once the host display sleeps.
+pub struct KeepAwake;
+
+impl KeepAwake {
+    pub fn hold() -> Self {
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+        Self
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    }
+}
+
+/// Hardware-accelerated GPU scheduling lets NVENC run with realtime priority.
+pub fn hags_enabled() -> Option<bool> {
+    let key: Vec<u16> = "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\0"
+        .encode_utf16()
+        .collect();
+    let value: Vec<u16> = "HwSchMode\0".encode_utf16().collect();
+    let mut data = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    (status == 0).then_some(data == 2)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Route {
+    pub direct: bool,
+    pub via: String,
+    pub ms: u32,
+}
+
+impl Route {
+    pub fn describe(&self) -> String {
+        if self.direct {
+            format!("Прямой P2P · {} мс", self.ms)
+        } else {
+            format!("Ретранслятор {} · {} мс", self.via, self.ms)
+        }
+    }
+}
+
+fn tailscale_cli() -> Option<PathBuf> {
+    [std::env::var_os("ProgramFiles"), std::env::var_os("ProgramW6432")]
+        .into_iter()
+        .flatten()
+        .map(|root| PathBuf::from(root).join("Tailscale").join("tailscale.exe"))
+        .find(|path| path.is_file())
+}
+
+/// Asks Tailscale for the path to `peer`. `tailscale ping` keeps probing until
+/// a direct UDP path is negotiated, so a DERP result here means NAT traversal failed.
+pub fn tailscale_route(peer: Ipv4Addr) -> Option<Route> {
+    let output = Command::new(tailscale_cli()?)
+        .args(["ping", "--c", "8", "--timeout", "3s"])
+        .arg(peer.to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().rev().find_map(parse_pong)
+}
+
+pub fn parse_pong(line: &str) -> Option<Route> {
+    let rest = line.trim().strip_prefix("pong from ")?;
+    let (_, rest) = rest.split_once(" via ")?;
+    let (via, rest) = rest.rsplit_once(" in ")?;
+    let number: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let value: f64 = number.parse().ok()?;
+    let unit = &rest[number.len()..];
+    let ms = match unit.trim() {
+        "ms" => value,
+        "s" => value * 1000.0,
+        "µs" | "us" => value / 1000.0,
+        _ => return None,
+    };
+    let relay = via.strip_prefix("DERP(").and_then(|name| name.strip_suffix(')'));
+    Some(Route {
+        direct: relay.is_none(),
+        via: relay.unwrap_or(via).to_string(),
+        ms: ms.round().max(0.0) as u32,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pong_lines_classify_direct_and_relay() {
+        assert_eq!(
+            parse_pong("pong from host (100.101.1.2) via 203.0.113.5:41641 in 23ms"),
+            Some(Route { direct: true, via: "203.0.113.5:41641".into(), ms: 23 })
+        );
+        assert_eq!(
+            parse_pong("pong from host (100.101.1.2) via DERP(fra) in 61ms"),
+            Some(Route { direct: false, via: "fra".into(), ms: 61 })
+        );
+        assert_eq!(
+            parse_pong("pong from h (100.64.0.1) via [2001:db8::1]:41641 in 1.4ms").map(|r| r.ms),
+            Some(1)
+        );
+        assert!(parse_pong("direct connection not established").is_none());
     }
 }

@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
@@ -15,10 +16,13 @@ use uuid::Uuid;
 
 use crate::{
     platform::{Process, run_tool, system_tool},
-    protocol::{Identity, MEDIA_PORT, Mode},
+    protocol::{Identity, MEDIA_PORT, Mode, Profile, tailscale_address},
 };
 
 const DESKTOP: &str = "DuoLink";
+
+/// Video datagram size that fits Tailscale's 1280-byte MTU without IP fragmentation.
+const TAILSCALE_PACKET: u32 = 1024;
 
 pub const SUNSHINE: Engine = Engine {
     name: "Sunshine",
@@ -137,6 +141,96 @@ fn create_log(data: &Path, name: &str) -> Result<(File, PathBuf)> {
     Ok((file, path))
 }
 
+/// Encoder settings per profile. Every profile keeps Sunshine's single-frame
+/// VBV, low-delay rate control and no lookahead, so none of them queues frames;
+/// they differ only in how much work the encoder spends per frame.
+fn encoder_tuning(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Latency => {
+            // Two-pass stays at quarter resolution: without it NVENC overshoots
+            // the frame budget and the resulting packet loss costs far more
+            // than the sub-millisecond it saves.
+            "nvenc_preset = 1\n\
+             nvenc_twopass = quarter_res\n\
+             nvenc_split_encode = enabled\n\
+             nvenc_realtime_hags = enabled\n\
+             nvenc_latency_over_power = enabled\n\
+             amd_usage = ultralowlatency\n\
+             amd_quality = speed\n\
+             amd_preanalysis = disabled\n\
+             qsv_preset = veryfast\n\
+             qsv_slow_hevc = disabled\n"
+        }
+        Profile::Balanced => {
+            "nvenc_preset = 1\n\
+             nvenc_twopass = quarter_res\n\
+             nvenc_split_encode = enabled\n\
+             nvenc_realtime_hags = enabled\n\
+             nvenc_latency_over_power = enabled\n\
+             amd_usage = ultralowlatency\n\
+             amd_quality = balanced\n\
+             amd_preanalysis = disabled\n\
+             qsv_preset = fast\n\
+             qsv_slow_hevc = disabled\n"
+        }
+        Profile::Quality => {
+            "nvenc_preset = 4\n\
+             nvenc_twopass = full_res\n\
+             nvenc_spatial_aq = enabled\n\
+             nvenc_split_encode = driver_decides\n\
+             nvenc_realtime_hags = enabled\n\
+             nvenc_latency_over_power = enabled\n\
+             amd_usage = lowlatency_high_quality\n\
+             amd_quality = quality\n\
+             amd_preanalysis = disabled\n\
+             qsv_preset = medium\n\
+             qsv_slow_hevc = disabled\n"
+        }
+    }
+}
+
+pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
+    let packet = if tailscale_address(address) {
+        format!("packetsize = {TAILSCALE_PACKET}\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "sunshine_name = {DESKTOP}\n\
+         port = {MEDIA_PORT}\n\
+         address_family = ipv4\n\
+         bind_address = {address}\n\
+         origin_web_ui_allowed = pc\n\
+         upnp = disabled\n\
+         system_tray = disabled\n\
+         notify_pre_releases = disabled\n\
+         lan_encryption_mode = 2\n\
+         wan_encryption_mode = 2\n\
+         controller = enabled\n\
+         gamepad_driver = vigembus\n\
+         gamepad = x360\n\
+         back_button_timeout = -1\n\
+         keyboard = disabled\n\
+         mouse = disabled\n\
+         native_pen_touch = disabled\n\
+         stream_audio = enabled\n\
+         install_steam_audio_drivers = disabled\n\
+         dd_configuration_option = disabled\n\
+         max_bitrate = 0\n\
+         ping_timeout = 5000\n\
+         hevc_mode = 0\n\
+         av1_mode = 0\n\
+         {encoder}\
+         {packet}\
+         file_apps = {rel}/apps.json\n\
+         file_state = {rel}/state.json\n\
+         pkey = {rel}/server.key\n\
+         cert = {rel}/server.pem\n\
+         log_path = {rel}/sunshine.log\n",
+        encoder = encoder_tuning(profile),
+    )
+}
+
 pub struct HostStream {
     process: Process,
     _directory: TempDir,
@@ -146,6 +240,7 @@ pub struct HostStream {
 }
 
 impl HostStream {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         exe: &Path,
         data: &Path,
@@ -154,6 +249,7 @@ impl HostStream {
         host: Uuid,
         peer: &str,
         peer_cert: &str,
+        profile: Profile,
     ) -> Result<Self> {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
@@ -180,34 +276,7 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            format!(
-                "sunshine_name = {DESKTOP}\n\
-             port = {MEDIA_PORT}\n\
-             address_family = ipv4\n\
-             bind_address = {address}\n\
-             origin_web_ui_allowed = pc\n\
-             upnp = disabled\n\
-             system_tray = disabled\n\
-             notify_pre_releases = disabled\n\
-             lan_encryption_mode = 2\n\
-             wan_encryption_mode = 2\n\
-             controller = enabled\n\
-             gamepad_driver = vigembus\n\
-             gamepad = x360\n\
-             back_button_timeout = -1\n\
-             keyboard = disabled\n\
-             mouse = disabled\n\
-             native_pen_touch = disabled\n\
-             stream_audio = enabled\n\
-             install_steam_audio_drivers = disabled\n\
-             dd_configuration_option = disabled\n\
-             max_bitrate = 0\n\
-             file_apps = {rel}/apps.json\n\
-             file_state = {rel}/state.json\n\
-             pkey = {rel}/server.key\n\
-             cert = {rel}/server.pem\n\
-             log_path = {rel}/sunshine.log\n"
-            ),
+            host_config(&rel, address, profile),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
@@ -218,6 +287,7 @@ impl HostStream {
                 .stdout(output.try_clone()?)
                 .stderr(output),
         )?;
+        process.boost();
         Ok(Self {
             process,
             _directory: directory,
@@ -263,16 +333,69 @@ impl HostStream {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Codec {
+    #[default]
+    Auto,
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl Codec {
+    fn moonlight(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Авто",
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+        }
+    }
+}
+
+/// Guest form exactly as typed in the interface.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Form {
+    pub width: String,
+    pub height: String,
+    pub fps: String,
+    pub bitrate: String,
+    pub profile: Profile,
+    pub codec: Codec,
+    pub yuv444: bool,
+    pub hdr: bool,
+    pub windowed: bool,
+    pub stats: bool,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct Preferences {
     pub resolution: Option<(u32, u32)>,
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
+    pub profile: Profile,
+    pub codec: Codec,
+    pub yuv444: bool,
+    pub hdr: bool,
+    pub windowed: bool,
     pub stats: bool,
 }
 
+pub const MAX_BITRATE_KBPS: u32 = 500_000;
+
 impl Preferences {
-    pub fn parse(width: &str, height: &str, fps: &str, bitrate: &str, stats: bool) -> Result<Self> {
+    pub fn parse(form: &Form) -> Result<Self> {
         let parse = |value: &str, name| -> Result<Option<u32>> {
             if value.trim().is_empty() {
                 return Ok(None);
@@ -285,8 +408,8 @@ impl Preferences {
                 .with_context(|| format!("{name} должно быть целым числом больше нуля."))?;
             Ok(Some(parsed as u32))
         };
-        let width = parse(width, "Значение ширины")?;
-        let height = parse(height, "Значение высоты")?;
+        let width = parse(&form.width, "Значение ширины")?;
+        let height = parse(&form.height, "Значение высоты")?;
         ensure!(
             width.is_some() == height.is_some(),
             "Укажите ширину и высоту или оставьте оба поля пустыми."
@@ -297,19 +420,24 @@ impl Preferences {
                 "Ширина и высота должны быть чётными для видеокодека."
             );
         }
-        let fps = parse(fps, "Значение FPS")?;
-        let bitrate = parse(bitrate, "Значение битрейта")?
+        let fps = parse(&form.fps, "Значение FPS")?;
+        let bitrate = parse(&form.bitrate, "Значение битрейта")?
             .map(|mbps| {
                 mbps.checked_mul(1000)
-                    .filter(|kbps| *kbps <= i32::MAX as u32)
-                    .context("Слишком большое значение битрейта.")
+                    .filter(|kbps| *kbps <= MAX_BITRATE_KBPS)
+                    .context("Битрейт не может превышать 500 Мбит/с.")
             })
             .transpose()?;
         Ok(Self {
             resolution: width.zip(height),
             fps,
             bitrate,
-            stats,
+            profile: form.profile,
+            codec: form.codec,
+            yuv444: form.yuv444,
+            hdr: form.hdr,
+            windowed: form.windowed,
+            stats: form.stats,
         })
     }
 
@@ -321,6 +449,50 @@ impl Preferences {
             fps: self.fps.unwrap_or(host.fps),
         }
     }
+
+    /// Kbps for `mode`: the explicit value, or Moonlight's reference curve
+    /// (extended past 4K) scaled by the profile.
+    pub fn bitrate_for(self, mode: Mode) -> u32 {
+        if let Some(bitrate) = self.bitrate {
+            return bitrate;
+        }
+        let scale = match self.profile {
+            Profile::Latency => 1.0,
+            Profile::Balanced => 1.5,
+            Profile::Quality => 2.5,
+        };
+        let kbps = reference_bitrate(mode, self.yuv444) as f64 * scale;
+        (kbps.round() as u32).clamp(500, MAX_BITRATE_KBPS)
+    }
+}
+
+/// Moonlight's default bitrate table, extrapolated linearly above 4K.
+pub fn reference_bitrate(mode: Mode, yuv444: bool) -> u32 {
+    const TABLE: [(f64, f64); 6] = [
+        (640.0 * 360.0, 1.0),
+        (854.0 * 480.0, 2.0),
+        (1280.0 * 720.0, 5.0),
+        (1920.0 * 1080.0, 10.0),
+        (2560.0 * 1440.0, 20.0),
+        (3840.0 * 2160.0, 40.0),
+    ];
+    let pixels = mode.width as f64 * mode.height as f64;
+    let mut factor = if pixels <= TABLE[0].0 {
+        TABLE[0].1
+    } else if pixels >= TABLE[5].0 {
+        TABLE[5].1 * pixels / TABLE[5].0
+    } else {
+        let i = TABLE.iter().position(|(p, _)| pixels <= *p).unwrap();
+        let (p0, f0) = TABLE[i - 1];
+        let (p1, f1) = TABLE[i];
+        f0 + (pixels - p0) / (p1 - p0) * (f1 - f0)
+    };
+    if yuv444 {
+        factor *= 2.0;
+    }
+    let fps = mode.fps as f64;
+    let rate = if fps <= 60.0 { fps } else { (fps / 60.0).sqrt() * 60.0 } / 30.0;
+    ((factor * rate).round() as u32) * 1000
 }
 
 pub struct GuestStream {
@@ -329,6 +501,7 @@ pub struct GuestStream {
 }
 
 impl GuestStream {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         exe: &Path,
         data: &Path,
@@ -364,49 +537,20 @@ impl GuestStream {
         let mut command = Command::new(exe);
         command
             .current_dir(directory.path())
-            .args([
-                "stream",
-                "--resolution",
-                &format!("{}x{}", mode.width, mode.height),
-                "--fps",
-                &mode.fps.to_string(),
-            ])
-            .args([
-                "--display-mode",
-                if address.is_loopback() {
-                    "windowed"
-                } else {
-                    "borderless"
-                },
-                "--no-vsync",
-                "--no-frame-pacing",
-                "--audio-on-host",
-                "--no-mute-on-focus-loss",
-                "--no-multi-controller",
-                "--no-game-optimization",
-                "--no-quit-after",
-                "--capture-system-keys",
-                "never",
-            ])
-            .arg(if preferences.stats {
-                "--performance-overlay"
-            } else {
-                "--no-performance-overlay"
-            })
+            .args(guest_args(address, mode, preferences))
+            .arg(host.to_string())
+            .arg(DESKTOP)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        if let Some(bitrate) = preferences.bitrate {
-            command.args(["--bitrate", &bitrate.to_string()]);
-        }
         if address.is_loopback() {
             // Still receive and decode audio, with no feedback into host WASAPI loopback.
             command
                 .env("SDL_AUDIODRIVER", "dummy")
                 .env("SDL_AUDIO_DRIVER", "dummy");
         }
-        command.args([&host.to_string(), DESKTOP]);
         let process = Process::spawn(&mut command)?;
+        process.boost();
         Ok(Self {
             process,
             _directory: directory,
@@ -414,9 +558,70 @@ impl GuestStream {
     }
 }
 
+pub fn guest_args(address: Ipv4Addr, mode: Mode, preferences: Preferences) -> Vec<String> {
+    let display = if address.is_loopback() {
+        "windowed"
+    } else if preferences.windowed {
+        "borderless"
+    } else {
+        // Exclusive fullscreen bypasses DWM composition: the shortest present path on Windows.
+        "fullscreen"
+    };
+    let toggle = |on: bool, name: &str| format!("--{}{name}", if on { "" } else { "no-" });
+    let mut args: Vec<String> = [
+        "stream",
+        "--resolution",
+        &format!("{}x{}", mode.width, mode.height),
+        "--fps",
+        &mode.fps.to_string(),
+        "--bitrate",
+        &preferences.bitrate_for(mode).to_string(),
+        "--video-codec",
+        preferences.codec.moonlight(),
+        "--video-decoder",
+        "auto",
+        "--display-mode",
+        display,
+        "--audio-config",
+        "stereo",
+        "--no-vsync",
+        "--no-frame-pacing",
+        "--audio-on-host",
+        "--no-mute-on-focus-loss",
+        "--no-multi-controller",
+        "--background-gamepad",
+        "--keep-awake",
+        "--no-game-optimization",
+        "--no-quit-after",
+        "--capture-system-keys",
+        "never",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    args.push(toggle(preferences.yuv444, "yuv444"));
+    args.push(toggle(preferences.hdr, "hdr"));
+    args.push(toggle(preferences.stats, "performance-overlay"));
+    if tailscale_address(address) {
+        // An explicit size also keeps Moonlight in its LAN mode (short audio packets).
+        args.extend(["--packet-size".into(), TAILSCALE_PACKET.to_string()]);
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn form(width: &str, height: &str, fps: &str, bitrate: &str) -> Form {
+        Form {
+            width: width.into(),
+            height: height.into(),
+            fps: fps.into(),
+            bitrate: bitrate.into(),
+            ..Form::default()
+        }
+    }
 
     #[test]
     fn preferences_keep_custom_modes_and_validate_dimensions() {
@@ -425,13 +630,8 @@ mod tests {
             height: 1080,
             fps: 144,
         };
-        assert_eq!(
-            Preferences::parse("", "", "", "", false)
-                .unwrap()
-                .mode(mode),
-            mode
-        );
-        let custom = Preferences::parse("7680", "4320", "240", "85", true).unwrap();
+        assert_eq!(Preferences::parse(&form("", "", "", "")).unwrap().mode(mode), mode);
+        let custom = Preferences::parse(&form("7680", "4320", "240", "85")).unwrap();
         assert_eq!(
             custom.mode(mode),
             Mode {
@@ -441,8 +641,46 @@ mod tests {
             }
         );
         assert_eq!(custom.bitrate, Some(85_000));
-        assert!(Preferences::parse("1919", "1080", "60", "", false).is_err());
-        assert!(Preferences::parse("1920", "", "60", "", false).is_err());
-        assert!(Preferences::parse("", "", "-1", "", false).is_err());
+        assert_eq!(custom.bitrate_for(mode), 85_000);
+        assert!(Preferences::parse(&form("1919", "1080", "60", "")).is_err());
+        assert!(Preferences::parse(&form("1920", "", "60", "")).is_err());
+        assert!(Preferences::parse(&form("", "", "-1", "")).is_err());
+        assert!(Preferences::parse(&form("", "", "", "501")).is_err());
+    }
+
+    #[test]
+    fn bitrate_follows_moonlight_curve_and_profiles() {
+        let m = |width, height, fps| Mode { width, height, fps };
+        assert_eq!(reference_bitrate(m(1920, 1080, 60), false), 20_000);
+        assert_eq!(reference_bitrate(m(3840, 2160, 60), false), 80_000);
+        assert_eq!(reference_bitrate(m(3840, 2160, 60), true), 160_000);
+        assert_eq!(reference_bitrate(m(7680, 4320, 60), false), 320_000);
+        let mut prefs = Preferences {
+            profile: Profile::Latency,
+            ..Preferences::default()
+        };
+        assert_eq!(prefs.bitrate_for(m(1920, 1080, 60)), 20_000);
+        prefs.profile = Profile::Quality;
+        assert_eq!(prefs.bitrate_for(m(1920, 1080, 60)), 50_000);
+        assert_eq!(prefs.bitrate_for(m(7680, 4320, 240)), MAX_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn engines_get_low_latency_flags() {
+        let mode = Mode { width: 2560, height: 1440, fps: 165 };
+        let remote = Ipv4Addr::new(100, 70, 1, 2);
+        let args = guest_args(remote, mode, Preferences::default());
+        let has = |flag: &str| args.iter().any(|arg| arg == flag);
+        for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "1024"] {
+            assert!(has(flag), "missing {flag}");
+        }
+        assert!(!guest_args(Ipv4Addr::new(192, 168, 1, 2), mode, Preferences::default())
+            .iter()
+            .any(|arg| arg == "--packet-size"));
+        let config = host_config("x", remote, Profile::Latency);
+        assert!(config.contains("nvenc_split_encode = enabled"));
+        assert!(config.contains("amd_usage = ultralowlatency"));
+        assert!(config.contains("packetsize = 1024"));
+        assert!(!host_config("x", Ipv4Addr::LOCALHOST, Profile::Quality).contains("packetsize"));
     }
 }

@@ -17,9 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     media::{GuestStream, HostStream, MOONLIGHT, Preferences, SUNSHINE},
-    platform::{HostLock, display_mode, vigem_present},
+    platform::{HostLock, KeepAwake, display_mode, tailscale_route, vigem_present},
     protocol::{
-        CONTROL_PORT, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config, valid_pem,
+        CONTROL_PORT, Identity, Invite, MEDIA_PORT, Profile, Reply, Request, Wire, client_config,
+        tailscale_address, valid_pem,
     },
 };
 
@@ -34,6 +35,8 @@ pub enum Event {
     Status(String),
     Invite(String),
     Approval(String),
+    /// A labelled fact about the live session (mode, bitrate, route…).
+    Fact(&'static str, String),
     Streaming,
     Finished { message: String, failed: bool },
 }
@@ -50,6 +53,26 @@ impl Worker {
 
     fn status(&self, message: impl Into<String>) {
         self.emit(Event::Status(message.into()));
+    }
+
+    fn fact(&self, key: &'static str, value: impl Into<String>) {
+        self.emit(Event::Fact(key, value.into()));
+    }
+
+    /// Measures the Tailscale path in the background; the result arrives as a fact.
+    fn probe_route(&self, peer: Ipv4Addr) {
+        if !tailscale_address(peer) {
+            return;
+        }
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let value = match tailscale_route(peer) {
+                Some(route) if route.direct => route.describe(),
+                Some(route) => format!("{} — NAT не пробит, задержка выше", route.describe()),
+                None => "Не удалось измерить".into(),
+            };
+            let _ = events.send(Event::Fact("Маршрут", value));
+        });
     }
 
     fn check(&self) -> Result<()> {
@@ -128,6 +151,14 @@ impl Drop for Session {
     }
 }
 
+pub fn profile_label(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Latency => "Минимальная задержка",
+        Profile::Balanced => "Баланс",
+        Profile::Quality => "Качество",
+    }
+}
+
 type HostWire = Wire<StreamOwned<ServerConnection, TcpStream>>;
 
 fn configure_socket(socket: &TcpStream) -> io::Result<()> {
@@ -173,7 +204,7 @@ fn host(
     worker.emit(Event::Invite(invite.encode()));
 
     let expires = Instant::now() + CODE_TIMEOUT;
-    let (mut wire, name, peer, certificate) = loop {
+    let (mut wire, name, peer, certificate, profile) = loop {
         worker.check()?;
         ensure!(
             Instant::now() < expires,
@@ -208,13 +239,14 @@ fn host(
             token,
             name,
             certificate,
+            profile,
         }) = request
             && invite.authorizes(&token)
             && valid_pem(&certificate)
         {
             let name = clean_name(&name);
             wire.send(&Reply::Pending)?;
-            break (wire, name, peer, certificate);
+            break (wire, name, peer, certificate, profile);
         }
         let _ = wire.send(&Reply::Closed {
             reason: "Приглашение отклонено.".into(),
@@ -223,6 +255,11 @@ fn host(
     // This invitation admits a single request. Once used, the listening socket closes.
     drop(listener);
     worker.emit(Event::Approval(format!("{name} · {}", peer.ip())));
+    worker.fact("Гость", format!("{name} · {}", peer.ip()));
+    worker.fact("Профиль", profile_label(profile));
+    if let std::net::IpAddr::V4(ip) = peer.ip() {
+        worker.probe_route(ip);
+    }
 
     let mut last_ping = Instant::now();
     let by = Instant::now() + DECISION_TIMEOUT;
@@ -258,6 +295,9 @@ fn host(
     wire.send(&Reply::Preparing)?;
     let host_id = Uuid::new_v4();
     let mode = display_mode()?;
+    worker.fact("Экран", format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps));
+    // Desktop Duplication stops producing frames once the display sleeps.
+    let _awake = KeepAwake::hold();
     let mut stream = HostStream::start(
         &engine,
         &data,
@@ -266,6 +306,7 @@ fn host(
         host_id,
         &name,
         &certificate,
+        profile,
     )?;
     let by = Instant::now() + START_TIMEOUT;
     while !stream.ready(address)? {
@@ -355,6 +396,7 @@ fn guest(
     let identity = Identity::generate("DuoLink Guest")?;
 
     worker.status(format!("Связываемся с {}…", invite.address));
+    worker.probe_route(invite.address);
     let endpoint = SocketAddr::from((invite.address, CONTROL_PORT));
     let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
         .context("Хост недоступен. Проверьте код, сеть и доступ к TCP 48171.")?;
@@ -372,6 +414,7 @@ fn guest(
         token: invite.token,
         name: clean_name(&std::env::var("COMPUTERNAME").unwrap_or_default()),
         certificate: identity.cert_pem.clone(),
+        profile: preferences.profile,
     })
     .context("Не удалось подтвердить подлинность приглашения или связаться с хостом.")?;
 
@@ -419,6 +462,11 @@ fn guest(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Получен неверный режим видео."
                 );
+                let bitrate = preferences.bitrate_for(mode);
+                worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
+                worker.fact("Битрейт", format!("{} Мбит/с", bitrate.div_ceil(1000)));
+                worker.fact("Кодек", preferences.codec.label());
+                worker.fact("Профиль", profile_label(preferences.profile));
                 worker.status(format!(
                     "Открываем поток {}×{} · {} FPS…",
                     mode.width, mode.height, mode.fps
@@ -508,7 +556,15 @@ mod tests {
         );
         assert!(host.events.try_recv().is_err());
         let invite = Invite::decode(&code).unwrap();
-        let prefs = Preferences::parse("1920", "1080", "144", "30", true).unwrap();
+        let prefs = Preferences::parse(&crate::media::Form {
+            width: "1920".into(),
+            height: "1080".into(),
+            fps: "144".into(),
+            bitrate: "30".into(),
+            stats: true,
+            ..Default::default()
+        })
+        .unwrap();
         let guest = Session::guest(data.clone(), invite, prefs);
         until(&host, Duration::from_secs(20), |event| match event {
             Event::Approval(_) => Some(String::new()),
