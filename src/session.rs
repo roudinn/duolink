@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     media::{GuestStream, HostStream, MOONLIGHT, Preferences, SUNSHINE},
-    platform::{HostLock, KeepAwake, WifiQuiet, display_mode, vigem_present},
+    platform::{HostLock, KeepAwake, WifiQuiet, display_max_refresh, display_mode, vigem_present},
     protocol::{
         CONTROL_PORT, Identity, Invite, MEDIA_PORT, Profile, Reply, Request, Wire, client_config,
         new_token, valid_pem,
@@ -327,8 +327,17 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     let _wifi = quiet_wifi(worker);
     wire.send(&Reply::Preparing)?;
     let host_id = Uuid::new_v4();
-    let mode = display_mode()?;
-    worker.fact("Экран", format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps));
+    let mut mode = display_mode()?;
+    let current_hz = mode.fps;
+    mode.fps = display_max_refresh().unwrap_or(current_hz);
+    worker.fact(
+        "Экран",
+        if mode.fps > current_hz {
+            format!("{}×{} · {current_hz} → {} Гц на время игры", mode.width, mode.height, mode.fps)
+        } else {
+            format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps)
+        },
+    );
     // Desktop Duplication stops producing frames once the display sleeps.
     let _awake = KeepAwake::hold();
     let mut stream = HostStream::start(

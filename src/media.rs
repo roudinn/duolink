@@ -212,7 +212,11 @@ pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
          native_pen_touch = disabled\n\
          stream_audio = enabled\n\
          install_steam_audio_drivers = disabled\n\
-         dd_configuration_option = disabled\n\
+         dd_configuration_option = verify_only\n\
+         dd_resolution_option = disabled\n\
+         dd_refresh_rate_option = auto\n\
+         dd_hdr_option = disabled\n\
+         dd_config_revert_on_disconnect = enabled\n\
          max_bitrate = 0\n\
          ping_timeout = 5000\n\
          hevc_mode = 0\n\

@@ -66,6 +66,31 @@ pub fn display_mode() -> Result<Mode> {
     })
 }
 
+/// The highest refresh rate the primary display offers at its current
+/// resolution. A monitor left at 60 Hz that can do 165 Hz caps the capture
+/// rate, so the stream asks for the maximum and Sunshine switches the display
+/// for the session (and back afterwards).
+pub fn display_max_refresh() -> Option<u32> {
+    let current = display_mode().ok()?;
+    let mut best = current.fps;
+    let mut index = 0;
+    loop {
+        let mut mode: DEVMODEW = unsafe { zeroed() };
+        mode.dmSize = size_of::<DEVMODEW>() as u16;
+        if unsafe { EnumDisplaySettingsW(std::ptr::null(), index, &mut mode) } == 0 {
+            break;
+        }
+        if mode.dmPelsWidth & !1 == current.width
+            && mode.dmPelsHeight & !1 == current.height
+            && mode.dmDisplayFrequency > 1
+        {
+            best = best.max(mode.dmDisplayFrequency);
+        }
+        index += 1;
+    }
+    Some(best)
+}
+
 pub fn vigem_present() -> bool {
     // GUID_DEVINTERFACE_BUSENUM_VIGEM from ViGEmClient's shared driver ABI.
     let guid = GUID::from_u128(0x96e42b22_f5e9_42f8_b043_ed0f932f014f);

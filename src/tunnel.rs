@@ -1073,6 +1073,115 @@ mod tests {
         assert_eq!(parse_stun(&message, &[0; 12]), None);
     }
 
+    fn percentiles(mut samples: Vec<Duration>) -> (f64, f64, f64) {
+        samples.sort();
+        let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e6;
+        (at(0.5), at(0.99), at(1.0))
+    }
+
+    fn round_trips(socket: &StdUdpSocket, target: SocketAddr, count: usize) -> Vec<Duration> {
+        let payload = vec![7u8; 1100];
+        let mut reply = [0u8; 2048];
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..count {
+            let start = Instant::now();
+            socket.send_to(&payload, target).unwrap();
+            let (got, _) = socket.recv_from(&mut reply).unwrap();
+            assert_eq!(got, payload.len());
+            samples.push(start.elapsed());
+        }
+        samples
+    }
+
+    /// Measures what the tunnel adds to a packet's round trip on one PC:
+    /// loopback → DuoLink host → QUIC → DuoLink guest → loopback and back.
+    #[test]
+    #[ignore = "binds stream ports and contacts STUN/UPnP"]
+    fn tunnel_round_trip_overhead() {
+        let echo = StdUdpSocket::bind((HOST_LOOPBACK, UDP_PORTS[2])).unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0u8; 2048];
+            while let Ok((count, from)) = echo.recv_from(&mut buffer) {
+                let _ = echo.send_to(&buffer[..count], from);
+            }
+        });
+        let identity = Identity::generate("bench").unwrap();
+        let token = [5u8; 16];
+        let host = HostTunnel::open(&identity, token).unwrap();
+        let loopback: Vec<Candidate> = host
+            .candidates
+            .iter()
+            .filter(|c| c.addr.ip().is_loopback())
+            .copied()
+            .collect();
+        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, || Ok(())).unwrap();
+
+        let client = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let direct = SocketAddr::from((HOST_LOOPBACK, UDP_PORTS[2]));
+        let tunneled = SocketAddr::from((GUEST_LOOPBACK, UDP_PORTS[2]));
+        round_trips(&client, tunneled, 200); // warm up
+        round_trips(&client, direct, 200);
+        let (d50, d99, dmax) = percentiles(round_trips(&client, direct, 5000));
+        let (t50, t99, tmax) = percentiles(round_trips(&client, tunneled, 5000));
+        eprintln!("direct   RTT µs: p50 {d50:7.1}  p99 {d99:7.1}  max {dmax:8.1}");
+        eprintln!("tunneled RTT µs: p50 {t50:7.1}  p99 {t99:7.1}  max {tmax:8.1}");
+        eprintln!("one-way overhead ≈ {:.0} µs (p50)", (t50 - d50) / 2.0);
+        drop(guest);
+        drop(host);
+    }
+
+    /// Pushes a sustained stream through the tunnel and counts what survives.
+    #[test]
+    #[ignore = "binds stream ports and contacts STUN/UPnP"]
+    fn tunnel_throughput() {
+        let sink = StdUdpSocket::bind((HOST_LOOPBACK, UDP_PORTS[0])).unwrap();
+        socket2::SockRef::from(&sink).set_recv_buffer_size(RECEIVE_BUFFER).unwrap();
+        let received = Arc::new(AtomicU64::new(0));
+        {
+            let received = received.clone();
+            thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                while let Ok(count) = sink.recv(&mut buffer) {
+                    received.fetch_add(count as u64, Ordering::Relaxed);
+                }
+            });
+        }
+        let identity = Identity::generate("bench").unwrap();
+        let token = [6u8; 16];
+        let host = HostTunnel::open(&identity, token).unwrap();
+        let loopback: Vec<Candidate> = host.candidates.iter().filter(|c| c.addr.ip().is_loopback()).copied().collect();
+        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, || Ok(())).unwrap();
+
+        let client = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = SocketAddr::from((GUEST_LOOPBACK, UDP_PORTS[0]));
+        let payload = vec![1u8; 1100];
+        for mbps in [100.0, 300.0, 500.0] {
+            received.store(0, Ordering::Relaxed);
+            let rate = mbps * 1e6 / 8.0;
+            let start = Instant::now();
+            let mut sent = 0u64;
+            while start.elapsed() < Duration::from_secs(1) {
+                let due = (start.elapsed().as_secs_f64() * rate) as u64;
+                while sent < due {
+                    client.send_to(&payload, target).unwrap();
+                    sent += payload.len() as u64;
+                }
+                std::hint::spin_loop();
+            }
+            thread::sleep(Duration::from_millis(300));
+            let got = received.load(Ordering::Relaxed);
+            eprintln!(
+                "{mbps:>4.0} Мбит/с: доставлено {:.2} % ({} из {} пакетов)",
+                got as f64 * 100.0 / sent as f64,
+                got / 1100,
+                sent / 1100
+            );
+        }
+        drop(guest);
+        drop(host);
+    }
+
     #[test]
     fn signal_round_trips_only_with_the_right_token() {
         let addrs = vec![SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 51000)];
