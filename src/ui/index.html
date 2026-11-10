@@ -20,6 +20,13 @@
   </header>
 
   <main>
+    <div id="update-banner" class="column banner-wrap" hidden>
+      <section class="banner">
+        <div><b id="update-title"></b><small>Новая версия уже скачана и проверена.</small></div>
+        <button type="button" class="btn primary small" data-action="restart">Перезапустить</button>
+      </section>
+    </div>
+
     <!-- Live session (host and/or guest) -->
     <div id="live" class="column" hidden>
       <section id="host-live" class="session" hidden>
@@ -137,6 +144,7 @@
       <h3>Система</h3>
       <div class="list">
         <div class="item"><span><b>Аппаратное планирование GPU</b><small id="hags-note"></small></span><button type="button" class="btn small" data-action="graphics">Открыть</button></div>
+        <div class="item"><span><b>Обновления</b><small id="update-note"></small></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
         <div class="item"><span><b>Журналы</b><small id="version-note"></small></span><button type="button" class="btn small" data-action="logs">Открыть</button></div>
       </div>
     </div>

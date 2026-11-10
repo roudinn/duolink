@@ -7,6 +7,7 @@ mod protocol;
 mod session;
 mod setup;
 mod tunnel;
+mod update;
 
 fn message(text: &str, icon: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBoxW};
@@ -30,6 +31,8 @@ fn main() {
         // Installation is a convenience: run portable if it fails.
         Err(_) => {}
     }
+    update::cleanup();
+    platform::prioritize_self();
     if let Err(error) = gui::run() {
         message(&format!("{error:#}"), MB_ICONERROR);
     }

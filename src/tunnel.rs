@@ -46,7 +46,7 @@ use tokio::{
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::{
-    platform::system_tool,
+    platform::{prioritize_thread, system_tool},
     protocol::{CONTROL_PORT, Candidate, Identity, MEDIA_PORT, PathKind, Pin},
 };
 
@@ -423,9 +423,19 @@ fn client_config(fingerprint: [u8; 32]) -> Result<ClientConfig> {
     Ok(config)
 }
 
+/// A video frame at high bitrate arrives as a burst far larger than Windows'
+/// default 64 KB socket buffer; without room for it the burst is dropped.
+const SOCKET_BUFFER: usize = 8 << 20;
+
+fn enlarge(socket: socket2::SockRef<'_>) {
+    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
+    let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
+}
+
 fn runtime() -> Result<Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .on_thread_start(prioritize_thread)
         .thread_name("duolink-net")
         .enable_all()
         .build()?)
@@ -463,6 +473,7 @@ async fn serve_host(conn: Connection) {
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
         let Ok(socket) = UdpSocket::bind((HOST_LOOPBACK, 0)).await else { return };
+        enlarge(socket2::SockRef::from(&socket));
         if socket.connect((HOST_LOOPBACK, port)).await.is_err() {
             return;
         }
@@ -654,6 +665,7 @@ impl HostTunnel {
         let punch_socket = socket.try_clone()?;
         socket.set_read_timeout(None)?;
         socket.set_nonblocking(true)?;
+        enlarge(socket2::SockRef::from(&socket));
         let runtime = runtime()?;
         let endpoint = {
             let _guard = runtime.enter();
@@ -797,6 +809,7 @@ impl GuestTunnel {
 
         socket.set_read_timeout(None)?;
         socket.set_nonblocking(true)?;
+        enlarge(socket2::SockRef::from(&socket));
         let runtime = runtime()?;
         let endpoint = {
             let _guard = runtime.enter();
@@ -861,6 +874,7 @@ impl GuestTunnel {
                 let socket = UdpSocket::bind((GUEST_LOOPBACK, port))
                     .await
                     .with_context(|| format!("Порт {port} на этом ПК занят. Закройте другой стриминг."))?;
+                enlarge(socket2::SockRef::from(&socket));
                 sockets.push((port, socket));
             }
             anyhow::Ok((listeners, sockets))

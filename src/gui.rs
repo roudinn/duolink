@@ -27,6 +27,7 @@ use crate::{
     protocol::Invite,
     session::{Event, Session},
     setup::{self, Components},
+    update::{self, Updater},
 };
 
 const VIEW: &str = "duolink://localhost/index.html";
@@ -48,6 +49,8 @@ enum Action {
     Paste,
     Install,
     Graphics,
+    CheckUpdate,
+    Restart,
     Logs,
 }
 
@@ -178,6 +181,11 @@ struct App {
     version: &'static str,
     /// Start hosting as soon as the running setup succeeds.
     host_after_setup: bool,
+    update: update::Status,
+    #[serde(skip)]
+    updater: Option<Updater>,
+    #[serde(skip)]
+    quit: bool,
     #[serde(skip)]
     data: PathBuf,
 }
@@ -192,6 +200,9 @@ impl App {
             full_setup: false,
             version: env!("CARGO_PKG_VERSION"),
             host_after_setup: false,
+            update: update::Status::Idle,
+            updater: Updater::start(),
+            quit: false,
             data,
         };
         // Streaming engines need no permission: fetch them right away.
@@ -287,6 +298,23 @@ impl App {
                 Err(_) => toast(view, "В буфере обмена нет текста.")?,
             },
             Action::Install if !self.full_setup => self.start_full_setup(),
+            Action::CheckUpdate => match &self.updater {
+                Some(updater) => {
+                    updater.check_now();
+                    self.update = update::Status::Checking;
+                }
+                None => toast(view, "Обновления отключены для этой сборки.")?,
+            },
+            Action::Restart if matches!(self.update, update::Status::Ready(_)) => {
+                if self.host.session.is_some() || self.guest.session.is_some() {
+                    toast(view, "Сначала завершите сессию.")?;
+                } else if let Some(updater) = &self.updater {
+                    match updater.relaunch() {
+                        Ok(()) => self.quit = true,
+                        Err(error) => toast(view, &format!("{error:#}"))?,
+                    }
+                }
+            }
             Action::Graphics => open_or_toast(view, OsStr::new(GRAPHICS))?,
             Action::Logs => {
                 let directory = self.data.join("logs");
@@ -302,7 +330,13 @@ impl App {
         let (host, _) = self.host.poll(true);
         let (guest, _) = self.guest.poll(false);
         let (setup, setup_done) = self.setup.poll(false);
-        let changed = host || guest || setup;
+        let mut changed = host || guest || setup;
+        if let Some(updater) = &self.updater {
+            for status in updater.statuses.try_iter() {
+                self.update = status;
+                changed = true;
+            }
+        }
         if setup_done {
             let full = std::mem::take(&mut self.full_setup);
             self.refresh();
@@ -323,6 +357,10 @@ impl App {
         self.host.session.is_some()
             || self.guest.session.is_some()
             || self.setup.session.is_some()
+            || matches!(
+                self.update,
+                update::Status::Idle | update::Status::Checking | update::Status::Downloading(_)
+            ) && self.updater.is_some()
     }
 
     fn shutdown(&self) {
@@ -431,6 +469,12 @@ pub fn run() -> Result<()> {
             WindowEvent::UserEvent(action) => {
                 if let Err(error) = app.action(action, &view) {
                     let _ = toast(&view, &error.to_string());
+                }
+                if app.quit {
+                    window.set_visible(false);
+                    app.shutdown();
+                    *control = ControlFlow::Exit;
+                    return;
                 }
             }
             WindowEvent::MainEventsCleared => app.poll(&view),

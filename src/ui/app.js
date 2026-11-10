@@ -171,12 +171,29 @@ function applyState(next) {
     : hags === false ? "Выключено. Включите на хосте и перезагрузите ПК — меньше задержка кодирования"
     : "Состояние неизвестно");
   text("version-note", `Версия ${next.version}`);
+  renderUpdate(next.update);
 
   if (next.host.phase === "approval" && prev?.host.phase !== "approval" && !settings.open) {
     document.querySelector('[data-action="allow"]').focus();
   }
   if (next.host.phase === "invite" && prev?.host.phase !== "invite" && !settings.open) $("copy-button").focus();
   if (next.guest.codeError && !prev?.guest.codeError) guestCode.focus();
+}
+
+function renderUpdate(update) {
+  const ready = update.state === "ready";
+  show("update-banner", ready);
+  if (ready) text("update-title", `DuoLink ${update.version} готов`);
+  const notes = {
+    idle: "Проверяются автоматически",
+    checking: "Проверяем…",
+    current: "У вас последняя версия",
+    downloading: `Скачиваем ${update.version}…`,
+    ready: `Версия ${update.version} установится при перезапуске`,
+    failed: `Не удалось проверить: ${update.version ?? ""}`,
+  };
+  text("update-note", notes[update.state] ?? "");
+  $("update-check").disabled = update.state === "checking" || update.state === "downloading" || ready;
 }
 
 function toast(message) {

@@ -23,10 +23,12 @@ use windows_sys::{
             Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState},
             Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
             Threading::{
-                CREATE_NO_WINDOW, CreateMutexW, HIGH_PRIORITY_CLASS,
+                ABOVE_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CreateMutexW, GetCurrentProcess,
+                GetCurrentThread, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
                 PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
                 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-                ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+                ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, SetThreadPriority,
+                THREAD_PRIORITY_HIGHEST,
             },
         },
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
@@ -134,6 +136,38 @@ impl HostLock {
     }
 }
 
+/// Raises a process's priority class and opts it out of EcoQoS, which on
+/// Windows 11 parks background processes on efficiency cores and coalesces
+/// their timers.
+fn prioritize(handle: HANDLE, class: PROCESS_CREATION_FLAGS) {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    unsafe {
+        SetPriorityClass(handle, class);
+        SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+/// DuoLink itself relays every packet of the stream: keep it responsive while
+/// a game saturates the CPU and its window sits in the background.
+pub fn prioritize_self() {
+    prioritize(unsafe { GetCurrentProcess() }, ABOVE_NORMAL_PRIORITY_CLASS);
+}
+
+/// For the threads that move stream packets.
+pub fn prioritize_thread() {
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
+}
+
 pub struct Process {
     child: Child,
     _job: Handle,
@@ -178,22 +212,7 @@ impl Process {
     /// EcoQoS would otherwise park them on efficiency cores and coalesce their
     /// timers. Raise the class and opt out of both throttles.
     pub fn boost(&self) {
-        let handle = self.child.as_raw_handle();
-        let state = PROCESS_POWER_THROTTLING_STATE {
-            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-            StateMask: 0,
-        };
-        unsafe {
-            SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
-            SetProcessInformation(
-                handle,
-                ProcessPowerThrottling,
-                (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
-                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-            );
-        }
+        prioritize(self.child.as_raw_handle(), HIGH_PRIORITY_CLASS);
     }
 
     pub fn status(&mut self) -> Result<Option<ExitStatus>> {
