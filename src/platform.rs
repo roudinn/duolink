@@ -286,3 +286,83 @@ pub fn hags_enabled() -> Option<bool> {
     };
     (status == 0).then_some(data == 2)
 }
+
+/// Quiets every connected Wi-Fi adapter for the length of a session.
+///
+/// Windows periodically leaves the channel to scan for other networks, which
+/// stalls traffic for 50–200 ms roughly once a minute: the classic periodic
+/// streaming hitch. Background scanning is turned off and media-streaming mode
+/// on. Both settings belong to this handle; Windows restores them when it is
+/// closed, including if DuoLink crashes.
+pub struct WifiQuiet {
+    handle: HANDLE,
+}
+
+// The WLAN client handle may be closed from any thread.
+unsafe impl Send for WifiQuiet {}
+
+impl WifiQuiet {
+    pub fn hold() -> Option<Self> {
+        use windows_sys::Win32::NetworkManagement::WiFi::{
+            WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
+            WlanOpenHandle, WlanSetInterface, wlan_interface_state_connected,
+            wlan_intf_opcode_background_scan_enabled, wlan_intf_opcode_media_streaming_mode,
+        };
+        let mut version = 0u32;
+        let mut handle: HANDLE = std::ptr::null_mut();
+        if unsafe { WlanOpenHandle(2, std::ptr::null(), &mut version, &mut handle) } != 0 {
+            return None;
+        }
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        if unsafe { WlanEnumInterfaces(handle, std::ptr::null(), &mut list) } != 0 || list.is_null() {
+            unsafe { WlanCloseHandle(handle, std::ptr::null()) };
+            return None;
+        }
+        let mut adapters = 0;
+        unsafe {
+            let count = (*list).dwNumberOfItems as usize;
+            let first = std::ptr::addr_of!((*list).InterfaceInfo).cast::<
+                windows_sys::Win32::NetworkManagement::WiFi::WLAN_INTERFACE_INFO,
+            >();
+            for index in 0..count {
+                let info = &*first.add(index);
+                if info.isState != wlan_interface_state_connected {
+                    continue;
+                }
+                let off: u32 = 0;
+                let on: u32 = 1;
+                WlanSetInterface(
+                    handle,
+                    &info.InterfaceGuid,
+                    wlan_intf_opcode_background_scan_enabled,
+                    size_of::<u32>() as u32,
+                    (&off as *const u32).cast(),
+                    std::ptr::null(),
+                );
+                WlanSetInterface(
+                    handle,
+                    &info.InterfaceGuid,
+                    wlan_intf_opcode_media_streaming_mode,
+                    size_of::<u32>() as u32,
+                    (&on as *const u32).cast(),
+                    std::ptr::null(),
+                );
+                adapters += 1;
+            }
+            WlanFreeMemory(list.cast());
+        }
+        if adapters == 0 {
+            unsafe { WlanCloseHandle(handle, std::ptr::null()) };
+            return None;
+        }
+        Some(Self { handle })
+    }
+}
+
+impl Drop for WifiQuiet {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::NetworkManagement::WiFi::WlanCloseHandle(self.handle, std::ptr::null())
+        };
+    }
+}

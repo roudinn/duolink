@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -22,7 +22,7 @@ local-ip-address = "0.6"
 tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.57", default-features = false }
 clipboard-win = { version = "5.4", features = ["std"] }
-windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_WiFi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 igd-next = "0.16"
 ring = "0.17"

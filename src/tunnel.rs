@@ -19,7 +19,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -64,6 +64,24 @@ const STUN_SERVERS: [&str; 3] = [
 ];
 const SIGNAL_SERVER: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
+const PROBE_PORT: u16 = 0;
+/// The probe sends at this rate; reaching most of it means "not the bottleneck".
+const PROBE_MBPS: f64 = 300.0;
+const PROBE_TIME: Duration = Duration::from_millis(700);
+
+/// Datagrams the tunnel could not send (too large or no connection).
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+pub fn dropped() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
+fn forward(conn: &Connection, port: u16, payload: &[u8]) {
+    if conn.send_datagram(tag(port, payload)).is_err() {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /* ------------------------------------------------------------------ STUN */
 
@@ -386,11 +404,13 @@ impl ControllerFactory for Unthrottled {
 fn transport() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config
-        .max_idle_timeout(Some(Duration::from_secs(6).try_into().unwrap()))
+        // Rides out a short Wi-Fi dropout; a clean disconnect is still instant.
+        .max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_millis(500)))
         .initial_mtu(1280)
         .datagram_receive_buffer_size(Some(16 << 20))
-        .datagram_send_buffer_size(16 << 20)
+        // Under overload, drop stale video rather than queue it: a late frame is worse than none.
+        .datagram_send_buffer_size(2 << 20)
         .max_concurrent_bidi_streams(VarInt::from_u32(64))
         .congestion_controller_factory(Arc::new(Unthrottled));
     Arc::new(config)
@@ -425,11 +445,50 @@ fn client_config(fingerprint: [u8; 32]) -> Result<ClientConfig> {
 
 /// A video frame at high bitrate arrives as a burst far larger than Windows'
 /// default 64 KB socket buffer; without room for it the burst is dropped.
-const SOCKET_BUFFER: usize = 8 << 20;
+const RECEIVE_BUFFER: usize = 8 << 20;
+/// Sending stays shallow: several frames of room, never seconds of backlog.
+const SEND_BUFFER: usize = 1 << 20;
 
 fn enlarge(socket: socket2::SockRef<'_>) {
-    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
-    let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
+    let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
+    let _ = socket.set_send_buffer_size(SEND_BUFFER);
+}
+
+/// Host side of the bandwidth probe: a fixed-rate burst of datagrams, then
+/// the number of bytes offered on the probe stream.
+async fn probe_send(conn: Connection, mut reply: quinn::SendStream) {
+    let size = conn.max_datagram_size().unwrap_or(1100).clamp(64, 1100);
+    let payload = vec![0u8; size - 2];
+    let rate = PROBE_MBPS * 1e6 / 8.0;
+    let start = Instant::now();
+    let mut sent: u64 = 0;
+    while start.elapsed() < PROBE_TIME {
+        let due = (start.elapsed().as_secs_f64() * rate) as u64;
+        while sent < due {
+            if conn.send_datagram(tag(PROBE_PORT, &payload)).is_err() {
+                break;
+            }
+            sent += size as u64;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let _ = reply.write_all(&sent.to_be_bytes()).await;
+    let _ = reply.finish();
+}
+
+#[derive(Default)]
+struct ProbeStats {
+    bytes: u64,
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
+
+/// Measured host→guest throughput.
+#[derive(Clone, Copy, Debug)]
+pub struct Bandwidth {
+    pub mbps: f64,
+    /// The path, not the probe, set the rate.
+    pub limited: bool,
 }
 
 fn runtime() -> Result<Runtime> {
@@ -484,9 +543,7 @@ async fn serve_host(conn: Connection) {
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 match socket.recv(&mut buffer).await {
-                    Ok(count) => {
-                        let _ = conn.send_datagram(tag(port, &buffer[..count]));
-                    }
+                    Ok(count) => forward(&conn, port, &buffer[..count]),
                     Err(error) if reset(&error) => {}
                     Err(_) => break,
                 }
@@ -508,12 +565,17 @@ async fn serve_host(conn: Connection) {
         })
     };
     while let Ok((send, mut recv)) = conn.accept_bi().await {
+        let conn = conn.clone();
         tokio::spawn(async move {
             let mut header = [0u8; 2];
             if recv.read_exact(&mut header).await.is_err() {
                 return;
             }
             let port = u16::from_be_bytes(header);
+            if port == PROBE_PORT {
+                probe_send(conn, send).await;
+                return;
+            }
             if !TCP_PORTS.contains(&port) {
                 return;
             }
@@ -526,7 +588,12 @@ async fn serve_host(conn: Connection) {
 }
 
 /// Guest side: the same ports mirrored on 127.0.0.2.
-async fn serve_guest(conn: Connection, listeners: Vec<(u16, TcpListener)>, sockets: Vec<(u16, UdpSocket)>) {
+async fn serve_guest(
+    conn: Connection,
+    listeners: Vec<(u16, TcpListener)>,
+    sockets: Vec<(u16, UdpSocket)>,
+    probe: Arc<Mutex<ProbeStats>>,
+) {
     for (port, listener) in listeners {
         let conn = conn.clone();
         tokio::spawn(async move {
@@ -553,7 +620,7 @@ async fn serve_guest(conn: Connection, listeners: Vec<(u16, TcpListener)>, socke
                 match socket.recv_from(&mut buffer).await {
                     Ok((count, from)) => {
                         *client.lock().unwrap() = Some(from);
-                        let _ = conn.send_datagram(tag(port, &buffer[..count]));
+                        forward(&conn, port, &buffer[..count]);
                     }
                     Err(error) if reset(&error) => {}
                     Err(_) => break,
@@ -566,6 +633,14 @@ async fn serve_guest(conn: Connection, listeners: Vec<(u16, TcpListener)>, socke
             continue;
         }
         let port = u16::from_be_bytes([datagram[0], datagram[1]]);
+        if port == PROBE_PORT {
+            let now = Instant::now();
+            let mut stats = probe.lock().unwrap();
+            stats.bytes += datagram.len() as u64;
+            stats.first.get_or_insert(now);
+            stats.last = Some(now);
+            continue;
+        }
         if let Some((socket, client)) = routes.get(&port) {
             let target = *client.lock().unwrap();
             if let Some(target) = target {
@@ -739,8 +814,10 @@ impl Drop for HostTunnel {
 }
 
 async fn accept(endpoint: Endpoint, token: [u8; 16], peer: Arc<Mutex<Option<Connection>>>) {
+    // A connection that died before the session began must not hold the slot.
+    let taken = |slot: &Option<Connection>| slot.as_ref().is_some_and(|c| c.close_reason().is_none());
     while let Some(incoming) = endpoint.accept().await {
-        if peer.lock().unwrap().is_some() {
+        if taken(&peer.lock().unwrap()) {
             incoming.refuse();
             continue;
         }
@@ -764,7 +841,7 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], peer: Arc<Mutex<Option<Conn
             }
             {
                 let mut slot = peer.lock().unwrap();
-                if slot.is_some() {
+                if taken(&slot) {
                     conn.close(VarInt::from_u32(4), b"busy");
                     return;
                 }
@@ -783,6 +860,7 @@ pub struct GuestTunnel {
     runtime: Option<Runtime>,
     endpoint: Endpoint,
     conn: Connection,
+    probe: Arc<Mutex<ProbeStats>>,
     pub kind: PathKind,
     pub same_machine: bool,
 }
@@ -879,15 +957,48 @@ impl GuestTunnel {
             }
             anyhow::Ok((listeners, sockets))
         })?;
-        runtime.spawn(serve_guest(conn.clone(), listeners, sockets));
+        let probe = Arc::new(Mutex::new(ProbeStats::default()));
+        runtime.spawn(serve_guest(conn.clone(), listeners, sockets, probe.clone()));
 
         let same_machine = is_self(conn.remote_address().ip());
         Ok(Self {
             runtime: Some(runtime),
             endpoint,
             conn,
+            probe,
             kind,
             same_machine,
+        })
+    }
+
+    /// Asks the host for a short burst and measures what actually arrives.
+    pub fn measure(&self) -> Option<Bandwidth> {
+        let runtime = self.runtime.as_ref()?;
+        *self.probe.lock().unwrap() = ProbeStats::default();
+        let conn = self.conn.clone();
+        let offered = runtime.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                send.write_all(&PROBE_PORT.to_be_bytes()).await.ok()?;
+                let mut total = [0u8; 8];
+                recv.read_exact(&mut total).await.ok()?;
+                Some(u64::from_be_bytes(total))
+            })
+            .await
+            .ok()
+            .flatten()
+        })?;
+        // Stragglers still in flight.
+        thread::sleep(Duration::from_millis(150));
+        let stats = self.probe.lock().unwrap();
+        let span = stats.last?.duration_since(stats.first?);
+        if offered == 0 || span < Duration::from_millis(100) {
+            return None;
+        }
+        let mbps = stats.bytes as f64 * 8.0 / span.as_secs_f64() / 1e6;
+        Some(Bandwidth {
+            mbps,
+            limited: mbps < PROBE_MBPS * 0.85,
         })
     }
 

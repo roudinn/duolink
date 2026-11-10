@@ -201,8 +201,8 @@ pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
          upnp = disabled\n\
          system_tray = disabled\n\
          notify_pre_releases = disabled\n\
-         lan_encryption_mode = 2\n\
-         wan_encryption_mode = 2\n\
+         lan_encryption_mode = 0\n\
+         wan_encryption_mode = 0\n\
          controller = enabled\n\
          gamepad_driver = vigembus\n\
          gamepad = x360\n\

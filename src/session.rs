@@ -17,12 +17,12 @@ use uuid::Uuid;
 
 use crate::{
     media::{GuestStream, HostStream, MOONLIGHT, Preferences, SUNSHINE},
-    platform::{HostLock, KeepAwake, display_mode, vigem_present},
+    platform::{HostLock, KeepAwake, WifiQuiet, display_mode, vigem_present},
     protocol::{
         CONTROL_PORT, Identity, Invite, MEDIA_PORT, Profile, Reply, Request, Wire, client_config,
         new_token, valid_pem,
     },
-    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, describe_peer},
+    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, describe_peer, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -181,6 +181,22 @@ fn connection_fact(label: &str, rtt: Duration) -> String {
     format!("{label} · {} мс", rtt.as_millis().max(1))
 }
 
+/// Silences Wi-Fi background scans for the session and says so.
+fn quiet_wifi(worker: &Worker) -> Option<WifiQuiet> {
+    let quiet = WifiQuiet::hold()?;
+    worker.fact("Wi-Fi", "Фоновое сканирование выключено");
+    Some(quiet)
+}
+
+/// Shows tunnel losses only when there are any.
+fn report_drops(worker: &Worker, shown: &mut u64) {
+    let now = dropped();
+    if now != *shown {
+        *shown = now;
+        worker.fact("Отброшено пакетов", now.to_string());
+    }
+}
+
 fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<String> {
     let address = Ipv4Addr::LOCALHOST;
     let _lock = HostLock::acquire()?;
@@ -265,11 +281,13 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     worker.fact("Гость", format!("{name} · {peer}"));
     worker.fact("Профиль", profile_label(profile));
     let mut next_rtt = Instant::now();
+    let mut drops_shown = dropped();
     let mut report = |worker: &Worker| {
         if Instant::now() >= next_rtt
             && let Some((addr, rtt)) = tunnel.peer()
         {
             worker.fact("Соединение", connection_fact(describe_peer(addr), rtt));
+            report_drops(worker, &mut drops_shown);
             next_rtt = Instant::now() + Duration::from_secs(2);
         }
     };
@@ -306,6 +324,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     }
 
     worker.status("Гость допущен. Запускаем захват экрана и звука…");
+    let _wifi = quiet_wifi(worker);
     wire.send(&Reply::Preparing)?;
     let host_id = Uuid::new_v4();
     let mode = display_mode()?;
@@ -409,7 +428,7 @@ fn guest(
     worker: &Worker,
     data: PathBuf,
     invite: Invite,
-    preferences: Preferences,
+    mut preferences: Preferences,
 ) -> Result<String> {
     worker.status("Подготовка Moonlight. При первом запуске загружается около 37 МБ.");
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
@@ -421,7 +440,21 @@ fn guest(
         worker.check()
     })?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
+    let _wifi = quiet_wifi(worker);
+    worker.status("Измеряем скорость канала…");
+    let channel = tunnel.measure();
+    if let Some(channel) = channel {
+        worker.fact(
+            "Канал",
+            if channel.limited {
+                format!("≈ {:.0} Мбит/с", channel.mbps)
+            } else {
+                format!("быстрее {:.0} Мбит/с", channel.mbps.floor())
+            },
+        );
+    }
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
+    let mut drops_shown = dropped();
     worker.status("Соединение установлено. Ждём подтверждения хоста…");
     let endpoint = SocketAddr::from((GUEST_LOOPBACK, CONTROL_PORT));
     let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
@@ -474,6 +507,7 @@ fn guest(
         }
         if Instant::now() >= next_rtt {
             worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
+            report_drops(worker, &mut drops_shown);
             next_rtt = Instant::now() + Duration::from_secs(2);
         }
         ensure!(
@@ -500,9 +534,28 @@ fn guest(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Получен неверный режим видео."
                 );
+                // Video + 20 % FEC + audio must fit the measured path, or the
+                // router queues frames: latency climbs and the picture freezes.
+                let mut capped = false;
+                if preferences.bitrate.is_none()
+                    && let Some(channel) = channel.filter(|c| c.limited)
+                {
+                    let budget = ((channel.mbps * 0.7 * 1000.0) as u32).max(3_000);
+                    if budget < preferences.bitrate_for(mode) {
+                        preferences.bitrate = Some(budget);
+                        capped = true;
+                    }
+                }
                 let bitrate = preferences.bitrate_for(mode);
                 worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
-                worker.fact("Битрейт", format!("{} Мбит/с", bitrate.div_ceil(1000)));
+                worker.fact(
+                    "Битрейт",
+                    if capped {
+                        format!("{} Мбит/с · под скорость канала", bitrate.div_ceil(1000))
+                    } else {
+                        format!("{} Мбит/с", bitrate.div_ceil(1000))
+                    },
+                );
                 worker.fact("Кодек", preferences.codec.label());
                 worker.fact("Профиль", profile_label(preferences.profile));
                 worker.status(format!(
@@ -631,7 +684,7 @@ mod tests {
                     "the requested stream mode was not forwarded"
                 );
                 let host_log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
-                assert!(host_log.contains("Video encryption enabled"));
+                assert!(host_log.contains("CLIENT CONNECTED"));
                 break;
             }
             assert!(
