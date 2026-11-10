@@ -16,13 +16,15 @@ use uuid::Uuid;
 
 use crate::{
     platform::{Process, run_tool, system_tool},
-    protocol::{Identity, MEDIA_PORT, Mode, Profile, tailscale_address},
+    protocol::{Identity, MEDIA_PORT, Mode, Profile},
 };
 
 const DESKTOP: &str = "DuoLink";
 
-/// Video datagram size that fits Tailscale's 1280-byte MTU without IP fragmentation.
-const TAILSCALE_PACKET: u32 = 1024;
+/// Video packet size. With RTP, Sunshine's encryption and the 2-byte tunnel
+/// header it still fits one QUIC datagram on a 1280-byte path, so a frame is
+/// never fragmented at the IP layer anywhere on the internet.
+const PACKET_SIZE: u32 = 1024;
 
 pub const SUNSHINE: Engine = Engine {
     name: "Sunshine",
@@ -190,11 +192,6 @@ fn encoder_tuning(profile: Profile) -> &'static str {
 }
 
 pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
-    let packet = if tailscale_address(address) {
-        format!("packetsize = {TAILSCALE_PACKET}\n")
-    } else {
-        String::new()
-    };
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -220,8 +217,8 @@ pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
          ping_timeout = 5000\n\
          hevc_mode = 0\n\
          av1_mode = 0\n\
+         packetsize = {PACKET_SIZE}\n\
          {encoder}\
-         {packet}\
          file_apps = {rel}/apps.json\n\
          file_state = {rel}/state.json\n\
          pkey = {rel}/server.key\n\
@@ -522,6 +519,7 @@ impl GuestStream {
         exe: &Path,
         data: &Path,
         address: Ipv4Addr,
+        same_machine: bool,
         host: Uuid,
         certificate: &str,
         identity: &Identity,
@@ -553,13 +551,13 @@ impl GuestStream {
         let mut command = Command::new(exe);
         command
             .current_dir(directory.path())
-            .args(guest_args(address, mode, preferences))
+            .args(guest_args(same_machine, mode, preferences))
             .arg(host.to_string())
             .arg(DESKTOP)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        if address.is_loopback() {
+        if same_machine {
             // Still receive and decode audio, with no feedback into host WASAPI loopback.
             command
                 .env("SDL_AUDIODRIVER", "dummy")
@@ -574,8 +572,8 @@ impl GuestStream {
     }
 }
 
-pub fn guest_args(address: Ipv4Addr, mode: Mode, preferences: Preferences) -> Vec<String> {
-    let display = if address.is_loopback() {
+pub fn guest_args(same_machine: bool, mode: Mode, preferences: Preferences) -> Vec<String> {
+    let display = if same_machine {
         "windowed"
     } else if preferences.windowed {
         "borderless"
@@ -618,10 +616,8 @@ pub fn guest_args(address: Ipv4Addr, mode: Mode, preferences: Preferences) -> Ve
     args.push(toggle(preferences.yuv444, "yuv444"));
     args.push(toggle(preferences.hdr, "hdr"));
     args.push(toggle(preferences.stats, "performance-overlay"));
-    if tailscale_address(address) {
-        // An explicit size also keeps Moonlight in its LAN mode (short audio packets).
-        args.extend(["--packet-size".into(), TAILSCALE_PACKET.to_string()]);
-    }
+    // An explicit size also keeps Moonlight in its LAN mode (5 ms audio packets).
+    args.extend(["--packet-size".into(), PACKET_SIZE.to_string()]);
     args
 }
 
@@ -689,19 +685,16 @@ mod tests {
     #[test]
     fn engines_get_low_latency_flags() {
         let mode = Mode { width: 2560, height: 1440, fps: 165 };
-        let remote = Ipv4Addr::new(100, 70, 1, 2);
-        let args = guest_args(remote, mode, Preferences::default());
+        let args = guest_args(false, mode, Preferences::default());
         let has = |flag: &str| args.iter().any(|arg| arg == flag);
         for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "1024"] {
             assert!(has(flag), "missing {flag}");
         }
-        assert!(!guest_args(Ipv4Addr::new(192, 168, 1, 2), mode, Preferences::default())
-            .iter()
-            .any(|arg| arg == "--packet-size"));
-        let config = host_config("x", remote, Profile::Latency);
+        assert!(guest_args(true, mode, Preferences::default()).iter().any(|arg| arg == "windowed"));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, Profile::Latency);
         assert!(config.contains("nvenc_split_encode = enabled"));
         assert!(config.contains("amd_usage = ultralowlatency"));
         assert!(config.contains("packetsize = 1024"));
-        assert!(!host_config("x", Ipv4Addr::LOCALHOST, Profile::Quality).contains("packetsize"));
+        assert!(config.contains("bind_address = 127.0.0.1"));
     }
 }

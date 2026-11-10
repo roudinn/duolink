@@ -20,56 +20,6 @@
   </header>
 
   <main>
-    <!-- Home -->
-    <div id="home" class="column">
-      <section id="prepare" class="card" hidden>
-        <div class="card-head">
-          <h2>Подготовка</h2>
-          <span id="prepare-count" class="muted"></span>
-        </div>
-        <ul class="checklist">
-          <li id="c-engines"><span class="mark"></span><div><b>Движки стриминга</b><small>Sunshine и Moonlight</small></div><em></em></li>
-          <li id="c-vigem"><span class="mark"></span><div><b>Драйвер геймпада</b><small>Чтобы игра увидела второго игрока</small></div><em></em></li>
-          <li id="c-tailscale"><span class="mark"></span><div><b>Tailscale</b><small>Прямое соединение через интернет</small></div><em></em></li>
-          <li id="c-firewall"><span class="mark"></span><div><b>Брандмауэр</b><small>Порты только для вашей сети</small></div><em></em></li>
-        </ul>
-        <p id="setup-line" class="status-line" role="status" hidden></p>
-        <div class="actions">
-          <button type="button" id="install" class="btn primary wide" data-action="install">Установить всё</button>
-          <button type="button" id="login" class="btn wide" data-action="tailscale_login" hidden>Войти в Tailscale</button>
-        </div>
-      </section>
-
-      <section id="host-card" class="card">
-        <h2>Пригласить друга</h2>
-        <p class="muted">Друг увидит этот экран, услышит звук и подключит свой геймпад как второй контроллер.</p>
-        <div class="network">
-          <label for="network">Сеть</label>
-          <select id="network"></select>
-        </div>
-        <button type="button" id="host-start" class="btn primary wide" data-action="host_start">Создать сессию</button>
-        <p id="host-result" class="status-line" role="status" hidden></p>
-      </section>
-
-      <section class="card">
-        <h2>Подключиться к другу</h2>
-        <form id="guest-form" class="stack">
-          <div class="code-field">
-            <input id="guest-code" class="mono" placeholder="Код приглашения" autocomplete="off" spellcheck="false" maxlength="256" aria-label="Код приглашения" aria-describedby="guest-result">
-            <button type="button" class="link" data-action="paste">Вставить</button>
-          </div>
-          <div class="segmented" role="radiogroup" aria-label="Профиль">
-            <button type="button" role="radio" data-profile="latency">Задержка</button>
-            <button type="button" role="radio" data-profile="balanced">Баланс</button>
-            <button type="button" role="radio" data-profile="quality">Качество</button>
-          </div>
-          <p id="profile-note" class="muted small"></p>
-          <button type="submit" class="btn primary wide">Подключиться</button>
-          <p id="guest-result" class="status-line" role="status" hidden></p>
-        </form>
-      </section>
-    </div>
-
     <!-- Live session (host and/or guest) -->
     <div id="live" class="column" hidden>
       <section id="host-live" class="session" hidden>
@@ -107,6 +57,50 @@
         <button type="button" id="guest-stop" class="btn" data-action="guest_stop">Отключиться</button>
       </section>
     </div>
+    <!-- Home -->
+    <div id="home" class="column">
+      <section id="prepare" class="card" hidden>
+        <div class="card-head">
+          <h2>Подготовка</h2>
+          <span id="prepare-count" class="muted"></span>
+        </div>
+        <ul class="checklist">
+          <li id="c-engines"><span class="mark"></span><div><b>Движки стриминга</b><small>Sunshine и Moonlight</small></div><em></em></li>
+          <li id="c-vigem"><span class="mark"></span><div><b>Драйвер геймпада</b><small>Чтобы игра увидела второго игрока</small></div><em></em></li>
+          <li id="c-firewall"><span class="mark"></span><div><b>Брандмауэр</b><small>Один порт для подключения друга</small></div><em></em></li>
+        </ul>
+        <p id="setup-line" class="status-line" role="status" hidden></p>
+        <div class="actions">
+          <button type="button" id="install" class="btn primary wide" data-action="install">Повторить установку</button>
+        </div>
+      </section>
+
+      <section id="host-card" class="card">
+        <h2>Пригласить друга</h2>
+        <p class="muted">Друг увидит этот экран, услышит звук и подключит свой геймпад как второй контроллер. Работает через интернет без регистрации.</p>
+        <button type="button" id="host-start" class="btn primary wide" data-action="host_start">Создать сессию</button>
+        <p id="host-result" class="status-line" role="status" hidden></p>
+      </section>
+
+      <section class="card">
+        <h2>Подключиться к другу</h2>
+        <form id="guest-form" class="stack">
+          <div class="code-field">
+            <input id="guest-code" class="mono" placeholder="Код приглашения" autocomplete="off" spellcheck="false" maxlength="256" aria-label="Код приглашения" aria-describedby="guest-result">
+            <button type="button" class="link" data-action="paste">Вставить</button>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="Профиль">
+            <button type="button" role="radio" data-profile="latency">Задержка</button>
+            <button type="button" role="radio" data-profile="balanced">Баланс</button>
+            <button type="button" role="radio" data-profile="quality">Качество</button>
+          </div>
+          <p id="profile-note" class="muted small"></p>
+          <button type="submit" class="btn primary wide">Подключиться</button>
+          <p id="guest-result" class="status-line" role="status" hidden></p>
+        </form>
+      </section>
+    </div>
+
   </main>
 
   <dialog id="settings" aria-labelledby="settings-title">
@@ -143,7 +137,6 @@
       <h3>Система</h3>
       <div class="list">
         <div class="item"><span><b>Аппаратное планирование GPU</b><small id="hags-note"></small></span><button type="button" class="btn small" data-action="graphics">Открыть</button></div>
-        <div class="item"><span><b>Доступ для друга</b><small>Поделитесь этим ПК в Tailscale, если у друга свой аккаунт</small></span><button type="button" class="btn small" data-action="sharing">Tailscale</button></div>
         <div class="item"><span><b>Журналы</b><small id="version-note"></small></span><button type="button" class="btn small" data-action="logs">Открыть</button></div>
       </div>
     </div>

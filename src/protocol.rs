@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read, Write},
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
 };
 
@@ -23,68 +23,104 @@ use uuid::Uuid;
 pub const CONTROL_PORT: u16 = 48171;
 pub const MEDIA_PORT: u16 = 48189;
 const MAX_FRAME: usize = 8192;
-const PREFIX: &str = "DL1-";
+const PREFIX: &str = "DL2-";
+const MAX_CANDIDATES: usize = 12;
 
-#[derive(Clone)]
+/// How a candidate address reaches the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathKind {
+    /// An address of one of the host's own interfaces (LAN, VPN, loopback).
+    Local = 0,
+    /// A port the host's router forwards through UPnP.
+    Forwarded = 1,
+    /// The host's public address as seen by STUN; needs NAT hole punching.
+    Public = 2,
+}
+
+impl PathKind {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Local),
+            1 => Some(Self::Forwarded),
+            2 => Some(Self::Public),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub kind: PathKind,
+    pub addr: SocketAddrV4,
+}
+
+/// Everything a guest needs to find and authenticate the host: the one-time
+/// token, the host certificate fingerprint and every address it may answer on.
+#[derive(Clone, Debug)]
 pub struct Invite {
-    pub address: Ipv4Addr,
     pub token: [u8; 16],
     pub fingerprint: [u8; 32],
+    pub candidates: Vec<Candidate>,
+}
+
+pub fn new_token() -> [u8; 16] {
+    let mut token = [0; 16];
+    OsRng.fill_bytes(&mut token);
+    token
 }
 
 impl Invite {
-    pub fn new(address: Ipv4Addr, identity: &Identity) -> Self {
-        let mut token = [0; 16];
-        OsRng.fill_bytes(&mut token);
-        Self {
-            address,
-            token,
-            fingerprint: identity.fingerprint(),
-        }
-    }
-
     pub fn encode(&self) -> String {
-        let mut bytes = [0; 52];
-        bytes[..4].copy_from_slice(&self.address.octets());
-        bytes[4..20].copy_from_slice(&self.token);
-        bytes[20..].copy_from_slice(&self.fingerprint);
+        let candidates = &self.candidates[..self.candidates.len().min(MAX_CANDIDATES)];
+        let mut bytes = Vec::with_capacity(49 + 7 * candidates.len());
+        bytes.extend_from_slice(&self.token);
+        bytes.extend_from_slice(&self.fingerprint);
+        bytes.push(candidates.len() as u8);
+        for candidate in candidates {
+            bytes.push(candidate.kind as u8);
+            bytes.extend_from_slice(&candidate.addr.ip().octets());
+            bytes.extend_from_slice(&candidate.addr.port().to_be_bytes());
+        }
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let payload = code
-            .trim()
-            .strip_prefix(PREFIX)
-            .context("Код приглашения должен начинаться с DL1-.")?;
-        let mut bytes = [0; 52];
+        let payload = code.trim().strip_prefix(PREFIX).context(
+            "Код приглашения должен начинаться с DL2-. Обновите DuoLink на обоих ПК.",
+        )?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()
+            .context("Повреждённый код приглашения.")?;
+        ensure!(bytes.len() >= 49, "Повреждённый код приглашения.");
+        let count = bytes[48] as usize;
         ensure!(
-            URL_SAFE_NO_PAD.decode_slice(payload, &mut bytes).ok() == Some(bytes.len()),
+            count > 0 && count <= MAX_CANDIDATES && bytes.len() == 49 + 7 * count,
             "Повреждённый код приглашения."
         );
-        let address = Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[..4])?);
-        ensure!(
-            permitted_address(address),
-            "Для подключения нужен адрес Tailscale или локальной сети."
-        );
+        let candidates = bytes[49..]
+            .chunks_exact(7)
+            .map(|chunk| {
+                Some(Candidate {
+                    kind: PathKind::from_byte(chunk[0])?,
+                    addr: SocketAddrV4::new(
+                        Ipv4Addr::new(chunk[1], chunk[2], chunk[3], chunk[4]),
+                        u16::from_be_bytes([chunk[5], chunk[6]]),
+                    ),
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .context("Повреждённый код приглашения.")?;
         Ok(Self {
-            address,
-            token: bytes[4..20].try_into()?,
-            fingerprint: bytes[20..].try_into()?,
+            token: bytes[..16].try_into()?,
+            fingerprint: bytes[16..48].try_into()?,
+            candidates,
         })
     }
 
     pub fn authorizes(&self, token: &[u8; 16]) -> bool {
         bool::from(self.token.ct_eq(token))
     }
-}
-
-pub fn tailscale_address(ip: Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
-    a == 100 && (64..128).contains(&b)
-}
-
-pub fn permitted_address(ip: Ipv4Addr) -> bool {
-    ip.is_private() || tailscale_address(ip) || ip == Ipv4Addr::LOCALHOST
 }
 
 pub struct Identity {
@@ -115,6 +151,10 @@ impl Identity {
         })
     }
 
+    pub fn key_der(&self) -> PrivatePkcs8KeyDer<'static> {
+        self.key_der.clone_key()
+    }
+
     pub fn fingerprint(&self) -> [u8; 32] {
         Sha256::digest(self.cert_der.as_ref()).into()
     }
@@ -128,8 +168,9 @@ impl Identity {
     }
 }
 
+/// Accepts exactly one server certificate: the one whose SHA-256 is in the invite.
 #[derive(Debug)]
-struct Pin([u8; 32]);
+pub struct Pin(pub [u8; 32]);
 
 impl ServerCertVerifier for Pin {
     fn verify_server_cert(
@@ -327,27 +368,27 @@ mod tests {
     #[test]
     fn invite_round_trip_and_validation() {
         let invite = Invite {
-            address: Ipv4Addr::new(100, 64, 1, 2),
             token: [7; 16],
             fingerprint: [3; 32],
+            candidates: vec![
+                Candidate {
+                    kind: PathKind::Forwarded,
+                    addr: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 48170),
+                },
+                Candidate {
+                    kind: PathKind::Local,
+                    addr: SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 20), 48170),
+                },
+            ],
         };
         let code = invite.encode();
         let decoded = Invite::decode(&format!(" {code}\r\n")).unwrap();
-        assert_eq!(decoded.address, invite.address);
+        assert_eq!(decoded.candidates, invite.candidates);
         assert_eq!(decoded.fingerprint, invite.fingerprint);
         assert!(decoded.authorizes(&invite.token));
         assert!(!decoded.authorizes(&[6; 16]));
         assert!(Invite::decode(&code[..code.len() - 1]).is_err());
-        assert!(
-            Invite::decode(
-                &Invite {
-                    address: Ipv4Addr::new(8, 8, 8, 8),
-                    ..invite
-                }
-                .encode()
-            )
-            .is_err()
-        );
+        assert!(Invite::decode("DL1-AAAA").is_err());
     }
 
     #[test]

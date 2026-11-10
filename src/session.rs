@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use crate::{
     media::{GuestStream, HostStream, MOONLIGHT, Preferences, SUNSHINE},
-    platform::{HostLock, KeepAwake, display_mode, tailscale_route, vigem_present},
+    platform::{HostLock, KeepAwake, display_mode, vigem_present},
     protocol::{
         CONTROL_PORT, Identity, Invite, MEDIA_PORT, Profile, Reply, Request, Wire, client_config,
-        tailscale_address, valid_pem,
+        new_token, valid_pem,
     },
+    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, describe_peer},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -57,22 +58,6 @@ impl Worker {
 
     fn fact(&self, key: &'static str, value: impl Into<String>) {
         self.emit(Event::Fact(key, value.into()));
-    }
-
-    /// Measures the Tailscale path in the background; the result arrives as a fact.
-    fn probe_route(&self, peer: Ipv4Addr) {
-        if !tailscale_address(peer) {
-            return;
-        }
-        let events = self.events.clone();
-        thread::spawn(move || {
-            let value = match tailscale_route(peer) {
-                Some(route) if route.direct => route.describe(),
-                Some(route) => format!("{} — NAT не пробит, задержка выше", route.describe()),
-                None => "Не удалось измерить".into(),
-            };
-            let _ = events.send(Event::Fact("Маршрут", value));
-        });
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -117,8 +102,8 @@ impl Session {
         }
     }
 
-    pub fn host(data: PathBuf, address: Ipv4Addr) -> Self {
-        Self::start(move |worker, decision| host(worker, decision, data, address))
+    pub fn host(data: PathBuf) -> Self {
+        Self::start(move |worker, decision| host(worker, decision, data))
     }
 
     pub fn guest(data: PathBuf, invite: Invite, preferences: Preferences) -> Self {
@@ -179,27 +164,48 @@ fn reserve_check(address: Ipv4Addr) -> Result<()> {
     Ok(())
 }
 
-fn host(
-    worker: &Worker,
-    decision: Receiver<bool>,
-    data: PathBuf,
-    address: Ipv4Addr,
-) -> Result<String> {
+/// One line about how reachable this host is from the internet.
+fn reachability(tunnel: &HostTunnel) -> &'static str {
+    if tunnel.forwarded {
+        "Открыт через UPnP роутера"
+    } else if tunnel.reflexive.addr.is_some() && !tunnel.reflexive.symmetric {
+        "Через пробивку NAT"
+    } else if tunnel.reflexive.symmetric {
+        "Строгий NAT — подключение может не пройти"
+    } else {
+        "Только локальная сеть"
+    }
+}
+
+fn connection_fact(label: &str, rtt: Duration) -> String {
+    format!("{label} · {} мс", rtt.as_millis().max(1))
+}
+
+fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<String> {
+    let address = Ipv4Addr::LOCALHOST;
     let _lock = HostLock::acquire()?;
-    ensure!(
-        address.is_loopback() || vigem_present(),
-        "На хосте нужен драйвер ViGEmBus. Откройте «Настройка»."
-    );
     reserve_check(address)?;
+    if !vigem_present() {
+        worker.fact("Геймпад гостя", "Драйвер ViGEmBus не установлен");
+    }
     worker.status("Подготовка Sunshine. При первом запуске загружается около 38 МБ.");
     let engine = SUNSHINE.ensure(&data, || worker.check())?;
     worker.check()?;
 
     let identity = Identity::generate("DuoLink Host")?;
-    let invite = Invite::new(address, &identity);
+    let token = new_token();
+    worker.status("Открываем доступ из интернета…");
+    let tunnel = HostTunnel::open(&identity, token)?;
+    worker.check()?;
+    worker.fact("Доступ", reachability(&tunnel));
+    let invite = Invite {
+        token,
+        fingerprint: identity.fingerprint(),
+        candidates: tunnel.candidates.clone(),
+    };
     let tls = identity.server_config()?;
     let listener = TcpListener::bind((address, CONTROL_PORT))
-        .with_context(|| format!("Не удалось открыть {address}:{CONTROL_PORT}."))?;
+        .with_context(|| format!("Не удалось открыть порт {CONTROL_PORT}."))?;
     listener.set_nonblocking(true)?;
     worker.emit(Event::Invite(invite.encode()));
 
@@ -210,7 +216,7 @@ fn host(
             Instant::now() < expires,
             "Срок приглашения истёк. Создайте новую сессию."
         );
-        let (socket, peer) = match listener.accept() {
+        let (socket, _) = match listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(70));
@@ -246,6 +252,7 @@ fn host(
         {
             let name = clean_name(&name);
             wire.send(&Reply::Pending)?;
+            let peer = tunnel.peer().map(|(addr, _)| addr.ip().to_string()).unwrap_or_default();
             break (wire, name, peer, certificate, profile);
         }
         let _ = wire.send(&Reply::Closed {
@@ -254,12 +261,19 @@ fn host(
     };
     // This invitation admits a single request. Once used, the listening socket closes.
     drop(listener);
-    worker.emit(Event::Approval(format!("{name} · {}", peer.ip())));
-    worker.fact("Гость", format!("{name} · {}", peer.ip()));
+    worker.emit(Event::Approval(format!("{name} · {peer}")));
+    worker.fact("Гость", format!("{name} · {peer}"));
     worker.fact("Профиль", profile_label(profile));
-    if let std::net::IpAddr::V4(ip) = peer.ip() {
-        worker.probe_route(ip);
-    }
+    let mut next_rtt = Instant::now();
+    let mut report = |worker: &Worker| {
+        if Instant::now() >= next_rtt
+            && let Some((addr, rtt)) = tunnel.peer()
+        {
+            worker.fact("Соединение", connection_fact(describe_peer(addr), rtt));
+            next_rtt = Instant::now() + Duration::from_secs(2);
+        }
+    };
+    report(worker);
 
     let mut last_ping = Instant::now();
     let by = Instant::now() + DECISION_TIMEOUT;
@@ -331,6 +345,11 @@ fn host(
         if worker.check().is_err() {
             break "Хост завершил сессию.";
         }
+        if tunnel.peer().is_none() {
+            // The tunnel is gone: the guest closed DuoLink or the network dropped.
+            break "Гость отключился.";
+        }
+        report(worker);
         let (connected, disconnected) = stream.events()?;
         if disconnected {
             break "Поток закрыт.";
@@ -352,6 +371,8 @@ fn host(
     let _ = wire.send(&Reply::Closed {
         reason: reason.into(),
     });
+    drop(wire);
+    drop(tunnel);
     Ok(reason.into())
 }
 
@@ -395,16 +416,21 @@ fn guest(
     worker.check()?;
     let identity = Identity::generate("DuoLink Guest")?;
 
-    worker.status(format!("Связываемся с {}…", invite.address));
-    worker.probe_route(invite.address);
-    let endpoint = SocketAddr::from((invite.address, CONTROL_PORT));
+    worker.status("Ищем путь к хосту…");
+    let tunnel = GuestTunnel::connect(invite.token, invite.fingerprint, &invite.candidates, || {
+        worker.check()
+    })?;
+    worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
+    let mut next_rtt = Instant::now() + Duration::from_secs(2);
+    worker.status("Соединение установлено. Ждём подтверждения хоста…");
+    let endpoint = SocketAddr::from((GUEST_LOOPBACK, CONTROL_PORT));
     let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
-        .context("Хост недоступен. Проверьте код, сеть и доступ к TCP 48171.")?;
+        .context("Хост не ответил по туннелю.")?;
     socket.set_read_timeout(Some(Duration::from_secs(4)))?;
     socket.set_write_timeout(Some(Duration::from_secs(4)))?;
     let mut tls = ClientConnection::new(
         client_config(&invite),
-        ServerName::from(std::net::IpAddr::from(invite.address)),
+        ServerName::from(std::net::IpAddr::from(GUEST_LOOPBACK)),
     )?;
     tls.complete_io(&mut socket)
         .context("Не удалось подтвердить подлинность приглашения или связаться с хостом.")?;
@@ -437,7 +463,19 @@ fn guest(
             }
             bail!("Moonlight завершился ({status}). Откройте guest.log.");
         }
-        ensure!(last_pong.elapsed() <= SILENCE, "Связь с хостом потеряна.");
+        if !tunnel.alive() || last_pong.elapsed() > SILENCE {
+            // The host may have said goodbye just before the tunnel closed.
+            for _ in 0..5 {
+                if let Ok(Some(Reply::Closed { reason })) = wire.poll::<Reply>() {
+                    return Ok(reason);
+                }
+            }
+            bail!("Связь с хостом потеряна.");
+        }
+        if Instant::now() >= next_rtt {
+            worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
+            next_rtt = Instant::now() + Duration::from_secs(2);
+        }
         ensure!(
             streaming || Instant::now() < by,
             "Хост или поток не ответил вовремя."
@@ -474,7 +512,8 @@ fn guest(
                 stream = Some(GuestStream::start(
                     &engine,
                     &data,
-                    invite.address,
+                    GUEST_LOOPBACK,
+                    tunnel.same_machine,
                     host,
                     &certificate,
                     &identity,
@@ -531,7 +570,7 @@ mod tests {
         );
         let data = data_dir().unwrap();
         let address = Ipv4Addr::LOCALHOST;
-        let host = Session::host(data.clone(), address);
+        let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(200), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),
@@ -550,10 +589,7 @@ mod tests {
                 _ => None,
             },
         );
-        assert!(
-            result.contains("Приглашение отклонено") || result.contains("закрыта"),
-            "{result}"
-        );
+        assert!(result.contains("отклонил"), "{result}");
         assert!(host.events.try_recv().is_err());
         let invite = Invite::decode(&code).unwrap();
         let prefs = Preferences::parse(&crate::media::Form {
@@ -621,7 +657,7 @@ mod tests {
             "media still listening after disconnect"
         );
 
-        let host = Session::host(data.clone(), address);
+        let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(20), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),

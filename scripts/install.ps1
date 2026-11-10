@@ -3,9 +3,9 @@
 param(
     [string]$ViGEm = '',
     [string]$ViGEmSha = '',
-    [string]$Tailscale = '',
-    [string]$TailscaleSha = '',
     [switch]$Firewall,
+    [int]$Port = 48170,
+    [string]$Program = '',
     [string]$Log = ''
 )
 
@@ -18,36 +18,30 @@ function Assert-Hash([string]$Path, [string]$Expected) {
     if ($actual -ne $Expected.ToUpperInvariant()) { throw "Checksum mismatch: $Path" }
 }
 
-function Assert-Success([string]$Name, $Process) {
-    # 3010 and 1641 mean success with a pending reboot.
-    if ($Process.ExitCode -notin 0, 3010, 1641) { throw "$Name installer exited with code $($Process.ExitCode)" }
-}
-
 try {
     if ($ViGEm) {
         Assert-Hash $ViGEm $ViGEmSha
         Write-Output 'Installing ViGEmBus'
-        Assert-Success 'ViGEmBus' (Start-Process -FilePath $ViGEm -ArgumentList '/exenoui', '/qn', '/norestart' -Wait -PassThru)
-    }
-    if ($Tailscale) {
-        Assert-Hash $Tailscale $TailscaleSha
-        Write-Output 'Installing Tailscale'
-        Assert-Success 'Tailscale' (Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList '/i', "`"$Tailscale`"", '/qn', '/norestart' -Wait -PassThru)
+        $process = Start-Process -FilePath $ViGEm -ArgumentList '/exenoui', '/qn', '/norestart' -Wait -PassThru
+        # 3010 and 1641 mean success with a pending reboot.
+        if ($process.ExitCode -notin 0, 3010, 1641) { throw "ViGEmBus installer exited with code $($process.ExitCode)" }
     }
     if ($Firewall) {
         Write-Output 'Configuring firewall'
-        Get-NetFirewallRule -Name 'DuoLink-v1-*', 'DuoLink-v2-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-        # Port rules (not program rules) keep working when DuoLink or an engine is updated.
-        # Only the tailnet and the local subnet can reach them.
-        $scope = @{
-            Direction     = 'Inbound'
-            Action        = 'Allow'
-            Profile       = 'Any'
-            RemoteAddress = @('100.64.0.0/10', 'LocalSubnet')
-            Enabled       = 'True'
+        Get-NetFirewallRule -Name 'DuoLink-v1-*', 'DuoLink-v2-*', 'DuoLink-v3-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        # A rule left over from a dismissed Windows prompt would block DuoLink outright.
+        if ($Program) {
+            Get-NetFirewallApplicationFilter -Program $Program -ErrorAction SilentlyContinue |
+                Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' } |
+                Remove-NetFirewallRule
         }
-        New-NetFirewallRule -Name 'DuoLink-v2-TCP' -DisplayName 'DuoLink (TCP)' -Protocol TCP -LocalPort 48171, 48184, 48189, 48210 @scope | Out-Null
-        New-NetFirewallRule -Name 'DuoLink-v2-UDP' -DisplayName 'DuoLink (UDP)' -Protocol UDP -LocalPort 48198, 48199, 48200 @scope | Out-Null
+        # One UDP port carries the whole stream. Sunshine itself only listens on 127.0.0.1.
+        New-NetFirewallRule -Name 'DuoLink-v3-Tunnel' -DisplayName 'DuoLink' -Direction Inbound -Action Allow `
+            -Protocol UDP -LocalPort $Port -Profile Any | Out-Null
+        if ($Program) {
+            New-NetFirewallRule -Name 'DuoLink-v3-App' -DisplayName 'DuoLink (приложение)' -Direction Inbound -Action Allow `
+                -Program $Program -Protocol UDP -Profile Any | Out-Null
+        }
     }
     exit 0
 }

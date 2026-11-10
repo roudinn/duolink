@@ -6,6 +6,7 @@ mod platform;
 mod protocol;
 mod session;
 mod setup;
+mod tunnel;
 
 fn message(text: &str, icon: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBoxW};

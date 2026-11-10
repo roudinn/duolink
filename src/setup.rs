@@ -2,12 +2,11 @@
 
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::Read,
     mem::{size_of, zeroed},
     os::windows::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    thread,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -24,8 +23,9 @@ use windows_sys::Win32::{
 
 use crate::{
     media::{MOONLIGHT, SUNSHINE},
-    platform::{hags_enabled, open, run_tool, system_tool, tailscale_cli, vigem_present},
+    platform::{hags_enabled, run_tool, system_tool, vigem_present},
     session::{Session, Worker},
+    tunnel::TUNNEL_PORT,
 };
 
 const INSTALL_SCRIPT: &str = include_str!("../scripts/install.ps1");
@@ -44,13 +44,6 @@ pub const VIGEM: Download = Download {
     url: "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe",
     sha256: "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a",
     file: "ViGEmBus_1.22.0_x64_x86_arm64.exe",
-};
-
-pub const TAILSCALE: Download = Download {
-    name: "Tailscale",
-    url: "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.5-amd64.msi",
-    sha256: "3c41318c83c5d95d0b017b1baa08ba7c99fd5334166122bbb1931e55af99839c",
-    file: "tailscale-setup-1.104.5-amd64.msi",
 };
 
 fn sha256(path: &Path) -> Result<String> {
@@ -107,7 +100,6 @@ pub struct Components {
     pub sunshine: bool,
     pub moonlight: bool,
     pub vigem: bool,
-    pub tailscale: bool,
     pub firewall: bool,
     pub hags: Option<bool>,
 }
@@ -118,7 +110,6 @@ impl Components {
             sunshine: SUNSHINE.path(data).is_file(),
             moonlight: MOONLIGHT.path(data).is_file(),
             vigem: vigem_present(),
-            tailscale: tailscale_cli().is_some(),
             firewall: firewall_ready(),
             hags: hags_enabled(),
         }
@@ -127,13 +118,18 @@ impl Components {
     pub fn engines(&self) -> bool {
         self.sunshine && self.moonlight
     }
+
+    /// What hosting needs beyond the engines: the gamepad driver and firewall rules.
+    pub fn host_ready(&self) -> bool {
+        self.vigem && self.firewall
+    }
 }
 
 fn firewall_ready() -> bool {
     let Ok(netsh) = system_tool("netsh.exe") else {
         return false;
     };
-    ["DuoLink-v2-TCP", "DuoLink-v2-UDP"].iter().all(|name| {
+    ["DuoLink-v3-Tunnel", "DuoLink-v3-App"].iter().all(|name| {
         Command::new(&netsh)
             .args(["advfirewall", "firewall", "show", "rule"])
             .arg(format!("name={name}"))
@@ -147,7 +143,7 @@ fn firewall_ready() -> bool {
 }
 
 /// Background setup. `elevated == false` only prefetches the streaming
-/// engines, which needs no prompt; `true` also installs the driver, Tailscale
+/// engines, which needs no prompt; `true` also installs the gamepad driver
 /// and firewall rules behind one UAC prompt.
 pub fn install(data: PathBuf, elevated: bool) -> Session {
     Session::start(move |worker, _| run_install(worker, &data, elevated))
@@ -175,17 +171,11 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
         worker.status("Скачиваем драйвер геймпада ViGEmBus…");
         Some(fetch(data, &VIGEM, check)?)
     };
-    let tailscale = if have.tailscale {
-        None
-    } else {
-        worker.status("Скачиваем Tailscale (39 МБ)…");
-        Some(fetch(data, &TAILSCALE, check)?)
-    };
-    if vigem.is_none() && tailscale.is_none() && have.firewall {
+    if vigem.is_none() && have.firewall {
         return Ok("Всё установлено.".into());
     }
 
-    worker.status("Подтвердите установку в окне Windows…");
+    worker.status("Разрешите установку в окне Windows…");
     let script = data.join("setup").join("install.ps1");
     write_script(&script, INSTALL_SCRIPT)?;
     let mut params = format!(
@@ -196,15 +186,15 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
     if let Some(path) = &vigem {
         params += &format!(" -ViGEm \"{}\" -ViGEmSha {}", path.display(), VIGEM.sha256);
     }
-    if let Some(path) = &tailscale {
-        params += &format!(" -Tailscale \"{}\" -TailscaleSha {}", path.display(), TAILSCALE.sha256);
-    }
     if !have.firewall {
-        params += " -Firewall";
+        params += &format!(
+            " -Firewall -Port {TUNNEL_PORT} -Program \"{}\"",
+            std::env::current_exe()?.display()
+        );
     }
     let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
     let code = run_elevated(&powershell, &params, || {
-        worker.status("Устанавливаем компоненты…");
+        worker.status("Устанавливаем драйвер геймпада…");
         worker.check()
     })?;
     ensure!(code == 0, "Установка не завершилась (код {code}). Подробности в setup.log.");
@@ -254,41 +244,6 @@ fn run_elevated(program: &Path, params: &str, tick: impl Fn() -> Result<()>) -> 
     })();
     unsafe { CloseHandle(process) };
     result
-}
-
-/// Starts `tailscale up` and opens the login page it prints.
-pub fn tailscale_login() -> Result<()> {
-    let cli = tailscale_cli().context("Сначала установите Tailscale.")?;
-    let mut child = Command::new(cli)
-        .arg("up")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Не удалось запустить Tailscale.")?;
-    let outputs: Vec<Box<dyn Read + Send>> = vec![
-        Box::new(child.stdout.take().unwrap()),
-        Box::new(child.stderr.take().unwrap()),
-    ];
-    for output in outputs {
-        thread::spawn(move || {
-            for line in BufReader::new(output).lines().map_while(Result::ok) {
-                if let Some(url) = line
-                    .split_whitespace()
-                    .find(|word| word.starts_with("https://login.tailscale.com/"))
-                {
-                    let _ = open(std::ffi::OsStr::new(url));
-                    return;
-                }
-            }
-        });
-    }
-    // `tailscale up` exits by itself once the login completes; reap it then.
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
 }
 
 fn installed_exe() -> Result<PathBuf> {

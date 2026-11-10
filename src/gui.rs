@@ -2,7 +2,6 @@ use std::{
     borrow::Cow,
     ffi::OsStr,
     fs,
-    net::Ipv4Addr,
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -24,7 +23,7 @@ use wry::{
 
 use crate::{
     media::{Form, Preferences},
-    platform::{Network, NetworkKind, data_dir, networks, open},
+    platform::{data_dir, open},
     protocol::Invite,
     session::{Event, Session},
     setup::{self, Components},
@@ -33,15 +32,13 @@ use crate::{
 const VIEW: &str = "duolink://localhost/index.html";
 const WINDOWS_VIEW: &str = "https://duolink.localhost/index.html";
 const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
-const SHARING: &str = "https://login.tailscale.com/admin/machines";
-const LOGIN_WATCH: Duration = Duration::from_secs(180);
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
     Ready,
     Refresh,
-    HostStart { address: Ipv4Addr },
+    HostStart,
     HostStop,
     Allow,
     Deny,
@@ -50,8 +47,6 @@ enum Action {
     GuestStop,
     Paste,
     Install,
-    TailscaleLogin,
-    Sharing,
     Graphics,
     Logs,
 }
@@ -177,15 +172,14 @@ struct App {
     host: Pane,
     guest: Pane,
     setup: Pane,
-    networks: Vec<Network>,
     components: Components,
-    /// The running setup includes the elevated step (driver, Tailscale, firewall).
+    /// The running setup includes the elevated step (gamepad driver, firewall).
     full_setup: bool,
     version: &'static str,
+    /// Start hosting as soon as the running setup succeeds.
+    host_after_setup: bool,
     #[serde(skip)]
     data: PathBuf,
-    #[serde(skip)]
-    login_watch: Option<(Instant, Instant)>,
 }
 
 impl App {
@@ -194,12 +188,11 @@ impl App {
             host: Pane::default(),
             guest: Pane::default(),
             setup: Pane::default(),
-            networks: networks(),
             components: Components::detect(&data),
             full_setup: false,
             version: env!("CARGO_PKG_VERSION"),
+            host_after_setup: false,
             data,
-            login_watch: None,
         };
         // Streaming engines need no permission: fetch them right away.
         if !app.components.engines() {
@@ -210,14 +203,22 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        self.networks = networks();
         self.components = Components::detect(&self.data);
     }
 
-    fn tailscale_up(&self) -> bool {
-        self.networks
-            .iter()
-            .any(|network| matches!(network.kind, NetworkKind::Tailscale))
+    fn start_full_setup(&mut self) {
+        // Supersede a background engine prefetch: the full setup fetches them too.
+        if let Some(prefetch) = self.setup.session.take() {
+            prefetch.cancel();
+        }
+        self.full_setup = true;
+        self.setup
+            .begin(setup::install(self.data.clone(), true), "Готовим установку…");
+    }
+
+    fn start_host(&mut self) {
+        self.host
+            .begin(Session::host(self.data.clone()), "Готовим приглашение…");
     }
 
     fn update(&self, view: &WebView) -> Result<()> {
@@ -232,13 +233,17 @@ impl App {
         match action {
             Action::Ready => {}
             Action::Refresh => self.refresh(),
-            Action::HostStart { address } if self.host.session.is_none() => {
-                if self.networks.iter().any(|network| network.address == address) {
-                    self.host
-                        .begin(Session::host(self.data.clone(), address), "Готовим приглашение…");
+            Action::HostStart if self.host.session.is_none() => {
+                self.refresh();
+                if self.components.host_ready() {
+                    self.start_host();
                 } else {
-                    self.networks = networks();
-                    self.host.fail("Эта сеть больше недоступна. Выберите другую.");
+                    // First time hosting: driver and firewall, one UAC prompt, then go.
+                    self.host_after_setup = true;
+                    self.host.set(Phase::Idle, "");
+                    if !self.full_setup {
+                        self.start_full_setup();
+                    }
                 }
             }
             Action::HostStop => self.host.stop(),
@@ -281,24 +286,7 @@ impl App {
                 }
                 Err(_) => toast(view, "В буфере обмена нет текста.")?,
             },
-            Action::Install if !self.full_setup => {
-                // Supersede a background engine prefetch: the full setup fetches them too.
-                if let Some(prefetch) = self.setup.session.take() {
-                    prefetch.cancel();
-                }
-                self.full_setup = true;
-                self.setup
-                    .begin(setup::install(self.data.clone(), true), "Готовим установку…");
-            }
-            Action::TailscaleLogin => match setup::tailscale_login() {
-                Ok(()) => {
-                    let now = Instant::now();
-                    self.login_watch = Some((now + LOGIN_WATCH, now));
-                    toast(view, "Войдите в Tailscale в открывшемся браузере.")?;
-                }
-                Err(error) => toast(view, &format!("{error:#}"))?,
-            },
-            Action::Sharing => open_or_toast(view, OsStr::new(SHARING))?,
+            Action::Install if !self.full_setup => self.start_full_setup(),
             Action::Graphics => open_or_toast(view, OsStr::new(GRAPHICS))?,
             Action::Logs => {
                 let directory = self.data.join("logs");
@@ -314,21 +302,16 @@ impl App {
         let (host, _) = self.host.poll(true);
         let (guest, _) = self.guest.poll(false);
         let (setup, setup_done) = self.setup.poll(false);
-        let mut changed = host || guest || setup;
+        let changed = host || guest || setup;
         if setup_done {
-            self.full_setup = false;
+            let full = std::mem::take(&mut self.full_setup);
             self.refresh();
-        }
-        // After «Войти в Tailscale», watch for the tailnet address to appear.
-        if let Some((until, last)) = self.login_watch {
-            let now = Instant::now();
-            if self.tailscale_up() || now >= until {
-                self.login_watch = None;
-            } else if now.duration_since(last) >= Duration::from_secs(2) {
-                self.login_watch = Some((until, now));
-                let had = self.tailscale_up();
-                self.networks = networks();
-                changed |= self.tailscale_up() != had;
+            if full && std::mem::take(&mut self.host_after_setup) {
+                if self.setup.error {
+                    self.host.fail("Без драйвера геймпада друг не сможет играть. Попробуйте ещё раз.");
+                } else if self.host.session.is_none() {
+                    self.start_host();
+                }
             }
         }
         if changed {
@@ -340,7 +323,6 @@ impl App {
         self.host.session.is_some()
             || self.guest.session.is_some()
             || self.setup.session.is_some()
-            || self.login_watch.is_some()
     }
 
     fn shutdown(&self) {

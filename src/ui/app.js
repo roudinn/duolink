@@ -3,7 +3,6 @@
 const $ = (id) => document.getElementById(id);
 const send = (action, fields = {}) => window.ipc.postMessage(JSON.stringify({ action, ...fields }));
 const settings = $("settings");
-const network = $("network");
 const guestCode = $("guest-code");
 const NUMBERS = ["width", "height", "fps", "bitrate"];
 const FLAGS = ["yuv444", "hdr", "windowed", "stats"];
@@ -77,47 +76,32 @@ function restore() {
 
 /* ---------- home ---------- */
 
-const selectedNetwork = () => state?.networks.find((n) => n.address === network.value);
-
-function updateNetworks(list) {
-  const keep = network.value;
-  network.replaceChildren(...list.map((n) => new Option(n.label, n.address)));
-  if (list.some((n) => n.address === keep)) network.value = keep;
-}
-
 function renderHostButton() {
-  const net = selectedNetwork();
-  const blocked = net && net.kind !== "loopback" && !state.components.vigem;
-  $("host-start").disabled = !net || blocked;
-  text("host-start", blocked ? "Сначала установите драйвер геймпада" : "Создать сессию");
+  const waiting = state.hostAfterSetup;
+  $("host-start").disabled = waiting;
+  text("host-start", waiting ? "Устанавливаем драйвер геймпада…" : "Создать сессию");
 }
 
 function renderPrepare(next) {
   const c = next.components;
-  const tsUp = next.networks.some((n) => n.kind === "tailscale");
   const working = next.setup.phase !== "idle";
   const rows = [
     ["c-engines", c.sunshine && c.moonlight, working ? "Загрузка" : "Нужно скачать"],
-    ["c-vigem", c.vigem, "Нужно установить"],
-    ["c-tailscale", c.tailscale && tsUp, c.tailscale ? "Нужно войти" : "Нужно установить"],
-    ["c-firewall", c.firewall, "Нужно настроить"],
+    ["c-vigem", c.vigem, "При создании сессии"],
+    ["c-firewall", c.firewall, "При создании сессии"],
   ];
   let done = 0;
   for (const [id, ok, pending] of rows) {
     const li = $(id);
-    const busy = !ok && working && (id === "c-engines" || (next.fullSetup && !(id === "c-tailscale" && c.tailscale)));
+    const busy = !ok && working && (id === "c-engines" || next.fullSetup);
     tone(li, ok ? "done" : busy ? "busy" : "");
-    li.querySelector("em").textContent = ok ? "Готово" : pending;
+    li.querySelector("em").textContent = ok ? "Готово" : busy ? "Установка" : pending;
     if (ok) done += 1;
   }
-  const needsInstall = !(c.sunshine && c.moonlight && c.vigem && c.tailscale && c.firewall);
-  const needsLogin = c.tailscale && !tsUp;
-  show("prepare", needsInstall || needsLogin || working || next.setup.error);
+  // Setup is invisible unless something is happening or went wrong.
+  show("prepare", working || next.setup.error);
   text("prepare-count", `${done} из ${rows.length}`);
-  show("install", needsInstall);
-  $("install").disabled = next.fullSetup;
-  text("install", next.fullSetup ? "Устанавливаем…" : "Установить всё");
-  show("login", needsLogin && !working);
+  show("install", next.setup.error && !working);
   statusLine("setup-line", working || next.setup.error ? next.setup.message : "", next.setup.error);
 }
 
@@ -134,7 +118,8 @@ function renderFacts(id, facts) {
     dt.textContent = name;
     const dd = document.createElement("dd");
     dd.textContent = value;
-    if (name === "Маршрут") tone(dd, value.startsWith("Прямой") ? "ok" : value.startsWith("Ретранслятор") ? "warn" : "");
+    if (name === "Соединение") tone(dd, "ok");
+    if (name === "Доступ") tone(dd, value.startsWith("Строгий") || value.startsWith("Только") ? "warn" : "ok");
     return [dt, dd];
   }));
 }
@@ -158,15 +143,14 @@ function renderSession(who, view, table) {
 function applyState(next) {
   const prev = state;
   state = next;
-  if (!prev || JSON.stringify(prev.networks) !== JSON.stringify(next.networks)) updateNetworks(next.networks);
   renderHostButton();
   renderPrepare(next);
 
   const hostActive = next.host.phase !== "idle";
   const guestActive = next.guest.phase !== "idle";
-  const loopbackHost = hostActive && selectedNetwork()?.kind === "loopback";
   show("live", hostActive || guestActive);
-  show("home", !guestActive && (!hostActive || loopbackHost));
+  // While a host waits for a friend, «Подключиться» stays reachable to test on this same PC.
+  show("home", !guestActive && (!hostActive || next.host.phase === "invite"));
   show("host-card", !hostActive);
 
   renderSession("host", next.host, HOST_VIEW);
@@ -224,12 +208,10 @@ document.addEventListener("click", (e) => {
   const { action } = button.dataset;
   if (action === "settings") settings.showModal();
   else if (action === "close_settings") settings.close();
-  else if (action === "host_start") send("host_start", { address: network.value });
   else send(action);
 });
 
 settings.addEventListener("click", (e) => { if (e.target === settings) settings.close(); });
-network.addEventListener("change", renderHostButton);
 $("guest-form").addEventListener("submit", (e) => {
   e.preventDefault();
   save();
