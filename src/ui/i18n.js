@@ -65,6 +65,7 @@ const EN = Object.freeze({
   "Подключаемся": "Connecting",
   "Отключаемся": "Disconnecting",
   "Отменить": "Cancel",
+  "мс": "ms",
   "Отклонить запрос": "Decline request",
   "Отозвать запрос": "Withdraw request",
   "Удалить из друзей": "Remove friend",

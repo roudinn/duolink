@@ -126,6 +126,21 @@ function renderSession(who, pane, table) {
   show(`${who}-details`, pane.facts.length > 0);
   renderFacts(`${who}-facts`, pane.facts);
   $(`${who}-stop`).disabled = pane.phase === "stopping";
+  renderPing(`${who}-ping`, pane);
+}
+
+// Live round trip: digits only.
+function renderPing(id, pane) {
+  const ms = pane.latency;
+  const on = pane.phase === "live" && typeof ms === "number";
+  show(id, on);
+  if (!on) return;
+  const value = ms < 10 ? ms.toFixed(1) : String(Math.round(ms));
+  const el = $(id);
+  if (el.dataset.value !== value) {
+    el.dataset.value = value;
+    el.replaceChildren(value, Object.assign(document.createElement("small"), { textContent: tr("мс") }));
+  }
 }
 
 function renderPlay(next) {

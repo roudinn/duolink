@@ -147,6 +147,8 @@ struct Pane {
     code_error: bool,
     video_error: bool,
     facts: Vec<(&'static str, String)>,
+    /// Round trip in milliseconds while connected.
+    latency: Option<f64>,
     #[serde(skip)]
     session: Option<Session>,
 }
@@ -165,6 +167,7 @@ impl Pane {
     fn begin(&mut self, session: Session, message: &str) {
         self.set(Phase::Working, message);
         self.facts.clear();
+        self.latency = None;
         self.session = Some(session);
     }
 
@@ -219,6 +222,7 @@ impl Pane {
                     self.set(Phase::Approval, "");
                     self.peer = peer.clone();
                 }
+                Event::Latency(rtt) => self.latency = Some(rtt.as_secs_f64() * 1000.0),
                 Event::Streaming => self.set(
                     Phase::Live,
                     if host { "Добавьте второго игрока в игре." } else { "Окно игры открыто." },
@@ -226,6 +230,7 @@ impl Pane {
                 Event::Finished { message, failed } => {
                     self.set(Phase::Idle, message.clone());
                     self.error = *failed;
+                    self.latency = None;
                     finished = true;
                 }
             }

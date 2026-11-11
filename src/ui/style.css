@@ -166,6 +166,8 @@ input[role="switch"]:checked::after { background: var(--accent-ink); transform: 
 .session { display: flex; flex-direction: column; gap: 14px; padding-top: 18px; animation: enter .22s cubic-bezier(.2, .8, .2, 1); }
 .session h1 { font-size: 30px; font-weight: 700; letter-spacing: -.03em; line-height: 1.15; overflow-wrap: anywhere; }
 .session > .muted { margin-top: -6px; }
+.ping { display: inline-flex; align-items: baseline; gap: 4px; align-self: flex-start; margin-top: -6px; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--muted); }
+.ping small { font-size: inherit; font-weight: 500; }
 .code-row { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: var(--card); background: var(--surface); }
 .code { flex: 1; min-width: 0; padding: 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 14px/1.6 "Cascadia Mono", Consolas, monospace; user-select: all; }
 details summary { width: fit-content; padding: 8px 4px; cursor: pointer; color: var(--muted); }

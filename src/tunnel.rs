@@ -506,7 +506,7 @@ impl Pinger {
         let now = self.origin.elapsed().as_micros() as u64;
         let sample = now.saturating_sub(u64::from_be_bytes(sent)).max(1);
         let previous = self.rtt_us.load(Ordering::Relaxed);
-        let smoothed = if previous == 0 { sample } else { (previous * 7 + sample) / 8 };
+        let smoothed = if previous == 0 { sample } else { (previous * 3 + sample) / 4 };
         self.rtt_us.store(smoothed, Ordering::Relaxed);
     }
 
@@ -536,7 +536,7 @@ fn ping_datagram(conn: &Connection, pinger: &Pinger, port: u16, payload: &[u8]) 
 async fn ping_loop(conn: Connection, pinger: Arc<Pinger>) {
     while conn.close_reason().is_none() {
         forward(&conn, PING_PORT, &pinger.stamp());
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

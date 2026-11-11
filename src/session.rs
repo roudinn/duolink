@@ -42,6 +42,8 @@ pub enum Event {
     /// A labelled fact about the live session (mode, bitrate, route…).
     Fact(&'static str, String),
     Streaming,
+    /// Round trip to the other PC, ten times a second.
+    Latency(Duration),
     Finished { message: String, failed: bool },
 }
 
@@ -139,11 +141,13 @@ impl Drop for Session {
     }
 }
 
+const LATENCY_EVERY: Duration = Duration::from_millis(100);
+
 type HostWire = Wire<StreamOwned<ServerConnection, TcpStream>>;
 
 fn configure_socket(socket: &TcpStream) -> io::Result<()> {
     socket.set_nodelay(true)?;
-    socket.set_read_timeout(Some(Duration::from_millis(180)))?;
+    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
     socket.set_write_timeout(Some(Duration::from_secs(3)))
 }
 
@@ -287,8 +291,15 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
         worker.fact("Xbox Game Bar", "Фоновая запись включена");
     }
     let mut next_rtt = Instant::now();
+    let mut next_latency = Instant::now();
     let mut drops_shown = dropped();
     let mut report = |worker: &Worker| {
+        if Instant::now() >= next_latency
+            && let Some((_, rtt)) = tunnel.peer()
+        {
+            worker.emit(Event::Latency(rtt));
+            next_latency = Instant::now() + LATENCY_EVERY;
+        }
         if Instant::now() >= next_rtt
             && let Some((addr, rtt)) = tunnel.peer()
         {
@@ -485,6 +496,7 @@ fn guest(
         None => DEFAULT_FEC,
     };
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
+    let mut next_latency = Instant::now();
     let mut drops_shown = dropped();
     worker.status("Ждём хост…");
     let endpoint = SocketAddr::from((GUEST_LOOPBACK, CONTROL_PORT));
@@ -535,6 +547,10 @@ fn guest(
                 }
             }
             bail!("Связь с хостом потеряна.");
+        }
+        if Instant::now() >= next_latency {
+            worker.emit(Event::Latency(tunnel.rtt()));
+            next_latency = Instant::now() + LATENCY_EVERY;
         }
         if Instant::now() >= next_rtt {
             worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
@@ -756,6 +772,18 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         }
         assert!(TcpStream::connect((address, MEDIA_PORT)).is_ok());
+        // DUOLINK_TEST_HOLD=<seconds> keeps the stream open for a manual look;
+        // closing Moonlight (Ctrl+Alt+Shift+Q) ends it early.
+        if let Some(hold) = std::env::var("DUOLINK_TEST_HOLD").ok().and_then(|s| s.parse().ok()) {
+            let by = Instant::now() + Duration::from_secs(hold);
+            while Instant::now() < by && !guest.finished() {
+                thread::sleep(Duration::from_millis(250));
+            }
+            if guest.finished() {
+                drop(guest);
+                return;
+            }
+        }
         guest.cancel();
         let result = until(&host, Duration::from_secs(8), |event| match event {
             Event::Finished {
