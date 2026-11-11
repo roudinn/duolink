@@ -1,12 +1,11 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs,
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -29,8 +28,8 @@ use wry::{
 
 use crate::{
     friends::{
-        self, Book, DIRECTORY_REFRESH, HEARTBEAT, INVITE_LIFETIME, Inbox, Incoming, Me, Message,
-        ONLINE_WINDOW, Status,
+        self, Book, DIRECTORY_REFRESH, HEARTBEAT, INVITE_LIFETIME, Inbox, Incoming, MailHistory, Me,
+        Message, ONLINE_WINDOW, Status,
     },
     media::{Form, Preferences},
     platform::{data_dir, open},
@@ -83,6 +82,7 @@ struct FriendView {
     tag: String,
     status: Status,
     online: bool,
+    sending: bool,
 }
 
 #[derive(Serialize)]
@@ -96,7 +96,6 @@ struct MeView {
 /// A friend's invite waiting for an answer.
 #[derive(Clone, Serialize)]
 struct Invitation {
-    id: String,
     name: String,
     #[serde(skip)]
     key: [u8; 32],
@@ -109,7 +108,6 @@ struct Invitation {
 /// The friend a running host session was created for.
 #[derive(Clone, Serialize)]
 struct HostFor {
-    id: String,
     name: String,
     #[serde(skip)]
     key: [u8; 32],
@@ -117,6 +115,8 @@ struct HostFor {
     sent_at: Option<u64>,
     #[serde(skip)]
     joined: bool,
+    #[serde(skip)]
+    send_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -228,6 +228,8 @@ impl Pane {
 /// Results of background work, delivered back to the UI thread.
 enum Job {
     Lookup { query: String, result: Result<[u8; 32]> },
+    FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
+    InviteSent { key: [u8; 32], at: u64, result: Result<()> },
 }
 
 #[derive(Serialize)]
@@ -257,15 +259,17 @@ struct App {
     #[serde(skip)]
     subscribed: Vec<[u8; 32]>,
     #[serde(skip)]
-    presence: HashMap<[u8; 32], u64>,
+    presence: HashMap<[u8; 32], (u64, bool)>,
     #[serde(skip)]
-    mail_cursor: u64,
+    mail_history: MailHistory,
+    #[serde(skip)]
+    sending_requests: HashSet<[u8; 32]>,
     #[serde(skip)]
     jobs: (Sender<Job>, Receiver<Job>),
     #[serde(skip)]
     wake: Arc<dyn Fn() + Send + Sync>,
     #[serde(skip)]
-    alive: Arc<AtomicBool>,
+    next_presence: Option<Instant>,
     #[serde(skip)]
     attention: bool,
     #[serde(skip)]
@@ -294,7 +298,8 @@ impl App {
             invitation: None,
             host_for: None,
             looking_up: false,
-            mail_cursor: friends::load_cursor(&data),
+            mail_history: MailHistory::load(&data),
+            sending_requests: HashSet::new(),
             identity,
             book,
             inbox: None,
@@ -302,7 +307,7 @@ impl App {
             presence: HashMap::new(),
             jobs: mpsc::channel(),
             wake,
-            alive: Arc::new(AtomicBool::new(true)),
+            next_presence: None,
             attention: false,
             updater: Updater::start(),
             quit: false,
@@ -312,28 +317,21 @@ impl App {
             app.setup.begin(setup::install(app.data.clone(), false), "Загружаем компоненты…");
         }
         app.resubscribe();
-        app.start_presence();
+        if app.identity.chosen {
+            friends::announce(&app.identity);
+        }
         app.sync();
         Ok(app)
     }
 
-    /// Heartbeat while open; directory refresh while the nickname is chosen.
-    fn start_presence(&self) {
-        let alive = self.alive.clone();
-        let key = self.identity.public;
-        thread::spawn(move || {
-            while alive.load(Ordering::Relaxed) {
-                friends::heartbeat(&key, true);
-                for _ in 0..HEARTBEAT.as_secs() {
-                    if !alive.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
+    fn refresh_presence(&mut self, now: Instant) {
+        if self.identity.chosen && !self.subscribed.is_empty() {
+            if self.next_presence.is_none_or(|next| now >= next) {
+                friends::heartbeat(&self.identity.public, true);
+                self.next_presence = Some(now + HEARTBEAT);
             }
-        });
-        if self.identity.chosen {
-            friends::announce(&self.identity);
+        } else if self.next_presence.take().is_some() {
+            friends::heartbeat(&self.identity.public, false);
         }
     }
 
@@ -343,12 +341,14 @@ impl App {
         if self.inbox.is_some() && keys == self.subscribed {
             return;
         }
-        self.inbox = Some(Inbox::listen(&self.identity.public, &keys, self.mail_cursor, self.wake.clone()));
+        self.inbox = Some(Inbox::listen(&self.identity.public, &keys, self.mail_history.latest(), self.wake.clone()));
         self.subscribed = keys;
     }
 
     fn online(&self, key: &[u8; 32]) -> bool {
-        self.presence.get(key).is_some_and(|seen| friends::now().saturating_sub(*seen) < ONLINE_WINDOW)
+        self.presence.get(key).is_some_and(|(seen, online)| {
+            *online && friends::now().saturating_sub(*seen) < ONLINE_WINDOW
+        })
     }
 
     /// Mirrors identity and friends into the serialized state.
@@ -370,6 +370,7 @@ impl App {
                     tag: format!("{:04}", friends::tag(&key)),
                     status: f.status.clone(),
                     online: f.status == Status::Friend && self.online(&key),
+                    sending: self.sending_requests.contains(&key),
                 }
             })
             .collect();
@@ -378,6 +379,16 @@ impl App {
 
     fn tell(&self, to: &[u8; 32], message: &Message) {
         friends::send(self.identity.seal(to, message), to);
+    }
+
+    fn send(&self, to: [u8; 32], message: &Message, done: impl FnOnce(Result<()>) -> Job + Send + 'static) {
+        let envelope = self.identity.seal(&to, message);
+        let sender = self.jobs.0.clone();
+        let wake = self.wake.clone();
+        thread::spawn(move || {
+            let _ = sender.send(done(friends::deliver(&envelope, &to)));
+            wake();
+        });
     }
 
     fn friend(&self, id: &str) -> Option<(friends::Friend, [u8; 32])> {
@@ -431,10 +442,18 @@ impl App {
                 self.tell(&key, &Message::FriendAccept { name: self.identity.name.clone() });
                 toast(view, &format!("{handle} теперь в друзьях."))?;
             }
-            _ => {
+            status => {
+                if !self.sending_requests.insert(key) {
+                    return Ok(());
+                }
                 self.book.set(&key, name, Status::Outgoing);
-                self.tell(&key, &Message::FriendRequest { name: self.identity.name.clone() });
-                toast(view, &format!("Запрос отправлен: {handle}"))?;
+                let new = status.is_none();
+                self.send(
+                    key,
+                    &Message::FriendRequest { name: self.identity.name.clone() },
+                    move |result| Job::FriendRequest { key, new, result },
+                );
+                toast(view, "Отправляем запрос…")?;
             }
         }
         view.evaluate_script("window.duo.friendAdded();")?;
@@ -442,10 +461,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_mail(&mut self, view: &WebView, text: &str) -> Result<()> {
-        let Some((from, message)) = self.identity.open(text) else {
-            return Ok(());
-        };
+    fn handle_mail(&mut self, view: &WebView, from: [u8; 32], message: Message) -> Result<()> {
         let known = self.book.find(&from).cloned();
         let is_friend = known.as_ref().is_some_and(|f| f.status == Status::Friend);
         match message {
@@ -476,9 +492,8 @@ impl App {
             Message::Invite { name, code, at } => {
                 if is_friend && friends::now().saturating_sub(at) < INVITE_LIFETIME {
                     self.book.set(&from, &name, Status::Friend);
-                    self.presence.insert(from, friends::now());
+                    self.presence.insert(from, (friends::now(), true));
                     self.invitation = Some(Invitation {
-                        id: friends::short_id(&from),
                         name: friends::handle(&name, &from),
                         key: from,
                         code,
@@ -487,9 +502,10 @@ impl App {
                     self.attention = true;
                 }
             }
-            Message::InviteDecline { .. } => {
+            Message::InviteDecline { at } => {
                 if let Some(target) = &self.host_for
                     && target.key == from
+                    && target.sent_at == Some(at)
                     && !target.joined
                 {
                     let name = target.name.clone();
@@ -499,7 +515,7 @@ impl App {
                 }
             }
             Message::InviteCancel { at } => {
-                if self.invitation.as_ref().is_some_and(|i| i.key == from && i.at <= at) {
+                if self.invitation.as_ref().is_some_and(|i| i.key == from && i.at == at) {
                     self.invitation = None;
                 }
             }
@@ -630,7 +646,9 @@ impl App {
             Action::CopyCode => copy(view, &self.identity.code(), "Код друга скопирован")?,
             Action::InviteFriend { id } if self.host.session.is_none() => {
                 if let Some((friend, key)) = self.friend(&id).filter(|(f, _)| f.status == Status::Friend) {
-                    self.host_for = Some(HostFor { id, name: friend.handle(), key, sent_at: None, joined: false });
+                    self.host_for = Some(HostFor {
+                        name: friend.handle(), key, sent_at: None, joined: false, send_error: None,
+                    });
                     self.begin_hosting();
                 }
             }
@@ -686,22 +704,27 @@ impl App {
         }
 
         // Friend invite: hand the session code to the friend once it exists.
+        let mut invite_to_send = None;
         if let Some(target) = &mut self.host_for {
             if target.sent_at.is_none() && self.host.phase == Phase::Invite && !self.host.code.is_empty() {
                 let at = friends::now();
-                let message = Message::Invite { name: self.identity.name.clone(), code: self.host.code.clone(), at };
-                friends::send(self.identity.seal(&target.key, &message), &target.key);
                 target.sent_at = Some(at);
-                self.host.message = "Приглашение отправлено.".into();
-                changed = true;
+                invite_to_send = Some((target.key, at));
             }
-            if self.host.phase == Phase::Live {
-                target.joined = true;
-            }
+            target.joined |= self.host.phase == Phase::Live;
+        }
+        if let Some((key, at)) = invite_to_send {
+            let message = Message::Invite { name: self.identity.name.clone(), code: self.host.code.clone(), at };
+            self.send(key, &message, move |result| Job::InviteSent { key, at, result });
+            self.host.message = "Отправляем приглашение…".into();
+            changed = true;
         }
         if host_done && let Some(target) = self.host_for.take() {
             if let (Some(at), false) = (target.sent_at, target.joined) {
-                friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
+                self.tell(&target.key, &Message::InviteCancel { at });
+            }
+            if let Some(error) = target.send_error {
+                self.host.fail(error);
             }
             changed = true;
         }
@@ -711,29 +734,28 @@ impl App {
         }
 
         let incoming: Vec<Incoming> = self.inbox.as_ref().map(|i| i.messages.try_iter().collect()).unwrap_or_default();
-        let mut newest_mail = self.mail_cursor;
+        let mut mail_changed = false;
         for item in incoming {
             match item {
-                // Handled before a restart: never show it twice.
-                Incoming::Mail { time, .. } if time <= self.mail_cursor => {}
                 Incoming::Mail { time, text } => {
-                    let _ = self.handle_mail(view, &text);
-                    newest_mail = newest_mail.max(time);
+                    if let Some((from, message)) = self.identity.open(&text)
+                        && self.mail_history.remember(time, &text)
+                    {
+                        let _ = self.handle_mail(view, from, message);
+                        mail_changed = true;
+                    }
                 }
                 Incoming::Presence { key, online, time } => {
-                    if online {
-                        let seen = self.presence.entry(key).or_insert(0);
-                        *seen = (*seen).max(time);
-                    } else if self.presence.get(&key).is_some_and(|seen| *seen <= time) {
-                        self.presence.remove(&key);
+                    let current = self.presence.entry(key).or_insert((0, false));
+                    if time >= current.0 {
+                        *current = (time, online);
                     }
                 }
             }
             changed = true;
         }
-        if newest_mail > self.mail_cursor {
-            self.mail_cursor = newest_mail;
-            friends::save_cursor(&self.data, newest_mail);
+        if mail_changed && self.mail_history.save(&self.data).is_err() {
+            let _ = toast(view, "Не удалось сохранить историю сообщений.");
         }
 
         for job in self.jobs.1.try_iter().collect::<Vec<_>>() {
@@ -747,6 +769,36 @@ impl App {
                         Err(error) => {
                             let _ = toast(view, &error.to_string());
                         }
+                    }
+                }
+                Job::FriendRequest { key, new, result } => {
+                    self.sending_requests.remove(&key);
+                    if self.book.find(&key).is_some_and(|entry| entry.status == Status::Outgoing) {
+                        match result {
+                            Ok(()) => { let _ = toast(view, "Запрос отправлен."); }
+                            Err(error) => {
+                                if new {
+                                    self.book.remove(&key);
+                                }
+                                let _ = toast(view, &error.to_string());
+                            }
+                        }
+                    }
+                }
+                Job::InviteSent { key, at, result } => {
+                    if let Some(target) = self.host_for.as_mut().filter(|target| target.key == key && target.sent_at == Some(at)) {
+                        if self.host.phase == Phase::Invite {
+                            match result {
+                                Ok(()) => self.host.message = "Приглашение отправлено.".into(),
+                                Err(error) => {
+                                    target.send_error = Some(format!("{error} Попробуйте по коду."));
+                                    self.host.stop();
+                                }
+                            }
+                        }
+                    } else if result.is_ok() {
+                        // It may have arrived after the user closed the session.
+                        self.tell(&key, &Message::InviteCancel { at });
                     }
                 }
             }
@@ -779,7 +831,6 @@ impl App {
     }
 
     fn shutdown(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
         let sessions = [self.host.session.as_ref(), self.guest.session.as_ref(), self.setup.session.as_ref()];
         for session in sessions.into_iter().flatten() {
             session.cancel();
@@ -789,7 +840,9 @@ impl App {
         {
             friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
         }
-        friends::sign_off(&self.identity.public);
+        if self.next_presence.is_some() {
+            friends::sign_off(&self.identity.public);
+        }
         self.inbox = None;
         let by = Instant::now() + Duration::from_secs(2);
         while Instant::now() < by && sessions.into_iter().flatten().any(|session| !session.finished()) {
@@ -857,7 +910,7 @@ pub fn run() -> Result<()> {
     }
     let proxy = event_loop.create_proxy();
     let view = WebViewBuilder::new_with_web_context(&mut context)
-        .with_background_color((10, 10, 11, 255))
+        .with_background_color((11, 11, 11, 255))
         .with_theme(wry::Theme::Dark)
         .with_https_scheme(true)
         .with_default_context_menus(false)
@@ -907,6 +960,7 @@ pub fn run() -> Result<()> {
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
                 let now = Instant::now();
+                app.refresh_presence(now);
                 if now >= next_tick {
                     app.tick(&view);
                     next_tick = now + Duration::from_secs(20);

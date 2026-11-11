@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
@@ -265,7 +266,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
 }
 
-fn register(exe: &Path, remove: bool) -> Result<()> {
+fn register(exe: &Path) -> Result<()> {
     let data = crate::platform::data_dir()?;
     let script = data.join("setup").join("register.ps1");
     write_script(&script, REGISTER_SCRIPT)?;
@@ -280,9 +281,6 @@ fn register(exe: &Path, remove: bool) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if remove {
-        command.arg("-Remove");
-    }
     ensure!(command.status()?.success(), "Не удалось создать ярлыки DuoLink.");
     Ok(())
 }
@@ -308,7 +306,7 @@ pub fn self_install() -> Result<Launch> {
     if same_path(&current, &target) {
         // Repair shortcuts and the uninstall entry once per version.
         let marker = target.with_file_name(format!(".registered-{VERSION}"));
-        if !marker.exists() && register(&target, false).is_ok() {
+        if !marker.exists() && register(&target).is_ok() {
             let _ = fs::write(marker, b"");
         }
         return Ok(Launch::Run);
@@ -321,7 +319,7 @@ pub fn self_install() -> Result<Launch> {
         // The installed copy is running: use this one for now.
         return Ok(Launch::Run);
     }
-    register(&target, false)?;
+    register(&target)?;
     let _ = fs::write(target.with_file_name(format!(".registered-{VERSION}")), b"");
     Command::new(&target)
         .current_dir(target.parent().unwrap())
@@ -332,18 +330,17 @@ pub fn self_install() -> Result<Launch> {
 
 /// `DuoLink.exe --uninstall`, started from Apps & Features.
 pub fn uninstall() -> Result<()> {
-    let target = installed_exe()?;
-    register(&target, true)?;
-    let folder = target.parent().unwrap().to_path_buf();
-    let data = crate::platform::data_dir()?;
-    // Delete after this process exits; the running exe cannot remove itself.
-    Command::new(system_tool("cmd.exe")?)
-        .arg("/c")
-        .arg(format!(
-            "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\" & rmdir /s /q \"{}\"",
-            folder.display(),
-            data.display()
-        ))
+    let exe = std::env::current_exe()?;
+    let exe_literal = exe.to_string_lossy().replace('\'', "''");
+    // The helper waits for this process and reports the result of the cleanup.
+    let script = format!(
+        "& {{\n{REGISTER_SCRIPT}\n}} -Exe '{exe_literal}' -Remove -ParentId {}",
+        std::process::id()
+    );
+    let encoded = STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    Command::new(system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?)
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        .arg(encoded)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

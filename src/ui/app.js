@@ -15,32 +15,24 @@ let confirmRemove = null;
 let toastTimer;
 
 const HOST = {
-  working: ["Подготовка", "", "Создаём сессию"],
-  invite: ["Ожидание", "warn", "Ждём друга"],
-  approval: ["Запрос", "warn", ""],
-  live: ["В эфире", "ok", "В игре"],
-  stopping: ["Завершение", "", "Завершаем"],
+  working: "Создаём сессию",
+  invite: "Ждём друга",
+  approval: "Запрос на подключение",
+  live: "В игре",
+  stopping: "Завершаем",
 };
 const GUEST = {
-  working: ["Подключение", "", "Подключаемся"],
-  live: ["В эфире", "ok", "В игре"],
-  stopping: ["Завершение", "", "Отключаемся"],
+  working: "Подключаемся",
+  live: "В игре",
+  stopping: "Отключаемся",
 };
 
 const text = (id, value) => { const el = $(id); if (el.textContent !== value) el.textContent = value; };
 const show = (id, on) => { $(id).hidden = !on; };
-const tone = (el, kind) => { el.classList.remove("ok", "warn", "done", "busy"); if (kind) el.classList.add(kind); };
 const initial = (name) => [...(name || "?")][0];
 
-function hue(id) {
-  let h = 0;
-  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
-  return `hsl(${h} 45% 42%)`;
-}
-
-function avatar(el, name, id, online = false) {
+function avatar(el, name, online = false) {
   el.textContent = initial(name);
-  el.style.setProperty("--hue", hue(id || name));
   el.classList.toggle("online", online);
 }
 
@@ -107,12 +99,12 @@ function renderPrepare(next) {
   ];
   for (const [id, ok, pending] of rows) {
     const busy = !ok && working && (id === "c-engines" || next.fullSetup);
-    tone($(id), ok ? "done" : busy ? "busy" : "");
+    $(id).classList.toggle("done", ok);
+    $(id).classList.toggle("busy", busy);
     $(id).querySelector("em").textContent = ok ? "Готово" : busy ? "Установка" : pending;
   }
   show("prepare", working || next.setup.error);
   text("setup-line", working || next.setup.error ? next.setup.message : "");
-  $("setup-line").style.color = next.setup.error ? "var(--red)" : "";
   show("install", next.setup.error && !working);
 }
 
@@ -127,9 +119,6 @@ function renderFacts(id, facts) {
     dt.textContent = name;
     const dd = document.createElement("dd");
     dd.textContent = value;
-    if (name === "Соединение") tone(dd, "ok");
-    if (name === "Доступ") tone(dd, value.startsWith("Строгий") || value.startsWith("Только") ? "warn" : "ok");
-    if (name === "Xbox Game Bar") tone(dd, "warn");
     return [dt, dd];
   }));
 }
@@ -141,10 +130,7 @@ function renderSession(who, pane, table) {
     line(`${who}-result`, pane.message, pane.error);
     return;
   }
-  const [pill, kind, title] = table[pane.phase];
-  text(`${who}-pill`, pill);
-  tone($(`${who}-pill`), kind);
-  text(`${who}-title`, title);
+  text(`${who}-title`, table[pane.phase]);
   text(`${who}-message`, pane.message);
   show(`${who}-message`, Boolean(pane.message));
   renderFacts(`${who}-facts`, pane.facts);
@@ -177,7 +163,7 @@ function renderPlay(next) {
   show("friend-invite", Boolean(invite) && !guestActive);
   if (invite) {
     text("invite-name", invite.name);
-    avatar($("invite-avatar"), invite.name, invite.id, true);
+    avatar($("invite-avatar"), invite.name, true);
   }
 }
 
@@ -210,7 +196,7 @@ function friendRow(friend, hosting) {
   row.className = "friend";
   const face = document.createElement("span");
   face.className = "avatar";
-  avatar(face, friend.name, friend.id, friend.online);
+  avatar(face, friend.name, friend.online);
   const who = document.createElement("div");
   who.className = "who";
   const name = document.createElement("b");
@@ -235,11 +221,10 @@ function friendRow(friend, hosting) {
     note.textContent = "хочет дружить";
     row.append(button("Принять", "accept_friend", friend.id, true), removeButton(friend));
   } else if (friend.status === "outgoing") {
-    note.textContent = "запрос отправлен";
+    note.textContent = friend.sending ? "отправляем…" : "запрос отправлен";
     row.append(removeButton(friend));
   } else {
     note.textContent = friend.online ? "в сети" : "не в сети";
-    note.classList.toggle("on", friend.online);
     row.append(button("Позвать", "invite_friend", friend.id, friend.online, hosting), removeButton(friend));
   }
   return row;
@@ -248,7 +233,7 @@ function friendRow(friend, hosting) {
 function renderFriends(next) {
   text("me-name", next.me.name);
   text("me-tag", `#${next.me.tag}`);
-  avatar($("me-avatar"), next.me.name, next.me.name);
+  avatar($("me-avatar"), next.me.name);
   $("add-button").disabled = next.lookingUp;
 
   const hosting = next.host.phase !== "idle";
@@ -257,7 +242,7 @@ function renderFriends(next) {
     ["Запросы", next.friends.filter((f) => f.status === "incoming")],
     ["В сети", next.friends.filter((f) => f.status === "friend" && f.online)],
     ["Не в сети", next.friends.filter((f) => f.status === "friend" && !f.online)],
-    ["Отправлены", next.friends.filter((f) => f.status === "outgoing")],
+    ["Исходящие", next.friends.filter((f) => f.status === "outgoing")],
   ].filter(([, list]) => list.length);
 
   const key = JSON.stringify([sections, hosting, confirmRemove]);

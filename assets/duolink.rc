@@ -1,8 +1,8 @@
 1 ICON "duolink.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,9,0,0
-PRODUCTVERSION 1,9,0,0
+FILEVERSION 1,9,1,0
+PRODUCTVERSION 1,9,1,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -12,11 +12,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "DuoLink"
       VALUE "FileDescription", "DuoLink"
-      VALUE "FileVersion", "1.9.0"
+      VALUE "FileVersion", "1.9.1"
       VALUE "InternalName", "DuoLink"
       VALUE "OriginalFilename", "DuoLink.exe"
       VALUE "ProductName", "DuoLink"
-      VALUE "ProductVersion", "1.9.0"
+      VALUE "ProductVersion", "1.9.1"
     END
   END
   BLOCK "VarFileInfo"

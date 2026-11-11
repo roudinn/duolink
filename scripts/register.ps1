@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [string]$Version = '',
-    [switch]$Remove
+    [switch]$Remove,
+    [int]$ParentId = 0
 )
 
 Set-StrictMode -Version Latest
@@ -14,10 +15,69 @@ $links = @(
 )
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\DuoLink'
 
+function Remove-DuoLinkFiles([string]$Local, [string]$InstalledExe) {
+    if (!$Local) { throw 'Не найдена папка LocalAppData.' }
+    $programs = Join-Path $Local 'Programs'
+    $installed = Join-Path $programs 'DuoLink'
+    $data = Join-Path $Local 'DuoLink'
+    $expected = Join-Path $installed 'DuoLink.exe'
+    if (![string]::Equals([IO.Path]::GetFullPath($InstalledExe), $expected, 'OrdinalIgnoreCase')) {
+        throw 'Запустите удаление DuoLink из списка приложений Windows.'
+    }
+
+    foreach ($path in @($programs, $installed, $data)) {
+        if (!(Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        if (!$item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Папка $path перенаправлена."
+        }
+        $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
+        if (![string]::Equals($resolved, $path, 'OrdinalIgnoreCase')) {
+            throw "Не удалось проверить путь $path."
+        }
+    }
+
+    foreach ($path in @($data, $installed)) {
+        if ([IO.Directory]::Exists($path)) {
+            # On Windows PowerShell 5.1 recursive deletion can fail on a junction.
+            # Remove directory links themselves before deleting the contents.
+            $pending = [Collections.Generic.Stack[string]]::new()
+            $pending.Push($path)
+            while ($pending.Count -gt 0) {
+                foreach ($child in [IO.Directory]::EnumerateDirectories($pending.Pop())) {
+                    if ([IO.File]::GetAttributes($child) -band [IO.FileAttributes]::ReparsePoint) {
+                        [IO.Directory]::Delete($child, $false)
+                    } else {
+                        $pending.Push($child)
+                    }
+                }
+            }
+            [IO.Directory]::Delete($path, $true)
+        }
+    }
+}
+
 if ($Remove) {
-    foreach ($link in $links) { Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue }
-    Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
-    exit 0
+    Add-Type -AssemblyName System.Windows.Forms
+    try {
+        $parent = Get-Process -Id $ParentId -ErrorAction SilentlyContinue
+        if ($parent) { Wait-Process -InputObject $parent -Timeout 15 }
+        $running = Get-Process -Name 'DuoLink' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe }
+        if ($running) { throw 'Закройте DuoLink и повторите.' }
+
+        Remove-DuoLinkFiles ([Environment]::GetFolderPath('LocalApplicationData')) $Exe
+        foreach ($link in $links) {
+            if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force }
+        }
+        if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse -Force }
+        [void][System.Windows.Forms.MessageBox]::Show('DuoLink удалён.', 'DuoLink', 'OK', 'Information')
+        exit 0
+    }
+    catch {
+        $message = "Не удалось удалить DuoLink.`r`n$($_.Exception.Message)"
+        [void][System.Windows.Forms.MessageBox]::Show($message, 'DuoLink', 'OK', 'Error')
+        exit 1
+    }
 }
 
 $folder = Split-Path -LiteralPath $Exe

@@ -37,9 +37,9 @@ use crate::tunnel::{SIGNAL_SERVER, curl};
 const CODE_PREFIX: &str = "DLF-";
 /// Invites older than this are stale: the host's session code has expired.
 pub const INVITE_LIFETIME: u64 = 15 * 60;
-/// A friend counts as online this long after their last heartbeat.
-pub const ONLINE_WINDOW: u64 = 150;
-pub const HEARTBEAT: Duration = Duration::from_secs(60);
+/// 72 presence posts per day, below the shared ntfy.sh quota of 250.
+pub const HEARTBEAT: Duration = Duration::from_secs(20 * 60);
+pub const ONLINE_WINDOW: u64 = HEARTBEAT.as_secs() + 4 * 60;
 /// ntfy.sh keeps messages for 12 hours, so the directory entry is refreshed
 /// well within that.
 pub const DIRECTORY_REFRESH: Duration = Duration::from_secs(4 * 3600);
@@ -368,59 +368,66 @@ fn directory_topic(name: &str, tag: u16) -> String {
     topic("directory", format!("{}#{tag:04}", name.to_ascii_lowercase()).as_bytes())
 }
 
-/// POSTs `body` to a topic, retrying a few times if the network hiccups.
-fn post(topic: String, body: String) {
-    thread::spawn(move || {
-        for attempt in 0..3u64 {
-            if attempt > 0 {
-                thread::sleep(Duration::from_secs(2 * attempt));
-            }
-            let Ok(mut command) = curl() else { return };
-            let Ok(mut child) = command
-                .args(["--fail", "--max-time", "10", "--data-binary", "@-"])
-                .arg(format!("{SIGNAL_SERVER}/{topic}"))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()
-            else {
-                return;
-            };
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(body.as_bytes());
-            }
-            if child.wait().is_ok_and(|status| status.success()) {
-                return;
-            }
+fn post_once(topic: &str, body: &str, timeout: &str) -> Result<u16> {
+    let mut child = curl()?
+        .args(["--max-time", timeout, "--data-binary", "@-", "--output", "NUL", "--write-out", "%{http_code}"])
+        .arg(format!("{SIGNAL_SERVER}/{topic}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(body.as_bytes()).is_ok());
+    let output = child.wait_with_output()?;
+    let status = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
+    // curl can see a success status before the response finishes.
+    Ok(if (!written || !output.status.success()) && (200..300).contains(&status) { 0 } else { status })
+}
+
+fn post(topic: &str, body: &str) -> Result<()> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_secs(2 * attempt));
         }
+        match post_once(topic, body, "10").unwrap_or(0) {
+            200..=299 => return Ok(()),
+            429 => bail!("Лимит отправки. Попробуйте позже."),
+            400..=499 => bail!("Сервис отклонил сообщение."),
+            _ => {}
+        }
+    }
+    bail!("Не удалось отправить сообщение.")
+}
+
+fn post_background(topic: String, body: String) {
+    thread::spawn(move || {
+        let _ = post(&topic, &body);
     });
 }
 
 /// Sends a sealed message to a friend's inbox.
 pub fn send(envelope: String, to: &[u8; 32]) {
-    post(inbox_topic(to), envelope);
+    post_background(inbox_topic(to), envelope);
+}
+
+/// Waits for the server to accept a message. Call off the UI thread.
+pub fn deliver(envelope: &str, to: &[u8; 32]) -> Result<()> {
+    post(&inbox_topic(to), envelope)
 }
 
 /// Lists us in the directory under `name#tag`.
 pub fn announce(me: &Me) {
-    post(directory_topic(&me.name, tag(&me.public)), URL_SAFE_NO_PAD.encode(me.public));
+    post_background(directory_topic(&me.name, tag(&me.public)), URL_SAFE_NO_PAD.encode(me.public));
 }
 
 pub fn heartbeat(key: &[u8; 32], online: bool) {
-    post(presence_topic(key), if online { "on" } else { "off" }.into());
+    let topic = presence_topic(key);
+    thread::spawn(move || {
+        let _ = post_once(&topic, if online { "on" } else { "off" }, "10");
+    });
 }
 
 /// Like `heartbeat(.., false)` but waits, for use while closing.
 pub fn sign_off(key: &[u8; 32]) {
-    if let Ok(mut command) = curl()
-        && let Ok(mut child) = command
-            .args(["--max-time", "3", "--data-binary", "off"])
-            .arg(format!("{SIGNAL_SERVER}/{}", presence_topic(key)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-    {
-        let _ = child.wait();
-    }
+    let _ = post_once(&presence_topic(key), "off", "3");
 }
 
 /// Finds the public key behind `name#tag`.
@@ -464,7 +471,7 @@ pub struct Inbox {
 }
 
 impl Inbox {
-    /// `since`: unix time of the last mail already handled.
+    /// `since`: latest mail time from the saved history.
     pub fn listen(me: &[u8; 32], friends: &[[u8; 32]], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let inbox = inbox_topic(me);
         let presence: HashMap<String, [u8; 32]> = friends.iter().map(|key| (presence_topic(key), *key)).collect();
@@ -479,15 +486,19 @@ impl Inbox {
             let (child, stop) = (child.clone(), stop.clone());
             thread::spawn(move || {
                 let mut seen = HashSet::new();
-                // Mail since the last handled message (bounded by the invite
-                // lifetime), and enough presence history to know who is online.
-                let floor = now().saturating_sub(INVITE_LIFETIME);
-                let mut cursor = since.max(floor).min(now().saturating_sub(ONLINE_WINDOW));
+                let clock = now();
+                let floor = clock.saturating_sub(ONLINE_WINDOW);
+                let mut cursor = since.max(floor);
+                if !presence.is_empty() {
+                    cursor = floor;
+                }
                 while !stop.load(Ordering::Relaxed) {
                     let spawned = curl().ok().and_then(|mut command| {
                         command
                             .args(["--no-buffer", "--max-time", "900"])
-                            .arg(format!("{url}?since={cursor}"))
+                            // Replay the boundary second too. Multiple IDs
+                            // can share that timestamp, even across reconnects.
+                            .arg(format!("{url}?since={}", cursor.saturating_sub(1)))
                             .stdin(Stdio::null())
                             .stdout(Stdio::piped())
                             .spawn()
@@ -498,7 +509,15 @@ impl Inbox {
                         continue;
                     };
                     let stdout = process.stdout.take();
-                    *child.lock().unwrap() = Some(process);
+                    {
+                        let mut slot = child.lock().unwrap();
+                        if stop.load(Ordering::Relaxed) {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                            break;
+                        }
+                        *slot = Some(process);
+                    }
                     for line in stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(Result::ok)) {
                         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                         if event["event"] != "message" {
@@ -520,7 +539,7 @@ impl Inbox {
                             continue;
                         };
                         if sender.send(incoming).is_err() {
-                            return;
+                            break;
                         }
                         wake();
                     }
@@ -548,17 +567,49 @@ impl Drop for Inbox {
     }
 }
 
-/// Unix time of the newest mail already handled; survives restarts so a
-/// declined request or answered invite is never shown twice.
-pub fn load_cursor(data: &Path) -> u64 {
-    fs::read_to_string(data.join("inbox.json"))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
+/// The same sealed message can have several ntfy IDs when a POST is retried.
+#[derive(Default, Deserialize, Serialize)]
+pub struct MailHistory {
+    legacy_through: u64,
+    received: HashMap<String, u64>,
 }
 
-pub fn save_cursor(data: &Path, time: u64) {
-    let _ = fs::write(data.join("inbox.json"), time.to_string());
+impl MailHistory {
+    pub fn load(data: &Path) -> Self {
+        let Ok(bytes) = fs::read(data.join("inbox.json")) else { return Self::default() };
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| Self {
+            legacy_through: serde_json::from_slice(&bytes).unwrap_or(0),
+            ..Self::default()
+        })
+    }
+
+    pub fn latest(&self) -> u64 {
+        self.received.values().copied().max().unwrap_or(0).max(self.legacy_through)
+    }
+
+    pub fn remember(&mut self, time: u64, text: &str) -> bool {
+        // Keep IDs through the replay window and the maximum POST retry time.
+        let floor = now().saturating_sub(ONLINE_WINDOW + 1);
+        self.received.retain(|_, at| *at >= floor.saturating_sub(60));
+        if time < floor || time <= self.legacy_through {
+            return false;
+        }
+        let id = hex(&digest(b"duolink/mail/v1", text.trim().as_bytes()));
+        match self.received.entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(time);
+                true
+            }
+        }
+    }
+
+    pub fn save(&self, data: &Path) -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(data)?;
+        serde_json::to_writer(file.as_file_mut(), self)?;
+        file.persist(data.join("inbox.json"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +620,35 @@ mod tests {
         let mut me = Me::load_or_create(dir).unwrap();
         me.rename(name).unwrap();
         me
+    }
+
+    #[test]
+    fn mail_history_keeps_distinct_messages_in_the_same_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let time = now();
+        let mut history = MailHistory::default();
+        assert!(history.remember(time, "first"));
+        history.save(dir.path()).unwrap();
+
+        let mut history = MailHistory::load(dir.path());
+        assert_eq!(history.latest(), time);
+        assert!(history.remember(time, "second"));
+        assert!(!history.remember(time + 1, "first"));
+        assert!(history.remember(time - 1, "late"));
+    }
+
+    #[test]
+    fn mail_history_loads_the_old_numeric_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let time = now();
+        fs::write(dir.path().join("inbox.json"), time.to_string()).unwrap();
+        let mut history = MailHistory::load(dir.path());
+        assert!(!history.remember(time, "old"));
+        assert!(history.remember(time + 1, "new"));
+        history.save(dir.path()).unwrap();
+        let mut history = MailHistory::load(dir.path());
+        assert!(!history.remember(time + 1, "new"));
+        assert!(history.remember(time + 1, "another"));
     }
 
     #[test]

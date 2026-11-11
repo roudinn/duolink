@@ -18,11 +18,10 @@ fn message(text: &str, icon: u32) {
 }
 
 fn main() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION};
+    use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR;
     if std::env::args().any(|arg| arg == "--uninstall") {
-        match setup::uninstall() {
-            Ok(()) => message("DuoLink удалён.", MB_ICONINFORMATION),
-            Err(error) => message(&format!("{error:#}"), MB_ICONERROR),
+        if let Err(error) = setup::uninstall() {
+            message(&format!("{error:#}"), MB_ICONERROR);
         }
         return;
     }
