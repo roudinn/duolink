@@ -14,6 +14,9 @@ let view = "play";
 let confirmRemove = null;
 let toastTimer;
 const main = document.querySelector("main");
+// Wide windows show the friends panel beside the main area at all times.
+const wideQuery = window.matchMedia("(min-width: 721px)");
+const wide = () => wideQuery.matches;
 
 const HOST = {
   working: "Создаём сессию",
@@ -72,15 +75,15 @@ function go(next) {
   if (state) render(state);
   main.scrollTop = 0;
   if (settings.open) return;
-  const target = next === "friends" ? "friends-title" :
+  const target = next === "friends" && !wide() ? "friends-title" :
     !$("host-live").hidden ? "host-title" : !$("guest-live").hidden ? "guest-title" :
       !$("prepare").hidden ? "setup-title" : "host-start";
   $(target).focus();
 }
 
 function renderViews(next) {
-  show("play", view === "play");
-  show("friends", view === "friends");
+  show("play", wide() || view === "play");
+  show("friends", wide() || view === "friends");
   show("nick-form", !next.me.chosen);
   show("friends-content", next.me.chosen);
   $("nav-icon").setAttribute("href", view === "friends" ? "#i-back" : "#i-people");
@@ -282,7 +285,8 @@ function renderFriends(next) {
       const group = document.createElement("div");
       group.className = "group";
       group.append(...list.sort(byName).map((f) => friendRow(f, busy)));
-      return title === "Друзья" && sections.length === 1 ? [group] : [label, group];
+      // The panel is already titled "Друзья"; a second heading would repeat it.
+      return title === "Друзья" ? [group] : [label, group];
     }));
   }
   show("friends-empty", next.friends.length === 0);
@@ -384,11 +388,11 @@ document.addEventListener("click", (e) => {
       break;
     case "accept_invite":
       send("accept_invite", { id, options: options() });
-      go("play");
+      if (!wide()) go("play");
       break;
     case "invite_friend":
       send("invite_friend", { id });
-      go("play");
+      if (!wide()) go("play");
       break;
     default: send(action, id ? { id } : {});
   }
@@ -397,12 +401,16 @@ document.addEventListener("click", (e) => {
 settings.addEventListener("click", (e) => { if (e.target === settings) settings.close(); });
 settings.addEventListener("close", () => line("settings-feedback", ""));
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape" || view !== "friends" || settings.open) return;
+  if (e.key !== "Escape" || settings.open || (view !== "friends" && !confirmRemove)) return;
   if (confirmRemove) {
     cancelRemove(confirmRemove);
-  } else {
+  } else if (!wide()) {
     go("play");
   }
+});
+wideQuery.addEventListener("change", () => {
+  view = "play";
+  if (state) render(state);
 });
 
 $("guest-form").addEventListener("submit", (e) => {

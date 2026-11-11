@@ -30,91 +30,96 @@
     </nav>
   </header>
 
-  <main>
-    <div id="invites" class="view notices" aria-label="Приглашения" hidden></div>
+  <div class="layout">
+    <main>
+      <div id="invites" class="view notices" aria-label="Приглашения" hidden></div>
 
-    <!-- Play -->
-    <section id="play" class="view">
-      <div id="prepare" class="session" hidden>
-        <h1 id="setup-title" tabindex="-1">Подготовка хоста</h1>
-        <p id="setup-line" class="muted" role="status"></p>
-      </div>
-
-      <!-- Live sessions -->
-      <div id="host-live" class="session" hidden>
-        <h1 id="host-title" tabindex="-1"></h1>
-        <p id="host-message" class="muted" role="status"></p>
-        <div id="invitation" class="code-row" hidden>
-          <span id="code-box" class="code"></span>
-          <button type="button" class="btn primary" data-action="copy" aria-label="Скопировать код"><svg aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button>
+      <!-- Play -->
+      <section id="play" class="view">
+        <div id="prepare" class="session" hidden>
+          <h1 id="setup-title" tabindex="-1">Подготовка хоста</h1>
+          <p id="setup-line" class="muted" role="status"></p>
         </div>
-        <div id="approval" class="pair" hidden>
-          <button type="button" class="btn block" data-action="deny">Отклонить</button>
-          <button type="button" class="btn primary block" data-action="allow">Разрешить</button>
-        </div>
-        <details id="host-details" hidden><summary>Подробности</summary><dl id="host-facts" class="facts"></dl></details>
-        <button type="button" id="host-stop" class="btn block" data-action="host_stop">Завершить сессию</button>
-      </div>
 
-      <div id="guest-live" class="session" hidden>
-        <h1 id="guest-title" tabindex="-1"></h1>
-        <p id="guest-message" class="muted" role="status"></p>
-        <details id="guest-details" hidden><summary>Подробности</summary><dl id="guest-facts" class="facts"></dl></details>
-        <p id="guest-keys" class="hint" hidden><kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>Q</kbd> — закрыть трансляцию</p>
-        <button type="button" id="guest-stop" class="btn block" data-action="guest_stop">Отключиться</button>
-      </div>
-
-      <!-- Home -->
-      <div id="home" class="stack wide">
-        <button type="button" id="host-start" class="btn primary block" data-action="host_start">Создать сессию</button>
-        <p id="host-result" class="line" role="status" hidden></p>
-
-        <form id="guest-form" class="card">
-          <label for="guest-code" class="field-label">Код сессии</label>
-          <div class="field-wrap">
-            <input id="guest-code" class="field mono" placeholder="DL2-…" autocomplete="off" spellcheck="false" maxlength="256" aria-describedby="guest-result">
-            <button type="button" class="inner" data-action="paste" aria-label="Вставить код" title="Вставить код"><svg aria-hidden="true"><use href="#i-paste"/></svg></button>
+        <!-- Live sessions -->
+        <div id="host-live" class="session" hidden>
+          <h1 id="host-title" tabindex="-1"></h1>
+          <p id="host-message" class="muted" role="status"></p>
+          <div id="invitation" class="code-row" hidden>
+            <span id="code-box" class="code"></span>
+            <button type="button" class="btn primary" data-action="copy" aria-label="Скопировать код"><svg aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button>
           </div>
-          <button type="submit" class="btn block">Подключиться</button>
-          <p id="guest-result" class="line" role="status" hidden></p>
-          <button type="button" id="fix-video" class="btn small self-start" data-action="video_settings" hidden>Настройки видео</button>
-        </form>
-      </div>
+          <div id="approval" class="pair" hidden>
+            <button type="button" class="btn block" data-action="deny">Отклонить</button>
+            <button type="button" class="btn primary block" data-action="allow">Разрешить</button>
+          </div>
+          <details id="host-details" hidden><summary>Подробности</summary><dl id="host-facts" class="facts"></dl></details>
+          <button type="button" id="host-stop" class="btn block" data-action="host_stop">Завершить сессию</button>
+        </div>
 
-      <div id="update-banner" class="notice" hidden>
-        <b id="update-title"></b>
-        <button type="button" class="btn small" data-action="restart">Перезапустить</button>
-      </div>
-    </section>
+        <div id="guest-live" class="session" hidden>
+          <h1 id="guest-title" tabindex="-1"></h1>
+          <p id="guest-message" class="muted" role="status"></p>
+          <details id="guest-details" hidden><summary>Подробности</summary><dl id="guest-facts" class="facts"></dl></details>
+          <p id="guest-keys" class="hint" hidden><kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>Q</kbd> — закрыть трансляцию</p>
+          <button type="button" id="guest-stop" class="btn block" data-action="guest_stop">Отключиться</button>
+        </div>
+
+        <!-- Home -->
+        <div id="home" class="stack wide">
+          <button type="button" id="host-start" class="btn primary block" data-action="host_start">Создать сессию</button>
+          <p id="host-result" class="line" role="status" hidden></p>
+
+          <form id="guest-form" class="card">
+            <label for="guest-code" class="field-label">Код сессии</label>
+            <div class="field-wrap">
+              <input id="guest-code" class="field mono" placeholder="DL2-…" autocomplete="off" spellcheck="false" maxlength="256" aria-describedby="guest-result">
+              <button type="button" class="inner" data-action="paste" aria-label="Вставить код" title="Вставить код"><svg aria-hidden="true"><use href="#i-paste"/></svg></button>
+            </div>
+            <button type="submit" class="btn block">Подключиться</button>
+            <p id="guest-result" class="line" role="status" hidden></p>
+            <button type="button" id="fix-video" class="btn small self-start" data-action="video_settings" hidden>Настройки видео</button>
+          </form>
+        </div>
+
+        <div id="update-banner" class="notice" hidden>
+          <b id="update-title"></b>
+          <button type="button" class="btn small" data-action="restart">Перезапустить</button>
+        </div>
+      </section>
+    </main>
 
     <!-- Friends -->
-    <section id="friends" class="view" hidden>
-      <h1 id="friends-title" class="title" tabindex="-1">Друзья</h1>
+    <aside id="friends" class="panel" aria-labelledby="friends-title" hidden>
+      <h2 id="friends-title" class="panel-title" tabindex="-1">Друзья</h2>
 
-      <form id="nick-form" class="card" hidden>
+      <form id="nick-form" class="panel-body stack" hidden>
         <label for="nick-input" class="field-label">Ваш ник</label>
         <input id="nick-input" class="field" maxlength="16" placeholder="ник" autocomplete="off" spellcheck="false" aria-describedby="nick-hint">
         <p id="nick-hint" class="hint">3–16 символов. Латиница, цифры, _ . -</p>
         <button type="submit" class="btn primary block">Сохранить ник</button>
       </form>
 
-      <div id="friends-content" class="stack wide" hidden>
-        <button type="button" id="me-chip" class="me-chip" data-action="copy_handle" title="Скопировать свой ник">
-          <span id="me-avatar" class="avatar small" aria-hidden="true"></span>
-          <span><b id="me-name"></b><span id="me-tag" class="tag"></span></span>
-          <svg aria-hidden="true"><use href="#i-copy"/></svg>
-        </button>
+      <div id="friends-content" class="panel-content" hidden>
+        <div class="panel-body">
+          <div id="friend-sections" class="stack"></div>
+          <p id="friends-empty" class="empty muted" hidden>Список друзей пуст.</p>
+        </div>
 
-        <form id="add-form" class="inline-form">
-          <input id="add-input" class="field" placeholder="ник#0000 или DLF-…" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Ник с тегом или код друга">
-          <button type="submit" id="add-button" class="btn">Добавить</button>
-        </form>
-
-        <div id="friend-sections" class="stack"></div>
-        <p id="friends-empty" class="empty muted" hidden>Список друзей пуст.</p>
+        <div class="panel-foot">
+          <form id="add-form" class="inline-form">
+            <input id="add-input" class="field" placeholder="ник#0000 или DLF-…" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Ник с тегом или код друга">
+            <button type="submit" id="add-button" class="btn">Добавить</button>
+          </form>
+          <button type="button" id="me-chip" class="me-chip" data-action="copy_handle" title="Скопировать свой ник">
+            <span id="me-avatar" class="avatar small" aria-hidden="true"></span>
+            <span class="me-name"><b id="me-name"></b><span id="me-tag" class="tag"></span></span>
+            <svg aria-hidden="true"><use href="#i-copy"/></svg>
+          </button>
+        </div>
       </div>
-    </section>
-  </main>
+    </aside>
+  </div>
 
   <dialog id="settings" aria-labelledby="settings-title">
     <header>

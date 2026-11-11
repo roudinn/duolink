@@ -877,8 +877,8 @@ pub fn run() -> Result<()> {
         .with_title("DuoLink")
         .with_theme(Some(Theme::Dark))
         .with_window_icon(Icon::from_resource(1, None).ok())
-        .with_inner_size(LogicalSize::new(480.0, 720.0))
-        .with_min_inner_size(LogicalSize::new(400.0, 560.0))
+        .with_inner_size(LogicalSize::new(880.0, 580.0))
+        .with_min_inner_size(LogicalSize::new(420.0, 520.0))
         .with_visible(false)
         .build(&event_loop)?;
     if let Some(monitor) = window.current_monitor() {
