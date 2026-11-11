@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     platform::{Process, run_tool, system_tool},
-    protocol::{Identity, MEDIA_PORT, Mode, Profile},
+    protocol::{Identity, MEDIA_PORT, Mode},
 };
 
 const DESKTOP: &str = "DuoLink";
@@ -143,55 +143,38 @@ fn create_log(data: &Path, name: &str) -> Result<(File, PathBuf)> {
     Ok((file, path))
 }
 
-/// Encoder settings per profile. Every profile keeps Sunshine's single-frame
-/// VBV, low-delay rate control and no lookahead, so none of them queues frames;
-/// they differ only in how much work the encoder spends per frame.
-fn encoder_tuning(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Latency => {
-            // Two-pass stays at quarter resolution: without it NVENC overshoots
-            // the frame budget and the resulting packet loss costs far more
-            // than the sub-millisecond it saves.
-            "nvenc_preset = 1\n\
-             nvenc_twopass = quarter_res\n\
-             nvenc_split_encode = enabled\n\
-             nvenc_realtime_hags = enabled\n\
-             nvenc_latency_over_power = enabled\n\
-             amd_usage = ultralowlatency\n\
-             amd_quality = speed\n\
-             amd_preanalysis = disabled\n\
-             qsv_preset = veryfast\n\
-             qsv_slow_hevc = disabled\n"
-        }
-        Profile::Balanced => {
-            "nvenc_preset = 1\n\
-             nvenc_twopass = quarter_res\n\
-             nvenc_split_encode = enabled\n\
-             nvenc_realtime_hags = enabled\n\
-             nvenc_latency_over_power = enabled\n\
-             amd_usage = ultralowlatency\n\
-             amd_quality = balanced\n\
-             amd_preanalysis = disabled\n\
-             qsv_preset = fast\n\
-             qsv_slow_hevc = disabled\n"
-        }
-        Profile::Quality => {
-            "nvenc_preset = 4\n\
-             nvenc_twopass = full_res\n\
-             nvenc_spatial_aq = enabled\n\
-             nvenc_split_encode = driver_decides\n\
-             nvenc_realtime_hags = enabled\n\
-             nvenc_latency_over_power = enabled\n\
-             amd_usage = lowlatency_high_quality\n\
-             amd_quality = quality\n\
-             amd_preanalysis = disabled\n\
-             qsv_preset = medium\n\
-             qsv_slow_hevc = disabled\n"
-        }
+/// The one encoder setup: the fastest preset of every vendor. Sunshine always
+/// uses single-frame VBV, low-delay rate control and no lookahead, so no frame
+/// waits for another. Quality comes from bitrate, which costs no encode time.
+/// Two-pass stays at quarter resolution: without it NVENC overshoots the frame
+/// budget, and the resulting packet loss costs far more than it saves.
+const ENCODER: &str = "nvenc_preset = 1\n\
+     nvenc_twopass = quarter_res\n\
+     nvenc_split_encode = enabled\n\
+     nvenc_realtime_hags = enabled\n\
+     nvenc_latency_over_power = enabled\n\
+     amd_usage = ultralowlatency\n\
+     amd_quality = speed\n\
+     amd_preanalysis = disabled\n\
+     qsv_preset = veryfast\n\
+     qsv_slow_hevc = disabled\n";
+
+/// Forward error correction when nothing was measured.
+pub const DEFAULT_FEC: u8 = 20;
+
+/// Redundancy for a measured random loss rate: enough to rebuild a frame
+/// without a keyframe round trip, and no more bandwidth than that needs.
+pub fn fec_for_loss(loss: f64) -> u8 {
+    match loss {
+        l if l < 0.002 => 15,
+        l if l < 0.01 => 20,
+        l if l < 0.03 => 30,
+        l if l < 0.06 => 40,
+        _ => 50,
     }
 }
 
-pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
+pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -222,13 +205,14 @@ pub fn host_config(rel: &str, address: Ipv4Addr, profile: Profile) -> String {
          hevc_mode = 0\n\
          av1_mode = 0\n\
          packetsize = {PACKET_SIZE}\n\
-         {encoder}\
+         fec_percentage = {fec}\n\
+         {ENCODER}\
          file_apps = {rel}/apps.json\n\
          file_state = {rel}/state.json\n\
          pkey = {rel}/server.key\n\
          cert = {rel}/server.pem\n\
          log_path = {rel}/sunshine.log\n",
-        encoder = encoder_tuning(profile),
+        fec = fec.clamp(5, 60),
     )
 }
 
@@ -250,7 +234,7 @@ impl HostStream {
         host: Uuid,
         peer: &str,
         peer_cert: &str,
-        profile: Profile,
+        fec: u8,
     ) -> Result<Self> {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
@@ -277,7 +261,7 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            host_config(&rel, address, profile),
+            host_config(&rel, address, fec),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
@@ -372,7 +356,6 @@ pub struct Form {
     pub height: String,
     pub fps: String,
     pub bitrate: String,
-    pub profile: Profile,
     pub codec: Codec,
     pub yuv444: bool,
     pub hdr: bool,
@@ -385,7 +368,6 @@ pub struct Preferences {
     pub resolution: Option<(u32, u32)>,
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
-    pub profile: Profile,
     pub codec: Codec,
     pub yuv444: bool,
     pub hdr: bool,
@@ -394,6 +376,13 @@ pub struct Preferences {
 }
 
 pub const MAX_BITRATE_KBPS: u32 = 500_000;
+/// Ceiling: 1.5× Moonlight's reference. Past it the picture barely improves
+/// while every frame grows and takes longer on the wire; FPS and latency win.
+const QUALITY_SCALE: f64 = 1.5;
+/// Share of the measured path the video may take. With single-frame VBV a
+/// frame is at most bitrate/fps, so at 35 % of the path it crosses the link in
+/// about a third of a frame interval, and the router never builds a queue.
+pub const PATH_SHARE: f64 = 0.35;
 
 impl Preferences {
     pub fn parse(form: &Form) -> Result<Self> {
@@ -433,7 +422,6 @@ impl Preferences {
             resolution: width.zip(height),
             fps,
             bitrate,
-            profile: form.profile,
             codec: form.codec,
             yuv444: form.yuv444,
             hdr: form.hdr,
@@ -454,19 +442,29 @@ impl Preferences {
         }
     }
 
-    /// Kbps for `mode`: the explicit value, or Moonlight's reference curve
-    /// (extended past 4K) scaled by the profile.
+    /// Kbps for `mode`: the explicit value, or the quality ceiling.
     pub fn bitrate_for(self, mode: Mode) -> u32 {
         if let Some(bitrate) = self.bitrate {
             return bitrate;
         }
-        let scale = match self.profile {
-            Profile::Latency => 1.0,
-            Profile::Balanced => 1.5,
-            Profile::Quality => 2.5,
-        };
-        let kbps = reference_bitrate(mode, self.yuv444) as f64 * scale;
+        let kbps = reference_bitrate(mode, self.yuv444) as f64 * QUALITY_SCALE;
         (kbps.round() as u32).clamp(500, MAX_BITRATE_KBPS)
+    }
+
+    /// The automatic bitrate: the quality ceiling, unless the measured path
+    /// cannot carry a frame in half a frame interval. Returns (kbps, capped).
+    pub fn auto_bitrate(self, mode: Mode, path_mbps: Option<f64>) -> (u32, bool) {
+        let ceiling = self.bitrate_for(mode);
+        if self.bitrate.is_some() {
+            return (ceiling, false);
+        }
+        match path_mbps {
+            Some(mbps) => {
+                let budget = ((mbps * PATH_SHARE * 1000.0) as u32).max(3_000);
+                if budget < ceiling { (budget, true) } else { (ceiling, false) }
+            }
+            None => (ceiling, false),
+        }
     }
 }
 
@@ -670,20 +668,32 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_follows_moonlight_curve_and_profiles() {
+    fn bitrate_is_quality_ceiling_bounded_by_half_the_path() {
         let m = |width, height, fps| Mode { width, height, fps };
         assert_eq!(reference_bitrate(m(1920, 1080, 60), false), 20_000);
         assert_eq!(reference_bitrate(m(3840, 2160, 60), false), 80_000);
         assert_eq!(reference_bitrate(m(3840, 2160, 60), true), 160_000);
         assert_eq!(reference_bitrate(m(7680, 4320, 60), false), 320_000);
-        let mut prefs = Preferences {
-            profile: Profile::Latency,
-            ..Preferences::default()
-        };
-        assert_eq!(prefs.bitrate_for(m(1920, 1080, 60)), 20_000);
-        prefs.profile = Profile::Quality;
-        assert_eq!(prefs.bitrate_for(m(1920, 1080, 60)), 50_000);
+        let prefs = Preferences::default();
+        let fhd = m(1920, 1080, 60);
+        assert_eq!(prefs.bitrate_for(fhd), 30_000);
         assert_eq!(prefs.bitrate_for(m(7680, 4320, 240)), MAX_BITRATE_KBPS);
+        assert_eq!(prefs.auto_bitrate(fhd, None), (30_000, false));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(300.0)), (30_000, false));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(40.0)), (14_000, true));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(2.0)), (3_000, true));
+        let manual = Preferences { bitrate: Some(80_000), ..Preferences::default() };
+        assert_eq!(manual.auto_bitrate(fhd, Some(40.0)), (80_000, false));
+    }
+
+    #[test]
+    fn fec_tracks_measured_loss() {
+        assert_eq!(fec_for_loss(0.0), 15);
+        assert_eq!(fec_for_loss(0.005), 20);
+        assert_eq!(fec_for_loss(0.02), 30);
+        assert_eq!(fec_for_loss(0.05), 40);
+        assert_eq!(fec_for_loss(0.2), 50);
+        assert!(host_config("x", Ipv4Addr::LOCALHOST, 90).contains("fec_percentage = 60"));
     }
 
     #[test]
@@ -695,7 +705,7 @@ mod tests {
             assert!(has(flag), "missing {flag}");
         }
         assert!(guest_args(true, mode, Preferences::default()).iter().any(|arg| arg == "windowed"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, Profile::Latency);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC);
         assert!(config.contains("nvenc_split_encode = enabled"));
         assert!(config.contains("amd_usage = ultralowlatency"));
         assert!(config.contains("packetsize = 1024"));

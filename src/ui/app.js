@@ -8,15 +8,9 @@ const NUMBERS = ["width", "height", "fps", "bitrate"];
 const FLAGS = ["yuv444", "hdr", "windowed", "stats"];
 const STORE = "duolink.guest.v3";
 
-let profile = "latency";
 let state;
 let toastTimer;
 
-const PROFILES = {
-  latency: "Самые быстрые пресеты энкодера и базовый битрейт. Лучший выбор для динамичных игр.",
-  balanced: "Те же быстрые пресеты, битрейт ×1.5 — чище картинка при той же задержке, нужен канал побыстрее.",
-  quality: "Более тщательное кодирование (+1–3 мс) и битрейт ×2.5. Для неспешных игр и быстрого интернета.",
-};
 const HOST_VIEW = {
   working: ["Подготовка", "", "Готовим сессию"],
   invite: ["Ожидание", "warn", "Ждём друга"],
@@ -42,18 +36,8 @@ function statusLine(id, message, error = false) {
 
 /* ---------- guest preferences ---------- */
 
-function selectProfile(next) {
-  profile = PROFILES[next] ? next : "latency";
-  document.querySelectorAll("[data-profile]").forEach((b) => {
-    const on = b.dataset.profile === profile;
-    b.setAttribute("aria-checked", String(on));
-    b.tabIndex = on ? 0 : -1;
-  });
-  text("profile-note", PROFILES[profile]);
-}
-
 function options() {
-  const out = { profile, codec: $("codec").value };
+  const out = { codec: $("codec").value };
   for (const id of NUMBERS) out[id] = $(id).value.trim();
   for (const id of FLAGS) out[id] = $(id).checked;
   return out;
@@ -71,7 +55,6 @@ function restore() {
     for (const id of FLAGS) $(id).checked = Boolean(saved[id]);
     if ([...$("codec").options].some((o) => o.value === saved.codec)) $("codec").value = saved.codec;
   }
-  selectProfile(saved?.profile ?? "latency");
 }
 
 /* ---------- home ---------- */
@@ -204,20 +187,6 @@ function toast(message) {
 }
 
 /* ---------- events ---------- */
-
-document.querySelectorAll("[data-profile]").forEach((b) => {
-  b.addEventListener("click", () => { selectProfile(b.dataset.profile); save(); });
-  b.addEventListener("keydown", (e) => {
-    const order = Object.keys(PROFILES);
-    const step = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 }[e.key];
-    if (!step) return;
-    e.preventDefault();
-    const next = order[(order.indexOf(profile) + step + order.length) % order.length];
-    selectProfile(next);
-    save();
-    document.querySelector(`[data-profile="${next}"]`).focus();
-  });
-});
 
 document.addEventListener("click", (e) => {
   const button = e.target.closest("button[data-action]");

@@ -290,17 +290,14 @@ impl Drop for KeepAwake {
     }
 }
 
-/// Hardware-accelerated GPU scheduling lets NVENC run with realtime priority.
-pub fn hags_enabled() -> Option<bool> {
-    let key: Vec<u16> = "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\0"
-        .encode_utf16()
-        .collect();
-    let value: Vec<u16> = "HwSchMode\0".encode_utf16().collect();
+fn registry_dword(root: windows_sys::Win32::System::Registry::HKEY, key: &str, value: &str) -> Option<u32> {
+    let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
     let mut data = 0u32;
     let mut size = size_of::<u32>() as u32;
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             key.as_ptr(),
             value.as_ptr(),
             RRF_RT_REG_DWORD,
@@ -309,7 +306,27 @@ pub fn hags_enabled() -> Option<bool> {
             &mut size,
         )
     };
-    (status == 0).then_some(data == 2)
+    (status == 0).then_some(data)
+}
+
+/// Hardware-accelerated GPU scheduling lets NVENC run with realtime priority.
+pub fn hags_enabled() -> Option<bool> {
+    registry_dword(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+        "HwSchMode",
+    )
+    .map(|mode| mode == 2)
+}
+
+/// Xbox Game Bar's "record what happened" keeps the GPU encoder busy in the
+/// background, competing with Sunshine for every frame.
+pub fn background_recording() -> bool {
+    registry_dword(
+        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+        "HistoricalCaptureEnabled",
+    ) == Some(1)
 }
 
 /// Quiets every connected Wi-Fi adapter for the length of a session.

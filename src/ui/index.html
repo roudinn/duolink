@@ -96,12 +96,7 @@
             <input id="guest-code" class="mono" placeholder="Код приглашения" autocomplete="off" spellcheck="false" maxlength="256" aria-label="Код приглашения" aria-describedby="guest-result">
             <button type="button" class="link" data-action="paste">Вставить</button>
           </div>
-          <div class="segmented" role="radiogroup" aria-label="Профиль">
-            <button type="button" role="radio" data-profile="latency">Задержка</button>
-            <button type="button" role="radio" data-profile="balanced">Баланс</button>
-            <button type="button" role="radio" data-profile="quality">Качество</button>
-          </div>
-          <p id="profile-note" class="muted small"></p>
+          <p class="muted small">Качество и FPS как у хоста, минимальная задержка. Битрейт и коррекция ошибок подбираются под ваш канал автоматически.</p>
           <button type="submit" class="btn primary wide">Подключиться</button>
           <p id="guest-result" class="status-line" role="status" hidden></p>
         </form>

@@ -66,9 +66,9 @@ const SIGNAL_SERVER: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
 const PROBE_PORT: u16 = 0;
-/// The probe sends at this rate; reaching most of it means "not the bottleneck".
-const PROBE_MBPS: f64 = 300.0;
-const PROBE_TIME: Duration = Duration::from_millis(700);
+/// The capacity probe sends at this rate; reaching most of it means the
+/// path is not the bottleneck.
+pub const PROBE_MBPS: u32 = 300;
 
 /// Datagrams the tunnel could not send (too large or no connection).
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -456,13 +456,19 @@ fn enlarge(socket: socket2::SockRef<'_>) {
 
 /// Host side of the bandwidth probe: a fixed-rate burst of datagrams, then
 /// the number of bytes offered on the probe stream.
-async fn probe_send(conn: Connection, mut reply: quinn::SendStream) {
+async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: quinn::RecvStream) {
+    let mut request = [0u8; 8];
+    if recv.read_exact(&mut request).await.is_err() {
+        return;
+    }
+    let mbps = u32::from_be_bytes(request[..4].try_into().unwrap()).clamp(1, 1000);
+    let time = Duration::from_millis(u32::from_be_bytes(request[4..].try_into().unwrap()).clamp(100, 1500) as u64);
     let size = conn.max_datagram_size().unwrap_or(1100).clamp(64, 1100);
     let payload = vec![0u8; size - 2];
-    let rate = PROBE_MBPS * 1e6 / 8.0;
+    let rate = mbps as f64 * 1e6 / 8.0;
     let start = Instant::now();
     let mut sent: u64 = 0;
-    while start.elapsed() < PROBE_TIME {
+    while start.elapsed() < time {
         let due = (start.elapsed().as_secs_f64() * rate) as u64;
         while sent < due {
             if conn.send_datagram(tag(PROBE_PORT, &payload)).is_err() {
@@ -489,6 +495,8 @@ pub struct Bandwidth {
     pub mbps: f64,
     /// The path, not the probe, set the rate.
     pub limited: bool,
+    /// Share of the offered bytes that never arrived.
+    pub loss: f64,
 }
 
 fn runtime() -> Result<Runtime> {
@@ -573,7 +581,7 @@ async fn serve_host(conn: Connection) {
             }
             let port = u16::from_be_bytes(header);
             if port == PROBE_PORT {
-                probe_send(conn, send).await;
+                probe_send(conn, send, recv).await;
                 return;
             }
             if !TCP_PORTS.contains(&port) {
@@ -972,14 +980,17 @@ impl GuestTunnel {
     }
 
     /// Asks the host for a short burst and measures what actually arrives.
-    pub fn measure(&self) -> Option<Bandwidth> {
+    pub fn measure(&self, mbps: u32, time: Duration) -> Option<Bandwidth> {
         let runtime = self.runtime.as_ref()?;
         *self.probe.lock().unwrap() = ProbeStats::default();
         let conn = self.conn.clone();
+        let mut request = PROBE_PORT.to_be_bytes().to_vec();
+        request.extend_from_slice(&mbps.to_be_bytes());
+        request.extend_from_slice(&(time.as_millis() as u32).to_be_bytes());
         let offered = runtime.block_on(async move {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(time + Duration::from_secs(3), async {
                 let (mut send, mut recv) = conn.open_bi().await.ok()?;
-                send.write_all(&PROBE_PORT.to_be_bytes()).await.ok()?;
+                send.write_all(&request).await.ok()?;
                 let mut total = [0u8; 8];
                 recv.read_exact(&mut total).await.ok()?;
                 Some(u64::from_be_bytes(total))
@@ -995,10 +1006,11 @@ impl GuestTunnel {
         if offered == 0 || span < Duration::from_millis(100) {
             return None;
         }
-        let mbps = stats.bytes as f64 * 8.0 / span.as_secs_f64() / 1e6;
+        let measured = stats.bytes as f64 * 8.0 / span.as_secs_f64() / 1e6;
         Some(Bandwidth {
-            mbps,
-            limited: mbps < PROBE_MBPS * 0.85,
+            mbps: measured,
+            limited: measured < mbps as f64 * 0.85,
+            loss: (1.0 - stats.bytes as f64 / offered as f64).clamp(0.0, 1.0),
         })
     }
 

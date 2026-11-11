@@ -16,13 +16,16 @@ use rustls::{ClientConnection, ServerConnection, StreamOwned, pki_types::ServerN
 use uuid::Uuid;
 
 use crate::{
-    media::{GuestStream, HostStream, MOONLIGHT, Preferences, SUNSHINE},
-    platform::{HostLock, KeepAwake, WifiQuiet, display_max_refresh, display_mode, vigem_present},
+    media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
+    platform::{
+        HostLock, KeepAwake, WifiQuiet, background_recording, display_max_refresh, display_mode,
+        vigem_present,
+    },
     protocol::{
-        CONTROL_PORT, Identity, Invite, MEDIA_PORT, Profile, Reply, Request, Wire, client_config,
+        CONTROL_PORT, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config,
         new_token, valid_pem,
     },
-    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, describe_peer, dropped},
+    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, PROBE_MBPS, describe_peer, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -136,14 +139,6 @@ impl Drop for Session {
     }
 }
 
-pub fn profile_label(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Latency => "Минимальная задержка",
-        Profile::Balanced => "Баланс",
-        Profile::Quality => "Качество",
-    }
-}
-
 type HostWire = Wire<StreamOwned<ServerConnection, TcpStream>>;
 
 fn configure_socket(socket: &TcpStream) -> io::Result<()> {
@@ -226,7 +221,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     worker.emit(Event::Invite(invite.encode()));
 
     let expires = Instant::now() + CODE_TIMEOUT;
-    let (mut wire, name, peer, certificate, profile) = loop {
+    let (mut wire, name, peer, certificate, fec) = loop {
         worker.check()?;
         ensure!(
             Instant::now() < expires,
@@ -261,7 +256,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
             token,
             name,
             certificate,
-            profile,
+            fec,
         }) = request
             && invite.authorizes(&token)
             && valid_pem(&certificate)
@@ -269,7 +264,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
             let name = clean_name(&name);
             wire.send(&Reply::Pending)?;
             let peer = tunnel.peer().map(|(addr, _)| addr.ip().to_string()).unwrap_or_default();
-            break (wire, name, peer, certificate, profile);
+            break (wire, name, peer, certificate, fec.unwrap_or(DEFAULT_FEC));
         }
         let _ = wire.send(&Reply::Closed {
             reason: "Приглашение отклонено.".into(),
@@ -279,7 +274,9 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     drop(listener);
     worker.emit(Event::Approval(format!("{name} · {peer}")));
     worker.fact("Гость", format!("{name} · {peer}"));
-    worker.fact("Профиль", profile_label(profile));
+    if background_recording() {
+        worker.fact("Xbox Game Bar", "Фоновая запись включена — она отнимает энкодер. Параметры → Игры → Запись");
+    }
     let mut next_rtt = Instant::now();
     let mut drops_shown = dropped();
     let mut report = |worker: &Worker| {
@@ -348,7 +345,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
         host_id,
         &name,
         &certificate,
-        profile,
+        fec,
     )?;
     let by = Instant::now() + START_TIMEOUT;
     while !stream.ready(address)? {
@@ -451,7 +448,8 @@ fn guest(
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     let _wifi = quiet_wifi(worker);
     worker.status("Измеряем скорость канала…");
-    let channel = tunnel.measure();
+    let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
+    let path_mbps = channel.filter(|c| c.limited).map(|c| c.mbps);
     if let Some(channel) = channel {
         worker.fact(
             "Канал",
@@ -462,6 +460,18 @@ fn guest(
             },
         );
     }
+    // Random loss at the rate the stream will actually use (video + FEC +
+    // audio) decides how much redundancy Sunshine adds.
+    worker.status("Проверяем потери в канале…");
+    let working_rate = path_mbps.map_or(150.0, |mbps| mbps * PATH_SHARE * 1.3).clamp(5.0, 150.0);
+    let fec = match tunnel.measure(working_rate as u32, Duration::from_millis(1000)) {
+        Some(probe) => {
+            let fec = fec_for_loss(probe.loss);
+            worker.fact("Потери", format!("{:.1} % · коррекция {fec} %", probe.loss * 100.0));
+            fec
+        }
+        None => DEFAULT_FEC,
+    };
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
     let mut drops_shown = dropped();
     worker.status("Соединение установлено. Ждём подтверждения хоста…");
@@ -482,7 +492,7 @@ fn guest(
         token: invite.token,
         name: clean_name(&std::env::var("COMPUTERNAME").unwrap_or_default()),
         certificate: identity.cert_pem.clone(),
-        profile: preferences.profile,
+        fec: Some(fec),
     })
     .context("Не удалось подтвердить подлинность приглашения или связаться с хостом.")?;
 
@@ -543,19 +553,10 @@ fn guest(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Получен неверный режим видео."
                 );
-                // Video + 20 % FEC + audio must fit the measured path, or the
-                // router queues frames: latency climbs and the picture freezes.
-                let mut capped = false;
-                if preferences.bitrate.is_none()
-                    && let Some(channel) = channel.filter(|c| c.limited)
-                {
-                    let budget = ((channel.mbps * 0.7 * 1000.0) as u32).max(3_000);
-                    if budget < preferences.bitrate_for(mode) {
-                        preferences.bitrate = Some(budget);
-                        capped = true;
-                    }
-                }
-                let bitrate = preferences.bitrate_for(mode);
+                // Highest visible quality, unless a frame could not cross the
+                // measured path in half a frame interval.
+                let (bitrate, capped) = preferences.auto_bitrate(mode, path_mbps);
+                preferences.bitrate = Some(bitrate);
                 worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
                 worker.fact(
                     "Битрейт",
@@ -566,7 +567,6 @@ fn guest(
                     },
                 );
                 worker.fact("Кодек", preferences.codec.label());
-                worker.fact("Профиль", profile_label(preferences.profile));
                 worker.status(format!(
                     "Открываем поток {}×{} · {} FPS…",
                     mode.width, mode.height, mode.fps
@@ -623,9 +623,53 @@ mod tests {
         }
     }
 
+    /// WASAPI loopback, which Sunshine captures, delivers nothing while no
+    /// application renders audio. Keep a silent stream playing for the test.
+    struct SilentAudio(std::process::Child);
+
+    impl SilentAudio {
+        fn start() -> Self {
+            use std::io::Write;
+            let path = std::env::temp_dir().join("duolink-silence.wav");
+            let samples = 48_000u32 * 4 * 120;
+            let mut wav = Vec::with_capacity(44 + samples as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + samples).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+            wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+            wav.extend_from_slice(&48_000u32.to_le_bytes());
+            wav.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+            wav.extend_from_slice(&4u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&samples.to_le_bytes());
+            wav.resize(44 + samples as usize, 0);
+            std::fs::File::create(&path).unwrap().write_all(&wav).unwrap();
+            let script = format!(
+                "(New-Object System.Media.SoundPlayer '{}').PlaySync()",
+                path.display()
+            );
+            let child = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-Command", &script])
+                .spawn()
+                .unwrap();
+            thread::sleep(Duration::from_millis(800));
+            Self(child)
+        }
+    }
+
+    impl Drop for SilentAudio {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
     #[test]
     #[ignore = "needs interactive Windows desktop, display/audio and engine downloads"]
     fn live_loopback() {
+        let _audio = SilentAudio::start();
         assert!(
             std::env::var_os("DUOLINK_DATA_DIR").is_some(),
             "set DUOLINK_DATA_DIR to an isolated test directory"
