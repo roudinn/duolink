@@ -62,7 +62,7 @@ const STUN_SERVERS: [&str; 3] = [
     "stun.cloudflare.com:3478",
     "stun1.l.google.com:19302",
 ];
-const SIGNAL_SERVER: &str = "https://ntfy.sh";
+pub(crate) const SIGNAL_SERVER: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
 const PROBE_PORT: u16 = 0;
@@ -290,7 +290,7 @@ fn unseal(token: &[u8; 16], text: &str) -> Option<Vec<SocketAddrV4>> {
     )
 }
 
-fn curl() -> Result<Command> {
+pub(crate) fn curl() -> Result<Command> {
     let mut command = Command::new(system_tool("curl.exe")?);
     command
         .args(["-q", "--silent", "--proto", "=https", "--connect-timeout", "8"])
@@ -482,6 +482,64 @@ async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: qu
     let _ = reply.finish();
 }
 
+/// Datagram ports 1 and 2 carry an echo over the media path itself, so the
+/// latency shown is what a video packet experiences: no ACK delays, no timers.
+const PING_PORT: u16 = 1;
+const PONG_PORT: u16 = 2;
+
+pub struct Pinger {
+    origin: Instant,
+    rtt_us: AtomicU64,
+}
+
+impl Pinger {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { origin: Instant::now(), rtt_us: AtomicU64::new(0) })
+    }
+
+    fn stamp(&self) -> [u8; 8] {
+        (self.origin.elapsed().as_micros() as u64).to_be_bytes()
+    }
+
+    fn record(&self, payload: &[u8]) {
+        let Ok(sent) = <[u8; 8]>::try_from(payload) else { return };
+        let now = self.origin.elapsed().as_micros() as u64;
+        let sample = now.saturating_sub(u64::from_be_bytes(sent)).max(1);
+        let previous = self.rtt_us.load(Ordering::Relaxed);
+        let smoothed = if previous == 0 { sample } else { (previous * 7 + sample) / 8 };
+        self.rtt_us.store(smoothed, Ordering::Relaxed);
+    }
+
+    pub fn rtt(&self) -> Option<Duration> {
+        match self.rtt_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(Duration::from_micros(us)),
+        }
+    }
+}
+
+/// Answers and times pings; true when the datagram was one.
+fn ping_datagram(conn: &Connection, pinger: &Pinger, port: u16, payload: &[u8]) -> bool {
+    match port {
+        PING_PORT => {
+            forward(conn, PONG_PORT, payload);
+            true
+        }
+        PONG_PORT => {
+            pinger.record(payload);
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn ping_loop(conn: Connection, pinger: Arc<Pinger>) {
+    while conn.close_reason().is_none() {
+        forward(&conn, PING_PORT, &pinger.stamp());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 #[derive(Default)]
 struct ProbeStats {
     bytes: u64,
@@ -536,7 +594,8 @@ fn reset(error: &std::io::Error) -> bool {
 }
 
 /// Host side: Sunshine's ports reached through 127.0.0.1.
-async fn serve_host(conn: Connection) {
+async fn serve_host(conn: Connection, pinger: Arc<Pinger>) {
+    tokio::spawn(ping_loop(conn.clone(), pinger.clone()));
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
         let Ok(socket) = UdpSocket::bind((HOST_LOOPBACK, 0)).await else { return };
@@ -566,6 +625,9 @@ async fn serve_host(conn: Connection) {
                     continue;
                 }
                 let port = u16::from_be_bytes([datagram[0], datagram[1]]);
+                if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
+                    continue;
+                }
                 if let Some(socket) = sockets.get(&port) {
                     let _ = socket.send(&datagram[2..]).await;
                 }
@@ -601,7 +663,9 @@ async fn serve_guest(
     listeners: Vec<(u16, TcpListener)>,
     sockets: Vec<(u16, UdpSocket)>,
     probe: Arc<Mutex<ProbeStats>>,
+    pinger: Arc<Pinger>,
 ) {
+    tokio::spawn(ping_loop(conn.clone(), pinger.clone()));
     for (port, listener) in listeners {
         let conn = conn.clone();
         tokio::spawn(async move {
@@ -641,6 +705,9 @@ async fn serve_guest(
             continue;
         }
         let port = u16::from_be_bytes([datagram[0], datagram[1]]);
+        if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
+            continue;
+        }
         if port == PROBE_PORT {
             let now = Instant::now();
             let mut stats = probe.lock().unwrap();
@@ -673,6 +740,97 @@ fn local_addresses() -> Vec<Ipv4Addr> {
     list.sort_by_key(|ip| !ip.is_private());
     list.dedup();
     list
+}
+
+/// Adapter names that belong to VPNs, proxies, tunnels and virtual machines.
+/// Traffic sent to their addresses detours through user-space software (or
+/// never leaves the PC), so they must never be offered as a path to a friend.
+fn virtual_adapter(name: &str) -> bool {
+    const MARKERS: [&str; 24] = [
+        "virtual", "vpn", "tap-", "tap ", "wintun", "wireguard", "hyper-v", "vethernet", "vmware",
+        "virtualbox", "tunnel", "xray", "v2ray", "sing-box", "singbox", "clash", "hiddify", "amnezia",
+        "outline", "zerotier", "radmin", "hamachi", "tailscale", "npcap",
+    ];
+    let name = name.to_lowercase();
+    MARKERS.iter().any(|marker| name.contains(marker))
+        || name
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word.strip_prefix("tun").is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit())))
+}
+
+fn wide_string(text: *const u16) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    let mut length = 0;
+    // SAFETY: Windows hands out NUL-terminated adapter strings.
+    unsafe {
+        while *text.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+    }
+}
+
+/// IPv4 addresses of real, connected network cards (Ethernet or Wi-Fi with a
+/// default gateway). These are the only local paths worth offering.
+fn lan_addresses() -> Vec<Ipv4Addr> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_BUFFER_OVERFLOW,
+        NetworkManagement::{
+            IpHelper::{
+                GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+                GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+            },
+            Ndis::IfOperStatusUp,
+        },
+        Networking::WinSock::{AF_INET, SOCKADDR_IN},
+    };
+    const ETHERNET: u32 = 6;
+    const WIFI: u32 = 71;
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 32 * 1024;
+    let mut buffer: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        buffer.resize(size as usize / 8 + 1, 0);
+        let status = unsafe {
+            GetAdaptersAddresses(AF_INET as u32, flags, std::ptr::null(), buffer.as_mut_ptr().cast(), &mut size)
+        };
+        match status {
+            0 => break,
+            ERROR_BUFFER_OVERFLOW => continue,
+            _ => return Vec::new(),
+        }
+    }
+    let mut found = Vec::new();
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    // SAFETY: the buffer holds the linked list GetAdaptersAddresses wrote.
+    unsafe {
+        while !adapter.is_null() {
+            let info = &*adapter;
+            let names = format!("{} {}", wide_string(info.FriendlyName), wide_string(info.Description));
+            if info.OperStatus == IfOperStatusUp
+                && (info.IfType == ETHERNET || info.IfType == WIFI)
+                && !info.FirstGatewayAddress.is_null()
+                && !virtual_adapter(&names)
+            {
+                let mut unicast = info.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    let socket = (*unicast).Address.lpSockaddr;
+                    if !socket.is_null() && (*socket).sa_family == AF_INET {
+                        let v4 = &*socket.cast::<SOCKADDR_IN>();
+                        let ip = Ipv4Addr::from(u32::from_be(v4.sin_addr.S_un.S_addr));
+                        if !ip.is_link_local() && !ip.is_loopback() && !found.contains(&ip) {
+                            found.push(ip);
+                        }
+                    }
+                    unicast = (*unicast).Next;
+                }
+            }
+            adapter = info.Next;
+        }
+    }
+    found
 }
 
 /// The remote end is this very computer (loopback or one of our own addresses).
@@ -712,6 +870,7 @@ pub struct HostTunnel {
     pub reflexive: Reflexive,
     pub forwarded: bool,
     peer: Arc<Mutex<Option<Connection>>>,
+    pinger: Arc<Pinger>,
     alive: Arc<AtomicBool>,
     _mapping: Option<PortMapping>,
     _signal: Option<Subscription>,
@@ -737,7 +896,7 @@ impl HostTunnel {
         {
             candidates.push(Candidate { kind: PathKind::Public, addr });
         }
-        for ip in local_addresses().into_iter().take(8) {
+        for ip in lan_addresses().into_iter().take(8) {
             candidates.push(Candidate { kind: PathKind::Local, addr: SocketAddrV4::new(ip, port) });
         }
         candidates.push(Candidate {
@@ -761,7 +920,8 @@ impl HostTunnel {
         };
 
         let peer = Arc::new(Mutex::new(None::<Connection>));
-        runtime.spawn(accept(endpoint.clone(), token, peer.clone()));
+        let pinger = Pinger::new();
+        runtime.spawn(accept(endpoint.clone(), token, peer.clone(), pinger.clone()));
 
         let alive = Arc::new(AtomicBool::new(true));
         // Keep our NAT mapping (and so the reflexive candidate) open while we wait.
@@ -792,6 +952,7 @@ impl HostTunnel {
             reflexive,
             forwarded: mapping.is_some(),
             peer,
+            pinger,
             alive,
             _mapping: mapping.map(|(_, mapping)| mapping),
             _signal: signal,
@@ -802,7 +963,9 @@ impl HostTunnel {
     pub fn peer(&self) -> Option<(SocketAddr, Duration)> {
         let peer = self.peer.lock().unwrap();
         let conn = peer.as_ref()?;
-        conn.close_reason().is_none().then(|| (conn.remote_address(), conn.rtt()))
+        conn.close_reason()
+            .is_none()
+            .then(|| (conn.remote_address(), self.pinger.rtt().unwrap_or_else(|| conn.rtt())))
     }
 }
 
@@ -821,7 +984,12 @@ impl Drop for HostTunnel {
     }
 }
 
-async fn accept(endpoint: Endpoint, token: [u8; 16], peer: Arc<Mutex<Option<Connection>>>) {
+async fn accept(
+    endpoint: Endpoint,
+    token: [u8; 16],
+    peer: Arc<Mutex<Option<Connection>>>,
+    pinger: Arc<Pinger>,
+) {
     // A connection that died before the session began must not hold the slot.
     let taken = |slot: &Option<Connection>| slot.as_ref().is_some_and(|c| c.close_reason().is_none());
     while let Some(incoming) = endpoint.accept().await {
@@ -830,6 +998,7 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], peer: Arc<Mutex<Option<Conn
             continue;
         }
         let peer = peer.clone();
+        let pinger = pinger.clone();
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             let handshake = tokio::time::timeout(Duration::from_secs(5), async {
@@ -857,7 +1026,7 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], peer: Arc<Mutex<Option<Conn
             }
             let _ = send.write_all(&[1]).await;
             let _ = send.finish();
-            serve_host(conn).await;
+            serve_host(conn, pinger).await;
         });
     }
 }
@@ -869,6 +1038,7 @@ pub struct GuestTunnel {
     endpoint: Endpoint,
     conn: Connection,
     probe: Arc<Mutex<ProbeStats>>,
+    pinger: Arc<Pinger>,
     pub kind: PathKind,
     pub same_machine: bool,
 }
@@ -885,7 +1055,7 @@ impl GuestTunnel {
         let port = socket.local_addr()?.port();
         let reflexive = discover(&socket);
         let mut mine: Vec<SocketAddrV4> = reflexive.addr.into_iter().collect();
-        mine.extend(local_addresses().into_iter().take(8).map(|ip| SocketAddrV4::new(ip, port)));
+        mine.extend(lan_addresses().into_iter().take(8).map(|ip| SocketAddrV4::new(ip, port)));
         publish(token, mine);
         punch(
             &socket,
@@ -966,7 +1136,8 @@ impl GuestTunnel {
             anyhow::Ok((listeners, sockets))
         })?;
         let probe = Arc::new(Mutex::new(ProbeStats::default()));
-        runtime.spawn(serve_guest(conn.clone(), listeners, sockets, probe.clone()));
+        let pinger = Pinger::new();
+        runtime.spawn(serve_guest(conn.clone(), listeners, sockets, probe.clone(), pinger.clone()));
 
         let same_machine = is_self(conn.remote_address().ip());
         Ok(Self {
@@ -974,6 +1145,7 @@ impl GuestTunnel {
             endpoint,
             conn,
             probe,
+            pinger,
             kind,
             same_machine,
         })
@@ -1019,7 +1191,7 @@ impl GuestTunnel {
     }
 
     pub fn rtt(&self) -> Duration {
-        self.conn.rtt()
+        self.pinger.rtt().unwrap_or_else(|| self.conn.rtt())
     }
 
     pub fn describe(&self) -> &'static str {
@@ -1192,6 +1364,27 @@ mod tests {
         }
         drop(guest);
         drop(host);
+    }
+
+    #[test]
+    fn vpn_and_virtual_adapters_are_not_paths() {
+        for name in [
+            "happ-xray", "Tailscale Tailscale Tunnel", "vEthernet (WSL) Hyper-V Virtual Ethernet Adapter",
+            "Ethernet 3 TAP-Windows Adapter V9", "wg0 WireGuard Tunnel", "AmneziaVPN", "sing-tun Wintun",
+            "Radmin VPN", "tun0",
+        ] {
+            assert!(virtual_adapter(name), "{name}");
+        }
+        for name in [
+            "Ethernet Realtek PCIe 2.5GbE Family Controller",
+            "Беспроводная сеть Intel(R) Wi-Fi 6E AX211 160MHz",
+            "Ethernet Intel(R) Ethernet Controller I225-V",
+        ] {
+            assert!(!virtual_adapter(name), "{name}");
+        }
+        let lan = lan_addresses();
+        eprintln!("LAN paths on this PC: {lan:?}");
+        assert!(lan.iter().all(|ip| !ip.is_loopback()));
     }
 
     #[test]

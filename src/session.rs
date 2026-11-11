@@ -105,12 +105,13 @@ impl Session {
         }
     }
 
-    pub fn host(data: PathBuf) -> Self {
-        Self::start(move |worker, decision| host(worker, decision, data))
+    /// `trusted`: the invite went only to a friend, so their join needs no approval.
+    pub fn host(data: PathBuf, trusted: bool) -> Self {
+        Self::start(move |worker, decision| host(worker, decision, data, trusted))
     }
 
-    pub fn guest(data: PathBuf, invite: Invite, preferences: Preferences) -> Self {
-        Self::start(move |worker, _| guest(worker, data, invite, preferences))
+    pub fn guest(data: PathBuf, invite: Invite, preferences: Preferences, nickname: String) -> Self {
+        Self::start(move |worker, _| guest(worker, data, invite, preferences, nickname))
     }
 
     pub fn decide(&self, approve: bool) {
@@ -173,7 +174,12 @@ fn reachability(tunnel: &HostTunnel) -> &'static str {
 }
 
 fn connection_fact(label: &str, rtt: Duration) -> String {
-    format!("{label} · {} мс", rtt.as_millis().max(1))
+    let ms = rtt.as_secs_f64() * 1000.0;
+    if ms < 10.0 {
+        format!("{label} · {ms:.1} мс")
+    } else {
+        format!("{label} · {ms:.0} мс")
+    }
 }
 
 /// Silences Wi-Fi background scans for the session and says so.
@@ -192,7 +198,7 @@ fn report_drops(worker: &Worker, shown: &mut u64) {
     }
 }
 
-fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<String> {
+fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool) -> Result<String> {
     let address = Ipv4Addr::LOCALHOST;
     let _lock = HostLock::acquire()?;
     reserve_check(address)?;
@@ -272,7 +278,11 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     };
     // This invitation admits a single request. Once used, the listening socket closes.
     drop(listener);
-    worker.emit(Event::Approval(format!("{name} · {peer}")));
+    if trusted {
+        worker.status(format!("{name} подключается…"));
+    } else {
+        worker.emit(Event::Approval(format!("{name} · {peer}")));
+    }
     worker.fact("Гость", format!("{name} · {peer}"));
     if background_recording() {
         worker.fact("Xbox Game Bar", "Фоновая запись включена — она отнимает энкодер. Параметры → Игры → Запись");
@@ -292,7 +302,11 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
 
     let mut last_ping = Instant::now();
     let by = Instant::now() + DECISION_TIMEOUT;
+    // A friend's invite needs no approval: only that friend ever saw the code.
     loop {
+        if trusted {
+            break;
+        }
         if worker.check().is_err() {
             let _ = wire.send(&Reply::Closed {
                 reason: "Хост закрыл сессию.".into(),
@@ -416,7 +430,7 @@ fn host_tick(wire: &mut HostWire, last_ping: &mut Instant) -> Result<bool> {
     Ok(true)
 }
 
-fn clean_name(name: &str) -> String {
+pub(crate) fn clean_name(name: &str) -> String {
     let result: String = name
         .trim()
         .chars()
@@ -435,6 +449,7 @@ fn guest(
     data: PathBuf,
     invite: Invite,
     mut preferences: Preferences,
+    nickname: String,
 ) -> Result<String> {
     worker.status("Подготовка Moonlight. При первом запуске загружается около 37 МБ.");
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
@@ -490,7 +505,7 @@ fn guest(
     let mut wire = Wire::new(StreamOwned::new(tls, socket));
     wire.send(&Request::Join {
         token: invite.token,
-        name: clean_name(&std::env::var("COMPUTERNAME").unwrap_or_default()),
+        name: clean_name(&nickname),
         certificate: identity.cert_pem.clone(),
         fec: Some(fec),
     })
@@ -676,7 +691,7 @@ mod tests {
         );
         let data = data_dir().unwrap();
         let address = Ipv4Addr::LOCALHOST;
-        let host = Session::host(data.clone());
+        let host = Session::host(data.clone(), false);
         let code = until(&host, Duration::from_secs(200), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),
@@ -684,7 +699,7 @@ mod tests {
         });
         let mut bad_invite = Invite::decode(&code).unwrap();
         bad_invite.token[0] ^= 1;
-        let unauthorized = Session::guest(data.clone(), bad_invite, Preferences::default());
+        let unauthorized = Session::guest(data.clone(), bad_invite, Preferences::default(), "Тест".into());
         let result = until(
             &unauthorized,
             Duration::from_secs(200),
@@ -707,7 +722,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let guest = Session::guest(data.clone(), invite, prefs);
+        let guest = Session::guest(data.clone(), invite, prefs, "Тест".into());
         until(&host, Duration::from_secs(20), |event| match event {
             Event::Approval(_) => Some(String::new()),
             Event::Finished { message: error, .. } => panic!("{error}"),
@@ -763,13 +778,13 @@ mod tests {
             "media still listening after disconnect"
         );
 
-        let host = Session::host(data.clone());
+        let host = Session::host(data.clone(), false);
         let code = until(&host, Duration::from_secs(20), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),
             _ => None,
         });
-        let guest = Session::guest(data, Invite::decode(&code).unwrap(), prefs);
+        let guest = Session::guest(data, Invite::decode(&code).unwrap(), prefs, "Тест".into());
         until(&host, Duration::from_secs(20), |event| match event {
             Event::Approval(_) => Some(String::new()),
             Event::Finished { message: error, .. } => panic!("{error}"),

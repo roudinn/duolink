@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod friends;
 mod gui;
 mod media;
 mod platform;
