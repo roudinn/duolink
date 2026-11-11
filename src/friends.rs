@@ -1,27 +1,30 @@
 //! Friends without accounts or servers of our own.
 //!
-//! Every install owns an X25519 key pair. The public key plus a display name
-//! form a friend code, shared once. Each user has an inbox: an ntfy.sh topic
-//! derived from their public key. A message to a friend is sealed with
-//! AES-256-GCM under the X25519 shared secret of the two keys, so only the
-//! recipient can read it and only the holder of the sender's secret key can
-//! have written it. The relay sees opaque bytes.
+//! Every install owns an X25519 key pair. A user is `nickname#tag`, where the
+//! four-digit tag is derived from the public key. Three kinds of ntfy.sh
+//! topics, all derived by hashing, carry everything:
+//!
+//! * directory — `nickname#tag` → public key, so friends can be added by name;
+//! * inbox — one per key; messages are sealed with AES-256-GCM under the
+//!   X25519 shared secret, which hides them and authenticates the sender;
+//! * presence — one per key; a heartbeat while DuoLink is open.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -29,30 +32,90 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::{
-    session::clean_name,
-    tunnel::{SIGNAL_SERVER, curl},
-};
+use crate::tunnel::{SIGNAL_SERVER, curl};
 
 const CODE_PREFIX: &str = "DLF-";
-/// Invites older than this are stale: the host's invite code has expired.
+/// Invites older than this are stale: the host's session code has expired.
 pub const INVITE_LIFETIME: u64 = 15 * 60;
+/// A friend counts as online this long after their last heartbeat.
+pub const ONLINE_WINDOW: u64 = 150;
+pub const HEARTBEAT: Duration = Duration::from_secs(60);
+/// ntfy.sh keeps messages for 12 hours, so the directory entry is refreshed
+/// well within that.
+pub const DIRECTORY_REFRESH: Duration = Duration::from_secs(4 * 3600);
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn short_id(key: &[u8; 32]) -> String {
-    key[..6].iter().map(|b| format!("{b:02x}")).collect()
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/* ------------------------------------------------------------- identity */
+fn digest(label: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(label);
+    hash.update(data);
+    hash.finalize().into()
+}
+
+pub fn short_id(key: &[u8; 32]) -> String {
+    hex(&key[..6])
+}
+
+/* ------------------------------------------------------------- nicknames */
+
+/// Latin letters, digits, `_`, `.` and `-`; 3 to 16 characters.
+pub fn valid_nickname(text: &str) -> Result<String> {
+    let name = text.trim();
+    ensure!(
+        (3..=16).contains(&name.chars().count()),
+        "Ник — от 3 до 16 символов."
+    );
+    ensure!(
+        name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+        "Только латинские буквы, цифры и _ . -"
+    );
+    Ok(name.to_string())
+}
+
+/// The four digits after `#`, fixed by the public key.
+pub fn tag(key: &[u8; 32]) -> u16 {
+    let hash = digest(b"duolink/tag/v1", key);
+    (u32::from_be_bytes(hash[..4].try_into().unwrap()) % 10_000) as u16
+}
+
+pub fn handle(name: &str, key: &[u8; 32]) -> String {
+    format!("{name}#{:04}", tag(key))
+}
+
+/// Parses `nickname#1234`.
+pub fn parse_handle(text: &str) -> Result<(String, u16)> {
+    let (name, number) = text.trim().rsplit_once('#').context("Нужен ник с тегом: name#1234")?;
+    let name = valid_nickname(name)?;
+    ensure!(
+        number.len() == 4 && number.chars().all(|c| c.is_ascii_digit()),
+        "После # — четыре цифры."
+    );
+    Ok((name, number.parse()?))
+}
+
+fn suggested_nickname() -> String {
+    let base: String = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .take(16)
+        .collect();
+    if base.chars().count() >= 3 { base } else { "player".into() }
+}
+
+/* -------------------------------------------------------------- identity */
 
 #[derive(Serialize, Deserialize)]
 struct StoredMe {
     secret: String,
     name: String,
-    /// The user picked this nickname (rather than the computer name default).
     #[serde(default)]
     chosen: bool,
 }
@@ -60,8 +123,8 @@ struct StoredMe {
 pub struct Me {
     secret: StaticSecret,
     pub public: [u8; 32],
-    /// Nickname shown to friends and hosts.
     pub name: String,
+    /// The user confirmed a nickname; until then DuoLink asks for one.
     pub chosen: bool,
     path: PathBuf,
 }
@@ -75,11 +138,13 @@ impl Me {
             && let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice())
         {
             let secret = StaticSecret::from(bytes);
+            // Nicknames from older versions may not be Latin: ask again.
+            let valid = valid_nickname(&stored.name).ok();
             return Ok(Self {
                 public: PublicKey::from(&secret).to_bytes(),
                 secret,
-                name: clean_name(&stored.name),
-                chosen: stored.chosen,
+                chosen: stored.chosen && valid.is_some(),
+                name: valid.unwrap_or_else(suggested_nickname),
                 path,
             });
         }
@@ -87,7 +152,7 @@ impl Me {
         let me = Self {
             public: PublicKey::from(&secret).to_bytes(),
             secret,
-            name: clean_name(&std::env::var("COMPUTERNAME").unwrap_or_default()),
+            name: suggested_nickname(),
             chosen: false,
             path,
         };
@@ -107,14 +172,16 @@ impl Me {
     }
 
     pub fn rename(&mut self, name: &str) -> Result<()> {
-        let name = clean_name(name);
-        ensure!(name.chars().count() >= 2, "Ник должен быть не короче двух символов.");
-        self.name = name;
+        self.name = valid_nickname(name)?;
         self.chosen = true;
         self.save()
     }
 
-    /// What a friend pastes to add us.
+    pub fn handle(&self) -> String {
+        handle(&self.name, &self.public)
+    }
+
+    /// Fallback for adding a friend when the directory cannot be reached.
     pub fn code(&self) -> String {
         let mut bytes = self.public.to_vec();
         bytes.extend_from_slice(self.name.as_bytes());
@@ -123,10 +190,8 @@ impl Me {
 
     fn cipher_with(&self, peer: &[u8; 32]) -> LessSafeKey {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer));
-        let mut hash = Sha256::new();
-        hash.update(b"duolink/friend/v1");
-        hash.update(shared.as_bytes());
-        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &hash.finalize()).unwrap())
+        let key = digest(b"duolink/friend/v1", shared.as_bytes());
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap())
     }
 
     /// Envelope: sender public key ‖ nonce ‖ AES-GCM(message).
@@ -162,24 +227,21 @@ impl Me {
     }
 }
 
+/// Reads a `DLF-` friend code.
 pub fn parse_code(code: &str) -> Result<([u8; 32], String)> {
-    let payload = code
-        .trim()
-        .strip_prefix(CODE_PREFIX)
-        .context("Код друга начинается с DLF-. Код сессии (DL2-) вставляется в «Подключиться к другу».")?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok().context("Повреждённый код друга.")?;
-    ensure!(bytes.len() >= 32 && bytes.len() <= 32 + 120, "Повреждённый код друга.");
+    let payload = code.trim().strip_prefix(CODE_PREFIX).context("Это не код друга.")?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok().context("Код друга повреждён.")?;
+    ensure!(bytes.len() >= 32 && bytes.len() <= 32 + 64, "Код друга повреждён.");
     let key: [u8; 32] = bytes[..32].try_into()?;
-    let name = clean_name(&String::from_utf8_lossy(&bytes[32..]));
+    let name = valid_nickname(&String::from_utf8_lossy(&bytes[32..])).unwrap_or_else(|_| "friend".into());
     Ok((key, name))
 }
 
-/* -------------------------------------------------------------- friends */
+/* --------------------------------------------------------------- friends */
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// Mutual friends.
     Friend,
     /// They asked; we have not answered.
     Incoming,
@@ -202,6 +264,15 @@ impl Friend {
     pub fn id(&self) -> String {
         self.public().map(|key| short_id(&key)).unwrap_or_default()
     }
+
+    pub fn handle(&self) -> String {
+        self.public().map(|key| handle(&self.name, &key)).unwrap_or_else(|| self.name.clone())
+    }
+}
+
+/// Names from the wire: kept only if they are valid nicknames.
+fn received_name(name: &str) -> String {
+    valid_nickname(name).unwrap_or_else(|_| "friend".into())
 }
 
 #[derive(Default)]
@@ -235,7 +306,7 @@ impl Book {
     }
 
     pub fn set(&mut self, key: &[u8; 32], name: &str, status: Status) {
-        let name = clean_name(name);
+        let name = received_name(name);
         match self.entries.iter_mut().find(|f| f.public().as_ref() == Some(key)) {
             Some(entry) => {
                 entry.name = name;
@@ -254,9 +325,18 @@ impl Book {
         self.entries.retain(|f| f.public().as_ref() != Some(key));
         self.save();
     }
+
+    /// Keys whose presence we follow.
+    pub fn friend_keys(&self) -> Vec<[u8; 32]> {
+        self.entries
+            .iter()
+            .filter(|f| f.status == Status::Friend)
+            .filter_map(Friend::public)
+            .collect()
+    }
 }
 
-/* ------------------------------------------------------------- messages */
+/* -------------------------------------------------------------- messages */
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -264,7 +344,6 @@ pub enum Message {
     FriendRequest { name: String },
     FriendAccept { name: String },
     FriendRemove,
-    /// The sender changed their nickname.
     Rename { name: String },
     /// A session invite; `code` is the one-time DL2 code.
     Invite { name: String, code: String, at: u64 },
@@ -272,62 +351,143 @@ pub enum Message {
     InviteCancel { at: u64 },
 }
 
-pub fn inbox_topic(key: &[u8; 32]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"duolink/inbox/v1");
-    hash.update(key);
-    let digest = hash.finalize();
-    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    format!("duolink-u-{hex}")
+fn topic(kind: &str, data: &[u8]) -> String {
+    let hash = digest(format!("duolink/{kind}/v1").as_bytes(), data);
+    format!("duolink-{}-{}", &kind[..1], hex(&hash[..16]))
 }
 
-/// Posts a sealed message to a friend's inbox in the background.
-pub fn send(envelope: String, to: &[u8; 32]) {
-    let url = format!("{SIGNAL_SERVER}/{}", inbox_topic(to));
+pub fn inbox_topic(key: &[u8; 32]) -> String {
+    topic("inbox", key)
+}
+
+fn presence_topic(key: &[u8; 32]) -> String {
+    topic("presence", key)
+}
+
+fn directory_topic(name: &str, tag: u16) -> String {
+    topic("directory", format!("{}#{tag:04}", name.to_ascii_lowercase()).as_bytes())
+}
+
+/// POSTs `body` to a topic, retrying a few times if the network hiccups.
+fn post(topic: String, body: String) {
     thread::spawn(move || {
-        let Ok(mut command) = curl() else { return };
-        let Ok(mut child) = command
-            .args(["--max-time", "15", "--data-binary", "@-"])
-            .arg(url)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-        else {
-            return;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(envelope.as_bytes());
+        for attempt in 0..3u64 {
+            if attempt > 0 {
+                thread::sleep(Duration::from_secs(2 * attempt));
+            }
+            let Ok(mut command) = curl() else { return };
+            let Ok(mut child) = command
+                .args(["--fail", "--max-time", "10", "--data-binary", "@-"])
+                .arg(format!("{SIGNAL_SERVER}/{topic}"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            if child.wait().is_ok_and(|status| status.success()) {
+                return;
+            }
         }
-        let _ = child.wait();
     });
 }
 
-/// Listens to our inbox for as long as it lives, reconnecting as needed.
-/// Raw envelopes come out of `messages`; the GUI opens them with `Me`.
+/// Sends a sealed message to a friend's inbox.
+pub fn send(envelope: String, to: &[u8; 32]) {
+    post(inbox_topic(to), envelope);
+}
+
+/// Lists us in the directory under `name#tag`.
+pub fn announce(me: &Me) {
+    post(directory_topic(&me.name, tag(&me.public)), URL_SAFE_NO_PAD.encode(me.public));
+}
+
+pub fn heartbeat(key: &[u8; 32], online: bool) {
+    post(presence_topic(key), if online { "on" } else { "off" }.into());
+}
+
+/// Like `heartbeat(.., false)` but waits, for use while closing.
+pub fn sign_off(key: &[u8; 32]) {
+    if let Ok(mut command) = curl()
+        && let Ok(mut child) = command
+            .args(["--max-time", "3", "--data-binary", "off"])
+            .arg(format!("{SIGNAL_SERVER}/{}", presence_topic(key)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+    {
+        let _ = child.wait();
+    }
+}
+
+/// Finds the public key behind `name#tag`.
+pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
+    let mut command = curl()?;
+    let output = command
+        .args(["--fail", "--max-time", "10"])
+        .arg(format!("{SIGNAL_SERVER}/{}/json?poll=1&since=all", directory_topic(name, wanted)))
+        .stdin(Stdio::null())
+        .output()
+        .context("Нет связи.")?;
+    ensure!(output.status.success(), "Нет связи.");
+    let keys: HashSet<[u8; 32]> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "message")
+        .filter_map(|event| URL_SAFE_NO_PAD.decode(event["message"].as_str()?.trim()).ok())
+        .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        // The tag is a function of the key: an entry that does not match is forged.
+        .filter(|key| tag(key) == wanted)
+        .collect();
+    match keys.len() {
+        1 => Ok(keys.into_iter().next().unwrap()),
+        0 => bail!("Не найдено. Проверьте ник и тег."),
+        _ => bail!("Ник занят несколькими людьми. Попросите код друга."),
+    }
+}
+
+/* ----------------------------------------------------------------- inbox */
+
+pub enum Incoming {
+    Mail { time: u64, text: String },
+    Presence { key: [u8; 32], online: bool, time: u64 },
+}
+
+/// One long-lived subscription to our inbox and our friends' presence.
 pub struct Inbox {
-    pub messages: Receiver<String>,
+    pub messages: Receiver<Incoming>,
     child: Arc<Mutex<Option<Child>>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Inbox {
-    pub fn listen(me: &[u8; 32], wake: impl Fn() + Send + 'static) -> Self {
-        let url = format!("{SIGNAL_SERVER}/{}/json", inbox_topic(me));
-        let (sender, messages): (Sender<String>, _) = mpsc::channel();
+    /// `since`: unix time of the last mail already handled.
+    pub fn listen(me: &[u8; 32], friends: &[[u8; 32]], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let inbox = inbox_topic(me);
+        let presence: HashMap<String, [u8; 32]> = friends.iter().map(|key| (presence_topic(key), *key)).collect();
+        let mut topics = vec![inbox.clone()];
+        topics.extend(presence.keys().cloned());
+        let url = format!("{SIGNAL_SERVER}/{}/json", topics.join(","));
+
+        let (sender, messages): (Sender<Incoming>, _) = mpsc::channel();
         let child = Arc::new(Mutex::new(None::<Child>));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         {
-            let child = child.clone();
-            let stop = stop.clone();
+            let (child, stop) = (child.clone(), stop.clone());
             thread::spawn(move || {
                 let mut seen = HashSet::new();
-                // On start, pick up what arrived while DuoLink was closed.
-                let mut since = format!("{}m", INVITE_LIFETIME / 60);
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Mail since the last handled message (bounded by the invite
+                // lifetime), and enough presence history to know who is online.
+                let floor = now().saturating_sub(INVITE_LIFETIME);
+                let mut cursor = since.max(floor).min(now().saturating_sub(ONLINE_WINDOW));
+                while !stop.load(Ordering::Relaxed) {
                     let spawned = curl().ok().and_then(|mut command| {
                         command
                             .args(["--no-buffer", "--max-time", "900"])
-                            .arg(format!("{url}?since={since}"))
+                            .arg(format!("{url}?since={cursor}"))
                             .stdin(Stdio::null())
                             .stdout(Stdio::piped())
                             .spawn()
@@ -339,34 +499,38 @@ impl Inbox {
                     };
                     let stdout = process.stdout.take();
                     *child.lock().unwrap() = Some(process);
-                    if let Some(stdout) = stdout {
-                        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                                continue;
-                            };
-                            if event["event"] != "message" {
-                                continue;
-                            }
-                            let id = event["id"].as_str().unwrap_or_default().to_string();
-                            if !id.is_empty() {
-                                since = id.clone();
-                            }
-                            if !seen.insert(id) {
-                                continue;
-                            }
-                            if let Some(text) = event["message"].as_str() {
-                                if sender.send(text.to_string()).is_err() {
-                                    return;
-                                }
-                                wake();
-                            }
+                    for line in stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(Result::ok)) {
+                        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                        if event["event"] != "message" {
+                            continue;
                         }
+                        let id = event["id"].as_str().unwrap_or_default().to_string();
+                        if !seen.insert(id) {
+                            continue;
+                        }
+                        let time = event["time"].as_u64().unwrap_or_else(now);
+                        cursor = cursor.max(time);
+                        let text = event["message"].as_str().unwrap_or_default().to_string();
+                        let topic = event["topic"].as_str().unwrap_or_default();
+                        let incoming = if topic == inbox {
+                            Incoming::Mail { time, text }
+                        } else if let Some(key) = presence.get(topic) {
+                            Incoming::Presence { key: *key, online: text.trim() == "on", time }
+                        } else {
+                            continue;
+                        };
+                        if sender.send(incoming).is_err() {
+                            return;
+                        }
+                        wake();
                     }
                     if let Some(mut process) = child.lock().unwrap().take() {
                         let _ = process.kill();
                         let _ = process.wait();
                     }
-                    thread::sleep(Duration::from_secs(2));
+                    if !stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_secs(2));
+                    }
                 }
             });
         }
@@ -376,12 +540,25 @@ impl Inbox {
 
 impl Drop for Inbox {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(mut process) = self.child.lock().unwrap().take() {
             let _ = process.kill();
             let _ = process.wait();
         }
     }
+}
+
+/// Unix time of the newest mail already handled; survives restarts so a
+/// declined request or answered invite is never shown twice.
+pub fn load_cursor(data: &Path) -> u64 {
+    fs::read_to_string(data.join("inbox.json"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn save_cursor(data: &Path, time: u64) {
+    let _ = fs::write(data.join("inbox.json"), time.to_string());
 }
 
 #[cfg(test)]
@@ -395,79 +572,107 @@ mod tests {
     }
 
     #[test]
-    fn identity_persists_and_codes_round_trip() {
+    fn nicknames_are_latin_and_handles_round_trip() {
+        assert!(valid_nickname("roud").is_ok());
+        assert!(valid_nickname("ro").is_err());
+        assert!(valid_nickname("Артём").is_err());
+        assert!(valid_nickname("a b c").is_err());
+        assert!(valid_nickname("player_one.2-x").is_ok());
+        assert!(valid_nickname("seventeen_chars_x").is_err());
+        let key = [3u8; 32];
+        let text = handle("roud", &key);
+        assert_eq!(parse_handle(&text).unwrap(), ("roud".into(), tag(&key)));
+        assert!(parse_handle("roud#12").is_err());
+        assert!(parse_handle("roud").is_err());
+        // Different keys almost always get different tags.
+        let tags: HashSet<u16> = (0u8..50).map(|i| tag(&[i; 32])).collect();
+        assert!(tags.len() > 45);
+    }
+
+    #[test]
+    fn identity_persists_and_old_non_latin_names_are_asked_again() {
         let dir = tempfile::tempdir().unwrap();
-        let first = me(dir.path(), "Артём");
+        let first = me(dir.path(), "roud");
         let again = Me::load_or_create(dir.path()).unwrap();
-        assert_eq!(first.public, again.public);
-        assert_eq!(again.name, "Артём");
+        assert_eq!((first.public, again.name.as_str(), again.chosen), (again.public, "roud", true));
         let (key, name) = parse_code(&first.code()).unwrap();
-        assert_eq!(key, first.public);
-        assert_eq!(name, "Артём");
-        assert!(parse_code("DL2-abc").is_err());
+        assert_eq!((key, name.as_str()), (first.public, "roud"));
+
+        let stored = serde_json::json!({ "secret": URL_SAFE_NO_PAD.encode([1u8; 32]), "name": "Артём", "chosen": true });
+        fs::write(dir.path().join("me.json"), stored.to_string()).unwrap();
+        let legacy = Me::load_or_create(dir.path()).unwrap();
+        assert!(!legacy.chosen);
+        assert!(valid_nickname(&legacy.name).is_ok());
     }
 
     #[test]
     fn only_the_recipient_opens_and_the_sender_is_authenticated() {
-        let (a_dir, b_dir, c_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (alice, bob, carol) = (me(a_dir.path(), "Alice"), me(b_dir.path(), "Bob"), me(c_dir.path(), "Carol"));
-        let message = Message::Invite { name: "Alice".into(), code: "DL2-xyz".into(), at: 42 };
+        let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (alice, bob, carol) = (me(a.path(), "alice"), me(b.path(), "bob"), me(c.path(), "carol"));
+        let message = Message::Invite { name: "alice".into(), code: "DL2-xyz".into(), at: 42 };
         let sealed = alice.seal(&bob.public, &message);
         assert_eq!(bob.open(&sealed), Some((alice.public, message)));
         assert_eq!(carol.open(&sealed), None);
         assert_eq!(alice.open(&sealed), None);
-
-        // Claiming to be Alice without her key fails authentication.
         let mut forged = URL_SAFE_NO_PAD.decode(carol.seal(&bob.public, &Message::FriendRemove)).unwrap();
         forged[..32].copy_from_slice(&alice.public);
         assert_eq!(bob.open(&URL_SAFE_NO_PAD.encode(forged)), None);
     }
 
-    /// Two identities talk through their real ntfy.sh inboxes.
     #[test]
-    #[ignore = "uses ntfy.sh over the internet"]
-    fn live_request_accept_invite() {
-        let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (alice, bob) = (me(a_dir.path(), "Alice"), me(b_dir.path(), "Bob"));
-        let alice_inbox = Inbox::listen(&alice.public, || {});
-        let bob_inbox = Inbox::listen(&bob.public, || {});
-        thread::sleep(Duration::from_secs(2));
-
-        let receive = |inbox: &Inbox, who: &Me| {
-            let started = std::time::Instant::now();
-            let envelope = inbox.messages.recv_timeout(Duration::from_secs(15)).expect("no message");
-            eprintln!("delivered in {} ms", started.elapsed().as_millis());
-            who.open(&envelope).expect("cannot open")
-        };
-
-        // Bob pastes Alice's friend code and sends a request.
-        let (alice_key, alice_name) = parse_code(&alice.code()).unwrap();
-        assert_eq!(alice_name, "Alice");
-        send(bob.seal(&alice_key, &Message::FriendRequest { name: bob.name.clone() }), &alice_key);
-        let (from, message) = receive(&alice_inbox, &alice);
-        assert_eq!(from, bob.public);
-        assert_eq!(message, Message::FriendRequest { name: "Bob".into() });
-
-        send(alice.seal(&bob.public, &Message::FriendAccept { name: alice.name.clone() }), &bob.public);
-        assert_eq!(receive(&bob_inbox, &bob).1, Message::FriendAccept { name: "Alice".into() });
-
-        let invite = Message::Invite { name: "Alice".into(), code: "DL2-test".into(), at: now() };
-        send(alice.seal(&bob.public, &invite), &bob.public);
-        assert_eq!(receive(&bob_inbox, &bob), (alice.public, invite));
-    }
-
-    #[test]
-    fn book_tracks_status() {
+    fn book_tracks_status_and_sanitises_names() {
         let dir = tempfile::tempdir().unwrap();
         let mut book = Book::load(dir.path());
         let key = [9u8; 32];
-        book.set(&key, "Друг", Status::Incoming);
-        book.set(&key, "Друг", Status::Friend);
+        book.set(&key, "mike", Status::Incoming);
+        book.set(&key, "mike", Status::Friend);
         let reloaded = Book::load(dir.path());
-        assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries[0].status, Status::Friend);
-        assert_eq!(reloaded.by_id(&short_id(&key)).unwrap().name, "Друг");
+        assert_eq!(reloaded.friend_keys(), vec![key]);
+        book.set(&[8u8; 32], "<script>", Status::Incoming);
+        assert_eq!(Book::load(dir.path()).find(&[8u8; 32]).unwrap().name, "friend");
         book.remove(&key);
-        assert!(Book::load(dir.path()).entries.is_empty());
+        assert_eq!(Book::load(dir.path()).entries.len(), 1);
+    }
+
+    /// Two identities: directory lookup, request, accept, invite and presence
+    /// through the real ntfy.sh.
+    #[test]
+    #[ignore = "uses ntfy.sh over the internet"]
+    fn live_directory_mail_and_presence() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let suffix = &hex(&rand::random::<[u8; 3]>())[..5];
+        let (alice, bob) = (me(a.path(), &format!("alice{suffix}")), me(b.path(), &format!("bob{suffix}")));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let alice_inbox = Inbox::listen(&alice.public, &[bob.public], now(), wake.clone());
+        let bob_inbox = Inbox::listen(&bob.public, &[alice.public], now(), wake);
+        announce(&alice);
+        thread::sleep(Duration::from_secs(3));
+
+        let (name, number) = parse_handle(&alice.handle()).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(lookup(&name, number).unwrap(), alice.public);
+        eprintln!("lookup {} ms", started.elapsed().as_millis());
+        assert!(lookup(&name, (number + 1) % 10_000).is_err());
+
+        let mail = |inbox: &Inbox, who: &Me| loop {
+            match inbox.messages.recv_timeout(Duration::from_secs(15)).expect("nothing arrived") {
+                Incoming::Mail { text, .. } => return who.open(&text).expect("cannot open"),
+                Incoming::Presence { .. } => continue,
+            }
+        };
+        send(bob.seal(&alice.public, &Message::FriendRequest { name: bob.name.clone() }), &alice.public);
+        assert_eq!(mail(&alice_inbox, &alice).0, bob.public);
+        send(alice.seal(&bob.public, &Message::FriendAccept { name: alice.name.clone() }), &bob.public);
+        assert!(matches!(mail(&bob_inbox, &bob).1, Message::FriendAccept { .. }));
+
+        heartbeat(&alice.public, true);
+        let online = loop {
+            match bob_inbox.messages.recv_timeout(Duration::from_secs(15)).expect("no presence") {
+                Incoming::Presence { key, online, .. } if key == alice.public => break online,
+                _ => continue,
+            }
+        };
+        assert!(online);
     }
 }

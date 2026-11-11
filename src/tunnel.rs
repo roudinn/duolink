@@ -856,8 +856,8 @@ pub fn describe(kind: PathKind, addr: SocketAddr) -> &'static str {
         (_, ip) if is_self(ip) => "Этот ПК",
         (PathKind::Local, IpAddr::V4(ip)) if ip.is_private() => "Локальная сеть",
         (PathKind::Local, _) => "Прямое",
-        (PathKind::Forwarded, _) => "Интернет · порт открыт",
-        (PathKind::Public, _) => "Интернет · пробитый NAT",
+        (PathKind::Forwarded, _) => "Интернет · UPnP",
+        (PathKind::Public, _) => "Интернет",
     }
 }
 
@@ -880,7 +880,7 @@ impl HostTunnel {
     pub fn open(identity: &Identity, token: [u8; 16]) -> Result<Self> {
         let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, TUNNEL_PORT))
             .or_else(|_| StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
-            .context("Не удалось открыть сетевой порт DuoLink.")?;
+            .context("Сетевой порт занят.")?;
         let port = socket.local_addr()?.port();
 
         let mapping = thread::spawn(move || forward_port(port));
@@ -1092,10 +1092,20 @@ impl GuestTunnel {
         drop(guard);
 
         let deadline = Instant::now() + CONNECT_TIMEOUT + Duration::from_secs(1);
+        // A refusal from one address (say, our own DuoLink on 127.0.0.1) must
+        // not end the race while other addresses may still answer.
+        let mut refused = false;
+        let give_up = |refused: bool| -> anyhow::Error {
+            if refused {
+                anyhow::anyhow!("Хост отклонил код: он устарел или уже использован.")
+            } else {
+                anyhow::anyhow!(failure_hint(&reflexive))
+            }
+        };
         let (kind, conn) = loop {
             check()?;
             if Instant::now() >= deadline {
-                bail!(failure_hint(&reflexive));
+                return Err(give_up(refused));
             }
             let next = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await
@@ -1105,12 +1115,10 @@ impl GuestTunnel {
                     Ok(()) => break (kind, conn),
                     Err(error) => {
                         conn.close(VarInt::from_u32(0), b"");
-                        if error.to_string().contains("denied") {
-                            bail!("Хост отклонил код: он устарел или уже использован.");
-                        }
+                        refused |= error.to_string().contains("denied");
                     }
                 },
-                Ok(None) => bail!(failure_hint(&reflexive)),
+                Ok(None) => return Err(give_up(refused)),
                 Err(_) => {}
             }
         };
@@ -1122,14 +1130,14 @@ impl GuestTunnel {
             for port in TCP_PORTS {
                 let listener = TcpListener::bind((GUEST_LOOPBACK, port))
                     .await
-                    .with_context(|| format!("Порт {port} на этом ПК занят. Закройте другой стриминг."))?;
+                    .with_context(|| format!("Порт {port} занят другой программой."))?;
                 listeners.push((port, listener));
             }
             let mut sockets = Vec::new();
             for port in UDP_PORTS {
                 let socket = UdpSocket::bind((GUEST_LOOPBACK, port))
                     .await
-                    .with_context(|| format!("Порт {port} на этом ПК занят. Закройте другой стриминг."))?;
+                    .with_context(|| format!("Порт {port} занят другой программой."))?;
                 enlarge(socket2::SockRef::from(&socket));
                 sockets.push((port, socket));
             }
@@ -1231,9 +1239,9 @@ async fn authenticate(conn: &Connection, token: [u8; 16]) -> Result<()> {
 
 fn failure_hint(reflexive: &Reflexive) -> String {
     if reflexive.symmetric {
-        "Не удалось соединиться: у вашего провайдера строгий NAT. Попробуйте, чтобы сессию создал друг, или включите UPnP на роутере хоста.".into()
+        "У вас строгий NAT. Пусть сессию создаст друг.".into()
     } else {
-        "Хост не отвечает. Проверьте, что сессия на хосте ещё открыта и код скопирован полностью. Если не поможет — включите UPnP на роутере хоста.".into()
+        "Хост не отвечает. Проверьте, что сессия ещё открыта.".into()
     }
 }
 

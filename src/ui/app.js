@@ -6,35 +6,51 @@ const settings = $("settings");
 const guestCode = $("guest-code");
 const NUMBERS = ["width", "height", "fps", "bitrate"];
 const FLAGS = ["yuv444", "hdr", "windowed", "stats"];
-const STORE = "duolink.guest.v3";
+const STORE = "duolink.video.v1";
+const NICK = /^[A-Za-z0-9_.-]{3,16}$/;
 
 let state;
+let view = "play";
+let confirmRemove = null;
 let toastTimer;
 
-const HOST_VIEW = {
-  working: ["Подготовка", "", "Готовим сессию"],
+const HOST = {
+  working: ["Подготовка", "", "Создаём сессию"],
   invite: ["Ожидание", "warn", "Ждём друга"],
-  approval: ["Запрос", "warn", "Разрешить подключение?"],
-  live: ["В эфире", "ok", "Вы играете вместе"],
-  stopping: ["Завершение", "", "Завершаем сессию"],
+  approval: ["Запрос", "warn", ""],
+  live: ["В эфире", "ok", "В игре"],
+  stopping: ["Завершение", "", "Завершаем"],
 };
-const GUEST_VIEW = {
+const GUEST = {
   working: ["Подключение", "", "Подключаемся"],
-  live: ["В эфире", "ok", "Подключено"],
+  live: ["В эфире", "ok", "В игре"],
   stopping: ["Завершение", "", "Отключаемся"],
 };
 
 const text = (id, value) => { const el = $(id); if (el.textContent !== value) el.textContent = value; };
 const show = (id, on) => { $(id).hidden = !on; };
 const tone = (el, kind) => { el.classList.remove("ok", "warn", "done", "busy"); if (kind) el.classList.add(kind); };
+const initial = (name) => [...(name || "?")][0];
 
-function statusLine(id, message, error = false) {
+function hue(id) {
+  let h = 0;
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return `hsl(${h} 45% 42%)`;
+}
+
+function avatar(el, name, id, online = false) {
+  el.textContent = initial(name);
+  el.style.setProperty("--hue", hue(id || name));
+  el.classList.toggle("online", online);
+}
+
+function line(id, message, error = false) {
   text(id, message);
   show(id, Boolean(message));
   $(id).classList.toggle("error", error);
 }
 
-/* ---------- guest preferences ---------- */
+/* ---------------- video preferences ---------------- */
 
 function options() {
   const out = { codec: $("codec").value };
@@ -44,51 +60,61 @@ function options() {
 }
 
 function save() {
-  try { localStorage.setItem(STORE, JSON.stringify(options())); } catch { /* storage unavailable */ }
+  try { localStorage.setItem(STORE, JSON.stringify(options())); } catch { /* unavailable */ }
 }
 
 function restore() {
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(STORE) || "null"); } catch { /* ignore */ }
-  if (saved) {
-    for (const id of NUMBERS) if (typeof saved[id] === "string") $(id).value = saved[id];
-    for (const id of FLAGS) $(id).checked = Boolean(saved[id]);
-    if ([...$("codec").options].some((o) => o.value === saved.codec)) $("codec").value = saved.codec;
-  }
+  if (!saved) return;
+  for (const id of NUMBERS) if (typeof saved[id] === "string") $(id).value = saved[id];
+  for (const id of FLAGS) $(id).checked = Boolean(saved[id]);
+  if ([...$("codec").options].some((o) => o.value === saved.codec)) $("codec").value = saved.codec;
 }
 
-/* ---------- home ---------- */
+/* ---------------- views ---------------- */
 
-function renderHostButton() {
-  const waiting = state.hostAfterSetup;
-  $("host-start").disabled = waiting;
-  text("host-start", waiting ? "Устанавливаем драйвер геймпада…" : "Создать сессию");
+function go(next) {
+  view = next;
+  confirmRemove = null;
+  if (state) render(state);
+  if (next === "friends") setTimeout(() => $("add-input").focus(), 50);
 }
+
+function renderViews(next) {
+  const onboarding = !next.me.chosen;
+  show("onboarding", onboarding);
+  show("play", !onboarding && view === "play");
+  show("friends", !onboarding && view === "friends");
+  show("back", !onboarding && view === "friends");
+  show("brand", view !== "friends" || onboarding);
+  $("friends-tab").classList.toggle("on", view === "friends");
+  show("friends-tab", !onboarding);
+  const requests = next.friends.filter((f) => f.status === "incoming").length;
+  show("friends-badge", requests > 0);
+  text("friends-badge", String(requests));
+}
+
+/* ---------------- play ---------------- */
 
 function renderPrepare(next) {
   const c = next.components;
   const working = next.setup.phase !== "idle";
   const rows = [
-    ["c-engines", c.sunshine && c.moonlight, working ? "Загрузка" : "Нужно скачать"],
-    ["c-vigem", c.vigem, "При создании сессии"],
-    ["c-firewall", c.firewall, "При создании сессии"],
+    ["c-engines", c.sunshine && c.moonlight, working ? "Загрузка" : "Нужно"],
+    ["c-vigem", c.vigem, "При первой сессии"],
+    ["c-firewall", c.firewall, "При первой сессии"],
   ];
-  let done = 0;
   for (const [id, ok, pending] of rows) {
-    const li = $(id);
     const busy = !ok && working && (id === "c-engines" || next.fullSetup);
-    tone(li, ok ? "done" : busy ? "busy" : "");
-    li.querySelector("em").textContent = ok ? "Готово" : busy ? "Установка" : pending;
-    if (ok) done += 1;
+    tone($(id), ok ? "done" : busy ? "busy" : "");
+    $(id).querySelector("em").textContent = ok ? "Готово" : busy ? "Установка" : pending;
   }
-  // Setup is invisible unless something is happening or went wrong.
   show("prepare", working || next.setup.error);
-  text("prepare-count", `${done} из ${rows.length}`);
+  text("setup-line", working || next.setup.error ? next.setup.message : "");
+  $("setup-line").style.color = next.setup.error ? "var(--red)" : "";
   show("install", next.setup.error && !working);
-  statusLine("setup-line", working || next.setup.error ? next.setup.message : "", next.setup.error);
 }
-
-/* ---------- sessions ---------- */
 
 function renderFacts(id, facts) {
   const dl = $(id);
@@ -103,223 +129,271 @@ function renderFacts(id, facts) {
     dd.textContent = value;
     if (name === "Соединение") tone(dd, "ok");
     if (name === "Доступ") tone(dd, value.startsWith("Строгий") || value.startsWith("Только") ? "warn" : "ok");
+    if (name === "Xbox Game Bar") tone(dd, "warn");
     return [dt, dd];
   }));
 }
 
-function renderSession(who, view, table) {
-  const active = view.phase !== "idle";
+function renderSession(who, pane, table) {
+  const active = pane.phase !== "idle";
   show(`${who}-live`, active);
   if (!active) {
-    statusLine(`${who}-result`, view.message, view.error);
+    line(`${who}-result`, pane.message, pane.error);
     return;
   }
-  const [pill, kind, title] = table[view.phase];
+  const [pill, kind, title] = table[pane.phase];
   text(`${who}-pill`, pill);
   tone($(`${who}-pill`), kind);
   text(`${who}-title`, title);
-  text(`${who}-message`, view.message);
-  renderFacts(`${who}-facts`, view.facts);
-  $(`${who}-stop`).disabled = view.phase === "stopping";
+  text(`${who}-message`, pane.message);
+  show(`${who}-message`, Boolean(pane.message));
+  renderFacts(`${who}-facts`, pane.facts);
+  $(`${who}-stop`).disabled = pane.phase === "stopping";
+}
+
+function renderPlay(next) {
+  renderPrepare(next);
+  const hostActive = next.host.phase !== "idle";
+  const guestActive = next.guest.phase !== "idle";
+
+  renderSession("host", next.host, HOST);
+  const forFriend = Boolean(next.hostFor);
+  show("invitation", next.host.phase === "invite" && !forFriend);
+  show("approval", next.host.phase === "approval");
+  text("code-box", next.host.code);
+  if (next.host.phase === "approval") text("host-title", `${next.host.peer.split(" · ")[0]} хочет подключиться`);
+  if (next.host.phase === "invite" && forFriend) text("host-title", `Ждём ${next.hostFor.name}`);
+
+  renderSession("guest", next.guest, GUEST);
+  show("guest-keys", next.guest.phase === "live");
+  text("guest-stop", next.guest.phase === "live" ? "Отключиться" : "Отменить");
+  guestCode.setAttribute("aria-invalid", String(next.guest.codeError));
+
+  // While waiting for a code-based guest, "По коду" stays available for a same-PC test.
+  show("home", !guestActive && (!hostActive || (next.host.phase === "invite" && !forFriend)));
+  show("host-card", !hostActive);
+
+  const invite = next.invitation;
+  show("friend-invite", Boolean(invite) && !guestActive);
+  if (invite) {
+    text("invite-name", invite.name);
+    avatar($("invite-avatar"), invite.name, invite.id, true);
+  }
+}
+
+/* ---------------- friends ---------------- */
+
+function button(label, action, id, primary = false, disabled = false) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `btn small${primary ? " primary" : ""}`;
+  b.textContent = label;
+  b.dataset.action = action;
+  if (id) b.dataset.id = id;
+  b.disabled = disabled;
+  return b;
+}
+
+function removeButton(friend) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "round x";
+  b.dataset.action = "ask_remove";
+  b.dataset.id = friend.id;
+  b.setAttribute("aria-label", "Удалить");
+  b.innerHTML = '<svg><use href="#i-close"/></svg>';
+  return b;
+}
+
+function friendRow(friend, hosting) {
+  const row = document.createElement("div");
+  row.className = "friend";
+  const face = document.createElement("span");
+  face.className = "avatar";
+  avatar(face, friend.name, friend.id, friend.online);
+  const who = document.createElement("div");
+  who.className = "who";
+  const name = document.createElement("b");
+  name.textContent = friend.name;
+  const tag = document.createElement("span");
+  tag.className = "tag";
+  tag.textContent = `#${friend.tag}`;
+  name.append(tag);
+  const note = document.createElement("small");
+  who.append(name, note);
+  row.append(face, who);
+
+  if (confirmRemove === friend.id) {
+    row.classList.add("confirm");
+    note.textContent = friend.status === "incoming" ? "Отклонить запрос?" : "Удалить из друзей?";
+    const yes = button(friend.status === "incoming" ? "Отклонить" : "Удалить", "remove_friend", friend.id);
+    yes.classList.add("danger");
+    row.append(button("Отмена", "cancel_remove"), yes);
+    return row;
+  }
+  if (friend.status === "incoming") {
+    note.textContent = "хочет дружить";
+    row.append(button("Принять", "accept_friend", friend.id, true), removeButton(friend));
+  } else if (friend.status === "outgoing") {
+    note.textContent = "запрос отправлен";
+    row.append(removeButton(friend));
+  } else {
+    note.textContent = friend.online ? "в сети" : "не в сети";
+    note.classList.toggle("on", friend.online);
+    row.append(button("Позвать", "invite_friend", friend.id, friend.online, hosting), removeButton(friend));
+  }
+  return row;
+}
+
+function renderFriends(next) {
+  text("me-name", next.me.name);
+  text("me-tag", `#${next.me.tag}`);
+  avatar($("me-avatar"), next.me.name, next.me.name);
+  $("add-button").disabled = next.lookingUp;
+
+  const hosting = next.host.phase !== "idle";
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const sections = [
+    ["Запросы", next.friends.filter((f) => f.status === "incoming")],
+    ["В сети", next.friends.filter((f) => f.status === "friend" && f.online)],
+    ["Не в сети", next.friends.filter((f) => f.status === "friend" && !f.online)],
+    ["Отправлены", next.friends.filter((f) => f.status === "outgoing")],
+  ].filter(([, list]) => list.length);
+
+  const key = JSON.stringify([sections, hosting, confirmRemove]);
+  const root = $("friend-sections");
+  if (root.dataset.key !== key) {
+    root.dataset.key = key;
+    root.replaceChildren(...sections.flatMap(([title, list]) => {
+      const label = document.createElement("p");
+      label.className = "section";
+      label.textContent = title;
+      const group = document.createElement("div");
+      group.className = "group";
+      group.append(...list.sort(byName).map((f) => friendRow(f, hosting)));
+      return [label, group];
+    }));
+  }
+  show("friends-empty", next.friends.length === 0);
+}
+
+/* ---------------- settings ---------------- */
+
+function renderSettings(next) {
+  if (document.activeElement !== $("nick-edit")) $("nick-edit").value = next.me.name;
+  const hags = next.components.hags;
+  text("hags-note", hags === true ? "включено" : hags === false ? "выключено — включите на хосте" : "");
+  text("version-note", `версия ${next.version}`);
+  const u = next.update;
+  const notes = {
+    idle: "автоматически",
+    checking: "проверяем…",
+    current: "последняя версия",
+    downloading: `скачиваем ${u.version}…`,
+    ready: `${u.version} — после перезапуска`,
+    failed: "нет связи",
+  };
+  text("update-note", notes[u.state] ?? "");
+  $("update-check").disabled = ["checking", "downloading", "ready"].includes(u.state);
+  show("update-banner", u.state === "ready");
+  if (u.state === "ready") text("update-title", `Доступна версия ${u.version}`);
+}
+
+/* ---------------- state ---------------- */
+
+function render(next) {
+  renderViews(next);
+  renderPlay(next);
+  renderFriends(next);
+  renderSettings(next);
+  const preview = $("nick-input").value.trim() || "nickname";
+  text("nick-preview", `${preview}#${next.me.tag}`);
 }
 
 function applyState(next) {
   const prev = state;
   state = next;
-  renderHostButton();
-  renderPrepare(next);
-
-  const hostActive = next.host.phase !== "idle";
-  const guestActive = next.guest.phase !== "idle";
-  show("live", hostActive || guestActive);
-  // While a host waits for a friend, «Подключиться» stays reachable to test on this same PC.
-  show("home", !guestActive && (!hostActive || (next.host.phase === "invite" && !next.hostFor)));
-  show("host-card", !hostActive);
-
-  renderSession("host", next.host, HOST_VIEW);
-  show("invitation", next.host.phase === "invite");
-  show("approval", next.host.phase === "approval");
-  text("code-box", next.host.code);
-  text("peer-name", next.host.peer);
-  if (next.host.code !== prev?.host.code) text("copy-button", "Скопировать код");
-
-  renderSession("guest", next.guest, GUEST_VIEW);
-  show("guest-keys", next.guest.phase === "live");
-  text("guest-stop", next.guest.phase === "live" ? "Отключиться" : "Отменить");
-  guestCode.setAttribute("aria-invalid", String(next.guest.codeError));
+  render(next);
   if (prev?.guest.phase === "live" && next.guest.phase === "idle") guestCode.value = "";
-
-  const hags = next.components.hags;
-  text("hags-note", hags === true ? "Включено — энкодер работает с приоритетом реального времени"
-    : hags === false ? "Выключено. Включите на хосте и перезагрузите ПК — меньше задержка кодирования"
-    : "Состояние неизвестно");
-  text("version-note", `Версия ${next.version}`);
-  renderFriends(next);
-  renderUpdate(next.update);
-
-  if (next.host.phase === "approval" && prev?.host.phase !== "approval" && !settings.open) {
+  if (next.host.phase === "approval" && prev?.host.phase !== "approval") {
+    go("play");
     document.querySelector('[data-action="allow"]').focus();
   }
-  if (next.host.phase === "invite" && prev?.host.phase !== "invite" && !settings.open) $("copy-button").focus();
+  if (next.invitation && !prev?.invitation) go("play");
+  if (!next.me.chosen && (!prev || prev.me.chosen)) $("nick-input").focus();
   if (next.guest.codeError && !prev?.guest.codeError) guestCode.focus();
 }
 
-function renderUpdate(update) {
-  const ready = update.state === "ready";
-  show("update-banner", ready);
-  if (ready) text("update-title", `DuoLink ${update.version} готов`);
-  const notes = {
-    idle: "Проверяются автоматически",
-    checking: "Проверяем…",
-    current: "У вас последняя версия",
-    downloading: `Скачиваем ${update.version}…`,
-    ready: `Версия ${update.version} установится при перезапуске`,
-    failed: `Не удалось проверить: ${update.version ?? ""}`,
-  };
-  text("update-note", notes[update.state] ?? "");
-  $("update-check").disabled = update.state === "checking" || update.state === "downloading" || ready;
-}
-
-const X_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>';
-
-function friendRow(friend, hosting) {
-  const li = document.createElement("li");
-  const avatar = document.createElement("span");
-  avatar.className = "avatar";
-  avatar.textContent = [...friend.name][0] ?? "?";
-  const info = document.createElement("div");
-  const name = document.createElement("b");
-  name.textContent = friend.name;
-  info.append(name);
-  const button = (label, action, primary) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = `btn small${primary ? " primary" : ""}`;
-    b.textContent = label;
-    b.dataset.action = action;
-    b.dataset.id = friend.id;
-    return b;
-  };
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "icon-btn remove";
-  remove.dataset.action = "remove_friend";
-  remove.dataset.id = friend.id;
-  remove.dataset.name = friend.name;
-  remove.innerHTML = X_ICON;
-  li.append(avatar, info);
-  if (friend.status === "friend") {
-    remove.title = "Удалить из друзей";
-    const invite = button("Пригласить", "invite_friend", true);
-    invite.disabled = hosting;
-    li.append(invite, remove);
-  } else if (friend.status === "incoming") {
-    const note = document.createElement("small");
-    note.textContent = "хочет добавить вас в друзья";
-    info.append(note);
-    remove.title = "Отклонить";
-    li.append(button("Принять", "accept_friend", true), remove);
-  } else {
-    const note = document.createElement("small");
-    note.textContent = "запрос отправлен, ждём ответа";
-    info.append(note);
-    remove.title = "Отменить запрос";
-    li.append(remove);
-  }
-  return li;
-}
-
-function renderFriends(next) {
-  show("nick-card", !next.nicknameChosen);
-  text("me-nick", `Вы: ${next.nickname}`);
-  if (document.activeElement !== $("nick-edit")) $("nick-edit").value = next.nickname;
-
-  const hosting = next.host.phase !== "idle";
-  const order = { incoming: 0, friend: 1, outgoing: 2 };
-  const list = [...next.friends].sort((a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name));
-  const key = JSON.stringify([list, hosting]);
-  const ul = $("friend-list");
-  if (ul.dataset.key !== key) {
-    ul.dataset.key = key;
-    ul.replaceChildren(...list.map((f) => friendRow(f, hosting)));
-  }
-  show("friend-list", list.length > 0);
-  show("friends-empty", list.length === 0);
-  if (list.length === 0 && !prevFriendsShown) $("add-friend").open = true;
-  prevFriendsShown = true;
-
-  const invite = next.invitation;
-  show("friend-invite", Boolean(invite) && next.guest.phase === "idle");
-  if (invite) {
-    text("friend-invite-title", `${invite.name} зовёт играть`);
-    text("friend-invite-avatar", [...invite.name][0] ?? "?");
-  }
-
-  // A session created for a friend: no code to pass around.
-  const target = next.hostFor;
-  if (target && next.host.phase === "invite") {
-    text("host-title", `Ждём ${target.name}`);
-    show("invitation", false);
-  }
-}
-
-let prevFriendsShown = false;
-
 function toast(message) {
   text("toast", message);
-  show("toast", true);
+  $("toast").hidden = true;
+  void $("toast").offsetWidth;
+  $("toast").hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => show("toast", false), 2600);
 }
 
-/* ---------- events ---------- */
+/* ---------------- events ---------------- */
 
 document.addEventListener("click", (e) => {
-  const button = e.target.closest("button[data-action]");
-  if (!button) return;
-  const { action, id } = button.dataset;
-  if (action === "settings") settings.showModal();
-  else if (action === "close_settings") settings.close();
-  else if (action === "edit_nick") { settings.showModal(); $("nick-edit").focus(); $("nick-edit").select(); }
-  else if (action === "add_friend") send("add_friend", { code: $("friend-code").value });
-  else if (action === "accept_invite") send("accept_invite", { options: options() });
-  else if (action === "remove_friend") {
-    if (window.confirm(`Удалить ${button.dataset.name} из друзей?`)) send("remove_friend", { id });
+  const b = e.target.closest("button[data-action]");
+  if (!b || b.disabled) return;
+  const { action, id } = b.dataset;
+  switch (action) {
+    case "settings": settings.showModal(); break;
+    case "close_settings": settings.close(); break;
+    case "go_friends": go(view === "friends" ? "play" : "friends"); break;
+    case "go_play": go("play"); break;
+    case "ask_remove": confirmRemove = id; render(state); break;
+    case "cancel_remove": confirmRemove = null; render(state); break;
+    case "remove_friend": confirmRemove = null; send("remove_friend", { id }); break;
+    case "accept_invite": send("accept_invite", { options: options() }); break;
+    case "invite_friend": send("invite_friend", { id }); go("play"); break;
+    default: send(action, id ? { id } : {});
   }
-  else if (id) send(action, { id });
-  else send(action);
 });
 
 settings.addEventListener("click", (e) => { if (e.target === settings) settings.close(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && view === "friends" && !settings.open) go("play");
+});
+
 $("guest-form").addEventListener("submit", (e) => {
   e.preventDefault();
   save();
   send("guest_start", { code: guestCode.value, options: options() });
 });
 guestCode.addEventListener("input", () => guestCode.removeAttribute("aria-invalid"));
+
+$("add-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const query = $("add-input").value.trim();
+  if (query) send("add_friend", { query });
+});
+
+$("nick-input").addEventListener("input", () => state && render(state));
+$("nick-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const name = $("nick-input").value.trim();
+  if (!NICK.test(name)) return toast("3–16 символов: латиница, цифры, _ . -");
+  send("set_name", { name });
+});
+$("nick-settings").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const name = $("nick-edit").value.trim();
+  if (!NICK.test(name)) return toast("3–16 символов: латиница, цифры, _ . -");
+  send("set_name", { name });
+  $("nick-edit").blur();
+  toast("Сохранено");
+});
+
 for (const id of [...NUMBERS, "codec"]) $(id).addEventListener("input", save);
 for (const id of FLAGS) $(id).addEventListener("change", save);
-window.addEventListener("focus", () => { if (state && !settings.open) send("refresh"); });
-
-for (const form of ["nick-form", "nick-settings"]) {
-  $(form).addEventListener("submit", (e) => {
-    e.preventDefault();
-    const input = $(form === "nick-form" ? "nick-input" : "nick-edit");
-    send("set_name", { name: input.value });
-    input.blur();
-  });
-}
 
 window.duo = {
   applyState,
-  friendAdded() {
-    $("friend-code").value = "";
-  },
   toast,
-  copied() {
-    text("copy-button", "Скопировано");
-    toast("Код скопирован — отправьте его другу");
-  },
+  friendAdded() { $("add-input").value = ""; },
   pasted(code) {
     guestCode.value = code;
     guestCode.removeAttribute("aria-invalid");

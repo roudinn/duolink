@@ -163,11 +163,11 @@ fn reserve_check(address: Ipv4Addr) -> Result<()> {
 /// One line about how reachable this host is from the internet.
 fn reachability(tunnel: &HostTunnel) -> &'static str {
     if tunnel.forwarded {
-        "Открыт через UPnP роутера"
+        "Открыт через UPnP"
     } else if tunnel.reflexive.addr.is_some() && !tunnel.reflexive.symmetric {
         "Через пробивку NAT"
     } else if tunnel.reflexive.symmetric {
-        "Строгий NAT — подключение может не пройти"
+        "Строгий NAT"
     } else {
         "Только локальная сеть"
     }
@@ -185,7 +185,7 @@ fn connection_fact(label: &str, rtt: Duration) -> String {
 /// Silences Wi-Fi background scans for the session and says so.
 fn quiet_wifi(worker: &Worker) -> Option<WifiQuiet> {
     let quiet = WifiQuiet::hold()?;
-    worker.fact("Wi-Fi", "Фоновое сканирование выключено");
+    worker.fact("Wi-Fi", "Без фоновых сканирований");
     Some(quiet)
 }
 
@@ -203,15 +203,15 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
     let _lock = HostLock::acquire()?;
     reserve_check(address)?;
     if !vigem_present() {
-        worker.fact("Геймпад гостя", "Драйвер ViGEmBus не установлен");
+        worker.fact("Геймпад гостя", "Нет драйвера");
     }
-    worker.status("Подготовка Sunshine. При первом запуске загружается около 38 МБ.");
+    worker.status("Готовим Sunshine…");
     let engine = SUNSHINE.ensure(&data, || worker.check())?;
     worker.check()?;
 
     let identity = Identity::generate("DuoLink Host")?;
     let token = new_token();
-    worker.status("Открываем доступ из интернета…");
+    worker.status("Открываем доступ…");
     let tunnel = HostTunnel::open(&identity, token)?;
     worker.check()?;
     worker.fact("Доступ", reachability(&tunnel));
@@ -231,7 +231,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
         worker.check()?;
         ensure!(
             Instant::now() < expires,
-            "Срок приглашения истёк. Создайте новую сессию."
+            "Код истёк."
         );
         let (socket, _) = match listener.accept() {
             Ok(connection) => connection,
@@ -273,7 +273,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
             break (wire, name, peer, certificate, fec.unwrap_or(DEFAULT_FEC));
         }
         let _ = wire.send(&Reply::Closed {
-            reason: "Приглашение отклонено.".into(),
+            reason: "Неверный код.".into(),
         });
     };
     // This invitation admits a single request. Once used, the listening socket closes.
@@ -285,7 +285,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
     }
     worker.fact("Гость", format!("{name} · {peer}"));
     if background_recording() {
-        worker.fact("Xbox Game Bar", "Фоновая запись включена — она отнимает энкодер. Параметры → Игры → Запись");
+        worker.fact("Xbox Game Bar", "Фоновая запись включена");
     }
     let mut next_rtt = Instant::now();
     let mut drops_shown = dropped();
@@ -315,9 +315,9 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
         }
         if Instant::now() >= by {
             wire.send(&Reply::Closed {
-                reason: "Хост не успел подтвердить запрос.".into(),
+                reason: "Хост не ответил.".into(),
             })?;
-            return Ok("Время подтверждения истекло.".into());
+            return Ok("Запрос истёк.".into());
         }
         match decision.try_recv() {
             Ok(true) => break,
@@ -334,7 +334,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
         }
     }
 
-    worker.status("Гость допущен. Запускаем захват экрана и звука…");
+    worker.status("Запускаем…");
     let _wifi = quiet_wifi(worker);
     wire.send(&Reply::Preparing)?;
     let host_id = Uuid::new_v4();
@@ -344,7 +344,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
     worker.fact(
         "Экран",
         if mode.fps > current_hz {
-            format!("{}×{} · {current_hz} → {} Гц на время игры", mode.width, mode.height, mode.fps)
+            format!("{}×{} · {current_hz} → {} Гц", mode.width, mode.height, mode.fps)
         } else {
             format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps)
         },
@@ -366,7 +366,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
         worker.check()?;
         ensure!(
             Instant::now() < by,
-            "Sunshine не открыл порт. Проверьте host.log."
+            "Sunshine не запустился. Подробности в host.log."
         );
         if !host_tick(&mut wire, &mut last_ping)? {
             return Ok("Гость отменил подключение.".into());
@@ -399,7 +399,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
             wire.send(&Reply::Connected)?;
         }
         if !streaming && Instant::now() >= by {
-            break "Поток не запустился. Проверьте журналы и порты Sunshine.";
+            break "Поток не запустился. Подробности в host.log.";
         }
         if !host_tick(&mut wire, &mut last_ping)? {
             break "Гость отключился.";
@@ -451,18 +451,18 @@ fn guest(
     mut preferences: Preferences,
     nickname: String,
 ) -> Result<String> {
-    worker.status("Подготовка Moonlight. При первом запуске загружается около 37 МБ.");
+    worker.status("Готовим Moonlight…");
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
     worker.check()?;
     let identity = Identity::generate("DuoLink Guest")?;
 
-    worker.status("Ищем путь к хосту…");
+    worker.status("Ищем хост…");
     let tunnel = GuestTunnel::connect(invite.token, invite.fingerprint, &invite.candidates, || {
         worker.check()
     })?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     let _wifi = quiet_wifi(worker);
-    worker.status("Измеряем скорость канала…");
+    worker.status("Меряем канал…");
     let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
     let path_mbps = channel.filter(|c| c.limited).map(|c| c.mbps);
     if let Some(channel) = channel {
@@ -477,7 +477,7 @@ fn guest(
     }
     // Random loss at the rate the stream will actually use (video + FEC +
     // audio) decides how much redundancy Sunshine adds.
-    worker.status("Проверяем потери в канале…");
+    worker.status("Меряем потери…");
     let working_rate = path_mbps.map_or(150.0, |mbps| mbps * PATH_SHARE * 1.3).clamp(5.0, 150.0);
     let fec = match tunnel.measure(working_rate as u32, Duration::from_millis(1000)) {
         Some(probe) => {
@@ -489,10 +489,10 @@ fn guest(
     };
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
     let mut drops_shown = dropped();
-    worker.status("Соединение установлено. Ждём подтверждения хоста…");
+    worker.status("Ждём хост…");
     let endpoint = SocketAddr::from((GUEST_LOOPBACK, CONTROL_PORT));
     let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
-        .context("Хост не ответил по туннелю.")?;
+        .context("Хост не ответил.")?;
     socket.set_read_timeout(Some(Duration::from_secs(4)))?;
     socket.set_write_timeout(Some(Duration::from_secs(4)))?;
     let mut tls = ClientConnection::new(
@@ -500,7 +500,7 @@ fn guest(
         ServerName::from(std::net::IpAddr::from(GUEST_LOOPBACK)),
     )?;
     tls.complete_io(&mut socket)
-        .context("Не удалось подтвердить подлинность приглашения или связаться с хостом.")?;
+        .context("Не удалось связаться с хостом.")?;
     configure_socket(&socket)?;
     let mut wire = Wire::new(StreamOwned::new(tls, socket));
     wire.send(&Request::Join {
@@ -509,7 +509,7 @@ fn guest(
         certificate: identity.cert_pem.clone(),
         fec: Some(fec),
     })
-    .context("Не удалось подтвердить подлинность приглашения или связаться с хостом.")?;
+    .context("Не удалось связаться с хостом.")?;
 
     let mut last_pong = Instant::now();
     let mut next_ping = Instant::now();
@@ -528,7 +528,7 @@ fn guest(
             if status.success() && streaming {
                 return Ok("Поток закрыт.".into());
             }
-            bail!("Moonlight завершился ({status}). Откройте guest.log.");
+            bail!("Moonlight закрылся с ошибкой. Подробности в guest.log.");
         }
         if !tunnel.alive() || last_pong.elapsed() > SILENCE {
             // The host may have said goodbye just before the tunnel closed.
@@ -546,17 +546,17 @@ fn guest(
         }
         ensure!(
             streaming || Instant::now() < by,
-            "Хост или поток не ответил вовремя."
+            "Хост не ответил."
         );
         if Instant::now() >= next_ping {
             wire.send(&Request::Ping)?;
             next_ping = Instant::now() + HEARTBEAT;
         }
         match wire.poll::<Reply>().context("Связь с хостом закрыта.")? {
-            Some(Reply::Pending) => worker.status("Запрос отправлен. Ждём подтверждения хоста…"),
+            Some(Reply::Pending) => worker.status("Ждём, пока хост разрешит…"),
             Some(Reply::Preparing) => {
                 by = Instant::now() + START_TIMEOUT + SILENCE;
-                worker.status("Хост подтвердил запрос. Готовим поток…");
+                worker.status("Хост разрешил. Запускаем…");
             }
             Some(Reply::Ready {
                 host,
@@ -566,7 +566,7 @@ fn guest(
                 let mode = preferences.mode(mode, display_mode().ok());
                 ensure!(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
-                    "Получен неверный режим видео."
+                    "Хост прислал неверные данные."
                 );
                 // Highest visible quality, unless a frame could not cross the
                 // measured path in half a frame interval.
@@ -576,16 +576,13 @@ fn guest(
                 worker.fact(
                     "Битрейт",
                     if capped {
-                        format!("{} Мбит/с · под скорость канала", bitrate.div_ceil(1000))
+                        format!("{} Мбит/с · по каналу", bitrate.div_ceil(1000))
                     } else {
                         format!("{} Мбит/с", bitrate.div_ceil(1000))
                     },
                 );
                 worker.fact("Кодек", preferences.codec.label());
-                worker.status(format!(
-                    "Открываем поток {}×{} · {} FPS…",
-                    mode.width, mode.height, mode.fps
-                ));
+                worker.status("Открываем игру…");
                 stream = Some(GuestStream::start(
                     &engine,
                     &data,
@@ -599,7 +596,7 @@ fn guest(
                 )?);
                 by = Instant::now() + START_TIMEOUT + SILENCE;
             }
-            Some(Reply::Ready { .. }) => bail!("Хост прислал неверные параметры потока."),
+            Some(Reply::Ready { .. }) => bail!("Хост прислал неверные данные."),
             Some(Reply::Connected) => {
                 streaming = true;
                 worker.emit(Event::Streaming);

@@ -87,7 +87,7 @@ pub fn fetch(data: &Path, item: &Download, check: impl Fn() -> Result<()>) -> Re
     .with_context(|| format!("Не удалось скачать {}. Проверьте интернет.", item.name))?;
     ensure!(
         sha256(&partial)? == item.sha256,
-        "Контрольная сумма {} не совпала — файл повреждён или подменён.",
+        "{} скачался с ошибкой. Попробуйте ещё раз.",
         item.name
     );
     let _ = fs::remove_file(&target);
@@ -168,14 +168,14 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
     let vigem = if have.vigem {
         None
     } else {
-        worker.status("Скачиваем драйвер геймпада ViGEmBus…");
+        worker.status("Скачиваем драйвер геймпада…");
         Some(fetch(data, &VIGEM, check)?)
     };
     if vigem.is_none() && have.firewall {
         return Ok("Всё установлено.".into());
     }
 
-    worker.status("Разрешите установку в окне Windows…");
+    worker.status("Подтвердите в окне Windows…");
     let script = data.join("setup").join("install.ps1");
     write_script(&script, INSTALL_SCRIPT)?;
     let mut params = format!(
@@ -197,7 +197,7 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
         worker.status("Устанавливаем драйвер геймпада…");
         worker.check()
     })?;
-    ensure!(code == 0, "Установка не завершилась (код {code}). Подробности в setup.log.");
+    ensure!(code == 0, "Установка не удалась. Подробности в setup.log.");
     Ok("Всё установлено.".into())
 }
 
@@ -228,7 +228,7 @@ fn run_elevated(program: &Path, params: &str, tick: impl Fn() -> Result<()>) -> 
     info.nShow = SW_HIDE;
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         if unsafe { GetLastError() } == ERROR_CANCELLED {
-            bail!("Установка отменена в окне Windows.");
+            bail!("Установка отменена.");
         }
         bail!("Windows не запустила установку: {}", std::io::Error::last_os_error());
     }
