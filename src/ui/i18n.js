@@ -30,6 +30,7 @@ const EN = Object.freeze({
   "Ник с тегом или код друга": "Nickname with tag or friend code",
   "Добавить": "Add",
   "Список друзей пуст.": "No friends yet.",
+  "Пока никого. Отправьте другу свой ник — он внизу, нажмите, чтобы скопировать.": "No friends yet. Send a friend your nickname — it's at the bottom, click to copy.",
   "Закрыть": "Close",
   "Язык": "Language",
   "Профиль": "Profile",

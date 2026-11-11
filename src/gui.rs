@@ -278,6 +278,9 @@ struct App {
     updater: Option<Updater>,
     #[serde(skip)]
     quit: bool,
+    /// The user stopped hosting while the driver/firewall check was running.
+    #[serde(skip)]
+    setup_cancelled: bool,
     #[serde(skip)]
     data: PathBuf,
 }
@@ -308,6 +311,7 @@ impl App {
             attention: false,
             updater,
             quit: false,
+            setup_cancelled: false,
             data,
         };
         if app.identity.chosen {
@@ -520,7 +524,14 @@ impl App {
                 self.host_for = None;
                 self.begin_hosting();
             }
-            Action::HostStop => self.host.stop(),
+            Action::HostStop => {
+                // Hosting may still be in its driver/firewall check.
+                if self.setup.session.is_some() {
+                    self.setup_cancelled = true;
+                    self.setup.stop();
+                }
+                self.host.stop();
+            }
             Action::Allow => self.host.decide(true),
             Action::Deny => self.host.decide(false),
             Action::Copy if self.host.phase == Phase::Invite => copy(view, &self.host.code, "Код скопирован")?,
@@ -682,7 +693,11 @@ impl App {
             }
         }
         if setup_done {
-            if self.setup.error {
+            if std::mem::take(&mut self.setup_cancelled) {
+                self.host_for = None;
+                self.setup.set(Phase::Idle, "");
+                self.host.set(Phase::Idle, "");
+            } else if self.setup.error {
                 self.host_for = None;
                 self.host.fail(self.setup.message.clone());
             } else {
@@ -884,6 +899,13 @@ pub fn run() -> Result<()> {
     if let Some(monitor) = window.current_monitor() {
         let screen = monitor.size();
         let origin = monitor.position();
+        // Small laptop screens at 125–150% scaling are narrower than 880×580 logical.
+        let scale = monitor.scale_factor();
+        let fit_width = (screen.width as f64 / scale * 0.9).max(420.0);
+        let fit_height = (screen.height as f64 / scale * 0.85).max(520.0);
+        if fit_width < 880.0 || fit_height < 580.0 {
+            window.set_inner_size(LogicalSize::new(fit_width.min(880.0), fit_height.min(580.0)));
+        }
         let size = window.outer_size();
         let x = screen.width.saturating_sub(size.width) / 2;
         let y = screen.height.saturating_sub(size.height) / 2;

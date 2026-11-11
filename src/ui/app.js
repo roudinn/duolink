@@ -132,6 +132,7 @@ function renderPlay(next) {
   const preparing = next.setup.phase !== "idle";
   show("prepare", preparing);
   text("setup-line", preparing ? notice(next.setup.message) : "");
+  $("setup-stop").disabled = next.setup.phase === "stopping";
 
   renderSession("host", next.host, HOST);
   const forFriend = Boolean(next.hostFor);
