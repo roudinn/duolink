@@ -457,10 +457,76 @@ mod tests {
     }
 
     #[test]
+    fn chime_is_a_valid_wav() {
+        let wav = chime();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(wav.len(), 44 + 2 * (44_100.0f32 * 0.75) as usize);
+        if let Some(path) = std::env::var_os("DUOLINK_CHIME_OUT") {
+            std::fs::write(path, wav).unwrap();
+        }
+    }
+
+    #[test]
     #[ignore = "needs an audio device"]
     fn process_loopback_activates() {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
         loopback_client(unsafe { GetCurrentProcessId() }).unwrap();
         eprintln!("voice app: {:?}", voice_app());
+    }
+}
+
+/// A soft two-note chime for an incoming invite, made here so no file ships.
+fn chime() -> &'static [u8] {
+    static WAV: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    WAV.get_or_init(|| {
+        const SR: u32 = 44_100;
+        // Two bell-like notes a fifth apart, the second starting as the first fades.
+        let notes = [(880.0f32, 0.0f32), (1318.5, 0.11)];
+        let length = (SR as f32 * 0.75) as usize;
+        let mut pcm = Vec::with_capacity(length * 2);
+        for i in 0..length {
+            let t = i as f32 / SR as f32;
+            let mut value = 0.0;
+            for (frequency, start) in notes {
+                let local = t - start;
+                if local < 0.0 {
+                    continue;
+                }
+                let attack = (local / 0.006).min(1.0);
+                let envelope = attack * (-local * 6.5).exp();
+                let phase = std::f32::consts::TAU * frequency * local;
+                value += envelope * (phase.sin() + 0.18 * (2.0 * phase).sin());
+            }
+            let sample = ((value * 0.16).clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&SR.to_le_bytes());
+        wav.extend_from_slice(&(SR * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        wav
+    })
+}
+
+/// Plays the invite chime without blocking.
+pub fn play_chime() {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    let wav = chime();
+    unsafe {
+        let _ = PlaySoundW(
+            windows::core::PCWSTR(wav.as_ptr() as *const u16),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        );
     }
 }

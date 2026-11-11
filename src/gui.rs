@@ -493,6 +493,7 @@ impl App {
                         expires,
                     });
                     self.attention = true;
+                    crate::audio::play_chime();
                 }
             }
             Message::InviteDecline { at } => {
