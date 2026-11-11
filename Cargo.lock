@@ -659,7 +659,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "duolink"
-version = "1.9.6"
+version = "1.9.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -683,6 +683,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows",
+ "windows-core",
  "windows-sys 0.61.2",
  "wry",
  "x25519-dalek",

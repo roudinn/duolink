@@ -55,7 +55,7 @@ pub const TUNNEL_PORT: u16 = 48170;
 pub const GUEST_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 const HOST_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA_PORT + 21];
-pub const UDP_PORTS: [u16; 3] = [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11];
+pub const UDP_PORTS: [u16; 4] = [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
 const ALPN: &[u8] = b"duolink/2";
 const STUN_SERVERS: [&str; 3] = [
     "stun.l.google.com:19302",

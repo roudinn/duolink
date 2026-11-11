@@ -259,6 +259,9 @@ pub enum Reply {
         host: Uuid,
         certificate: String,
         mode: Mode,
+        /// Game audio comes from DuoLink without voice chat; Moonlight stays silent.
+        #[serde(default)]
+        own_audio: bool,
     },
     Connected,
     Pong,

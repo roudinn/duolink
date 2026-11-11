@@ -522,6 +522,7 @@ impl GuestStream {
         data: &Path,
         address: Ipv4Addr,
         same_machine: bool,
+        own_audio: bool,
         host: Uuid,
         certificate: &str,
         identity: &Identity,
@@ -559,8 +560,9 @@ impl GuestStream {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        if same_machine {
-            // Still receive and decode audio, with no feedback into host WASAPI loopback.
+        if same_machine || own_audio {
+            // Still receive and decode Sunshine's audio, but play nothing: either the
+            // host's loopback would hear it, or DuoLink plays the cleaner copy.
             command
                 .env("SDL_AUDIODRIVER", "dummy")
                 .env("SDL_AUDIO_DRIVER", "dummy");

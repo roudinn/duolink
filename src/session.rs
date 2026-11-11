@@ -16,6 +16,7 @@ use rustls::{ClientConnection, ServerConnection, StreamOwned, pki_types::ServerN
 use uuid::Uuid;
 
 use crate::{
+    audio::{AUDIO_PORT, GuestAudio, HostAudio, voice_app},
     media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
     platform::{
         KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
@@ -156,7 +157,7 @@ fn reserve_check(address: Ipv4Addr) -> Result<()> {
         let _socket = TcpListener::bind((address, port))
             .with_context(|| format!("TCP-порт {port} недоступен на {address}."))?;
     }
-    for port in [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11] {
+    for port in [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11, AUDIO_PORT] {
         let _socket = UdpSocket::bind((address, port))
             .with_context(|| format!("UDP-порт {port} недоступен на {address}."))?;
     }
@@ -378,10 +379,28 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
             return Ok("Гость отменил подключение.".into());
         }
     }
+    // Game audio without the voice-chat app, so the guest never hears themself.
+    let audio = match HostAudio::start(address) {
+        Ok(audio) => {
+            worker.fact(
+                "Звук",
+                match voice_app() {
+                    Some((_, name)) => format!("Без {name}"),
+                    None => "Без голосовых чатов".into(),
+                },
+            );
+            Some(audio)
+        }
+        Err(error) => {
+            worker.fact("Звук", format!("{error:#}"));
+            None
+        }
+    };
     wire.send(&Reply::Ready {
         host: host_id,
         certificate: identity.cert_pem,
         mode,
+        own_audio: audio.is_some(),
     })?;
 
     let by = Instant::now() + START_TIMEOUT;
@@ -413,6 +432,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     };
     // Closing Sunshine removes the virtual controller before notifying the guest.
     drop(stream);
+    drop(audio);
     let _ = wire.send(&Reply::Closed {
         reason: reason.into(),
     });
@@ -524,6 +544,8 @@ fn guest(
     let mut next_ping = Instant::now();
     let mut by = Instant::now() + DECISION_TIMEOUT + SILENCE;
     let mut stream = None::<GuestStream>;
+    // Held for the session; dropping it stops playback.
+    let mut _guest_audio = None::<GuestAudio>;
     let mut streaming = false;
     loop {
         if worker.check().is_err() {
@@ -575,6 +597,7 @@ fn guest(
                 host,
                 certificate,
                 mode,
+                own_audio,
             }) if stream.is_none() && valid_pem(&certificate) => {
                 let mode = preferences.mode(mode, display_mode().ok());
                 ensure!(
@@ -601,12 +624,19 @@ fn guest(
                     &data,
                     GUEST_LOOPBACK,
                     tunnel.same_machine,
+                    own_audio,
                     host,
                     &certificate,
                     &identity,
                     mode,
                     preferences,
                 )?);
+                if own_audio {
+                    _guest_audio = Some(GuestAudio::start(
+                        SocketAddr::from((GUEST_LOOPBACK, AUDIO_PORT)),
+                        tunnel.same_machine,
+                    )?);
+                }
                 by = Instant::now() + START_TIMEOUT + SILENCE;
             }
             Some(Reply::Ready { .. }) => bail!("Хост прислал неверные данные."),
@@ -689,6 +719,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
         }
+    }
+
+    #[test]
+    #[ignore = "needs an audio device"]
+    fn live_audio_without_voice_chat() {
+        let _audio = SilentAudio::start();
+        let host = crate::audio::HostAudio::start(Ipv4Addr::LOCALHOST).unwrap();
+        let guest = GuestAudio::start(SocketAddr::from((Ipv4Addr::LOCALHOST, AUDIO_PORT)), true).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        let packets = guest.received.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("audio packets in 3 s: {packets}; voice app: {:?}", voice_app());
+        // 5 ms packets: ~600 in 3 s once the hello has gone through.
+        assert!(packets > 300, "{packets}");
+        drop(guest);
+        drop(host);
     }
 
     #[test]
