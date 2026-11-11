@@ -35,7 +35,7 @@ use crate::{
     platform::{data_dir, open},
     protocol::Invite,
     session::{Event, Session},
-    setup::{self, Components},
+    setup,
     update::{self, Updater},
 };
 
@@ -378,18 +378,9 @@ impl App {
         self.host.begin(Session::host(self.data.clone()), "Создаём сессию…");
     }
 
-    /// Hosting needs the driver and firewall once; set them up first if missing.
     fn begin_hosting(&mut self) {
-        let components = Components::detect();
-        if components.host_ready() {
-            self.start_host();
-        } else {
-            self.host.set(Phase::Idle, "");
-            self.setup.begin(
-                setup::install(self.data.clone(), components),
-                "Готовим установку…",
-            );
-        }
+        self.host.set(Phase::Idle, "");
+        self.setup.begin(setup::prepare(self.data.clone()), "Проверяем драйвер и брандмауэр…");
     }
 
     fn start_guest(&mut self, invite: Invite, preferences: Preferences) {
@@ -691,13 +682,9 @@ impl App {
             }
         }
         if setup_done {
-            if self.setup.error || !Components::detect().host_ready() {
+            if self.setup.error {
                 self.host_for = None;
-                self.host.fail(if self.setup.error {
-                    self.setup.message.clone()
-                } else {
-                    "Windows не обнаружила драйвер геймпада или правило брандмауэра.".into()
-                });
+                self.host.fail(self.setup.message.clone());
             } else {
                 self.start_host();
             }
@@ -867,6 +854,7 @@ fn asset(path: &str) -> Response<Cow<'static, [u8]>> {
     let (content_type, body): (&str, &'static [u8]) = match path {
         "/index.html" => ("text/html; charset=utf-8", include_bytes!("ui/index.html")),
         "/style.css" => ("text/css; charset=utf-8", include_bytes!("ui/style.css")),
+        "/i18n.js" => ("text/javascript; charset=utf-8", include_bytes!("ui/i18n.js")),
         "/app.js" => ("text/javascript; charset=utf-8", include_bytes!("ui/app.js")),
         "/inter.woff2" => ("font/woff2", include_bytes!("ui/inter.woff2")),
         _ => {

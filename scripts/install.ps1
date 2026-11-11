@@ -19,12 +19,14 @@ function Assert-Hash([string]$Path, [string]$Expected) {
 }
 
 try {
+    $restartNeeded = $false
     if ($ViGEm) {
         Assert-Hash $ViGEm $ViGEmSha
         Write-Output 'Installing ViGEmBus'
-        $process = Start-Process -FilePath $ViGEm -ArgumentList '/exenoui', '/qn', '/norestart' -Wait -PassThru
+        $process = Start-Process -FilePath $ViGEm -ArgumentList '/exenoui', '/qn', '/norestart' -WindowStyle Hidden -Wait -PassThru
         # 3010 and 1641 mean success with a pending reboot.
         if ($process.ExitCode -notin 0, 3010, 1641) { throw "ViGEmBus installer exited with code $($process.ExitCode)" }
+        $restartNeeded = $process.ExitCode -in 3010, 1641
     }
     if ($Firewall) {
         Write-Output 'Configuring firewall'
@@ -43,6 +45,7 @@ try {
                 -Program $Program -Protocol UDP -Profile Any | Out-Null
         }
     }
+    if ($restartNeeded) { exit 20 }
     exit 0
 }
 catch {

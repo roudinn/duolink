@@ -72,9 +72,10 @@ function go(next) {
   if (state) render(state);
   main.scrollTop = 0;
   if (settings.open) return;
-  const title = next === "friends" ? "friends" :
-    state?.host.phase !== "idle" ? "host" : state?.guest.phase !== "idle" ? "guest" : "play";
-  $(`${title}-title`).focus();
+  const target = next === "friends" ? "friends-title" :
+    !$("host-live").hidden ? "host-title" : !$("guest-live").hidden ? "guest-title" :
+      !$("prepare").hidden ? "setup-title" : "host-start";
+  $(target).focus();
 }
 
 function renderViews(next) {
@@ -84,7 +85,7 @@ function renderViews(next) {
   show("friends-content", next.me.chosen);
   $("nav-icon").setAttribute("href", view === "friends" ? "#i-back" : "#i-people");
   const requests = next.friends.filter((f) => f.status === "incoming").length;
-  text("nav-label", view === "friends" ? "К игре" : requests ? `Друзья (${requests})` : "Друзья");
+  text("nav-label", view === "friends" ? tr("К игре") : tr("Друзья") + (requests ? ` (${requests})` : ""));
 }
 
 /* ---------------- play ---------------- */
@@ -95,14 +96,14 @@ function sessionBusy(next) {
 
 function renderFacts(id, facts) {
   const dl = $(id);
-  const key = JSON.stringify(facts);
+  const key = JSON.stringify([language.value, facts]);
   if (dl.dataset.key === key) return;
   dl.dataset.key = key;
   dl.replaceChildren(...facts.flatMap(([name, value]) => {
     const dt = document.createElement("dt");
-    dt.textContent = name;
+    dt.textContent = tr(name);
     const dd = document.createElement("dd");
-    dd.textContent = value;
+    dd.textContent = factValue(name, value);
     return [dt, dd];
   }));
 }
@@ -111,14 +112,14 @@ function renderSession(who, pane, table) {
   const active = pane.phase !== "idle";
   show(`${who}-live`, active);
   if (!active) {
-    line(`${who}-result`, pane.message, pane.error);
+    line(`${who}-result`, notice(pane.message), pane.error);
     $(`${who}-details`).open = false;
     return;
   }
   const title = table[pane.phase];
-  text(`${who}-title`, title);
+  text(`${who}-title`, tr(title));
   const message = pane.message.replace(/[…\s]+$/, "") === title ? "" : pane.message;
-  line(`${who}-message`, message);
+  line(`${who}-message`, notice(message));
   show(`${who}-details`, pane.facts.length > 0);
   renderFacts(`${who}-facts`, pane.facts);
   $(`${who}-stop`).disabled = pane.phase === "stopping";
@@ -127,7 +128,7 @@ function renderSession(who, pane, table) {
 function renderPlay(next) {
   const preparing = next.setup.phase !== "idle";
   show("prepare", preparing);
-  text("setup-line", preparing ? next.setup.message : "");
+  text("setup-line", preparing ? notice(next.setup.message) : "");
 
   renderSession("host", next.host, HOST);
   const forFriend = Boolean(next.hostFor);
@@ -135,15 +136,16 @@ function renderPlay(next) {
   show("approval", next.host.phase === "approval");
   text("code-box", next.host.code);
   if (next.host.phase === "approval") {
-    line("host-message", `${next.host.peer} хочет подключиться.`);
+    const peer = next.host.peer === "Гость" ? tr("Гость") : next.host.peer;
+    line("host-message", pick(`${peer} хочет подключиться.`, `${peer} wants to connect.`));
   }
   if (next.host.phase === "invite" && forFriend) {
-    text("host-title", `Ждём ${next.hostFor.name}`);
+    text("host-title", pick(`Ждём ${next.hostFor.name}`, `Waiting for ${next.hostFor.name}`));
   }
 
   renderSession("guest", next.guest, GUEST);
   show("guest-keys", next.guest.phase === "live");
-  text("guest-stop", next.guest.phase === "live" ? "Отключиться" : "Отменить");
+  text("guest-stop", tr(next.guest.phase === "live" ? "Отключиться" : "Отменить"));
   if (next.guest.codeError) guestCode.setAttribute("aria-invalid", "true");
   else guestCode.removeAttribute("aria-invalid");
   show("fix-video", next.guest.videoError);
@@ -156,7 +158,7 @@ function button(label, action, id, primary = false, disabled = false) {
   const b = document.createElement("button");
   b.type = "button";
   b.className = `btn small${primary ? " primary" : ""}`;
-  b.textContent = label;
+  b.textContent = tr(label);
   b.dataset.action = action;
   if (id) b.dataset.id = id;
   b.disabled = disabled;
@@ -170,8 +172,8 @@ function removeButton(friend) {
   b.dataset.action = "ask_remove";
   b.dataset.id = friend.id;
   const label = friend.status === "incoming" ? "Отклонить запрос" : friend.status === "outgoing" ? "Отозвать запрос" : "Удалить из друзей";
-  b.setAttribute("aria-label", `${label} ${friend.name}#${friend.tag}`);
-  b.title = label;
+  b.setAttribute("aria-label", `${tr(label)} ${friend.name}#${friend.tag}`);
+  b.title = tr(label);
   b.disabled = friend.sending;
   b.innerHTML = '<svg aria-hidden="true"><use href="#i-close"/></svg>';
   return b;
@@ -206,13 +208,13 @@ function friendRow(friend, busy) {
   } else if (friend.status === "outgoing") {
     if (friend.sending) {
       const note = document.createElement("small");
-      note.textContent = "Отправляем…";
+      note.textContent = tr("Отправляем…");
       who.append(note);
     }
     row.append(removeButton(friend));
   } else {
     const invite = button("Позвать", "invite_friend", friend.id, false, busy);
-    if (busy) invite.title = "Сначала завершите сессию";
+    if (busy) invite.title = tr("Сначала завершите сессию");
     row.append(invite, removeButton(friend));
   }
   return row;
@@ -235,7 +237,7 @@ function focusAction(root, action, id) {
 function renderInvites(next) {
   const busy = sessionBusy(next);
   const invites = $("invites");
-  const key = JSON.stringify([next.invitations, busy]);
+  const key = JSON.stringify([language.value, next.invitations, busy]);
   show("invites", next.invitations.length > 0);
   if (invites.dataset.key === key) return;
   invites.dataset.key = key;
@@ -245,9 +247,9 @@ function renderInvites(next) {
     const who = document.createElement("p");
     const nick = document.createElement("b");
     nick.textContent = name;
-    who.append(nick, " зовёт играть");
+    who.append(nick, " " + tr("зовёт играть"));
     const join = button("Играть", "accept_invite", id, true, busy);
-    if (busy) join.title = "Сначала завершите сессию";
+    if (busy) join.title = tr("Сначала завершите сессию");
     row.append(who, button("Отклонить", "decline_invite", id), join);
     return row;
   }));
@@ -257,9 +259,9 @@ function renderFriends(next) {
   text("me-name", next.me.name);
   text("me-tag", `#${next.me.tag}`);
   avatar($("me-avatar"), next.me.name);
-  $("me-chip").setAttribute("aria-label", `Скопировать ник ${next.me.name}#${next.me.tag}`);
+  $("me-chip").setAttribute("aria-label", `${tr("Скопировать свой ник")} ${next.me.name}#${next.me.tag}`);
   $("add-button").disabled = next.lookingUp;
-  text("add-button", next.lookingUp ? "Ищем…" : "Добавить");
+  text("add-button", tr(next.lookingUp ? "Ищем…" : "Добавить"));
 
   const busy = sessionBusy(next);
   const byName = (a, b) => a.name.localeCompare(b.name);
@@ -269,14 +271,14 @@ function renderFriends(next) {
     ["Исходящие запросы", next.friends.filter((f) => f.status === "outgoing")],
   ].filter(([, list]) => list.length);
 
-  const key = JSON.stringify([sections, busy, confirmRemove]);
+  const key = JSON.stringify([language.value, sections, busy, confirmRemove]);
   const root = $("friend-sections");
   if (root.dataset.key !== key) {
     root.dataset.key = key;
     replaceRows(root, sections.flatMap(([title, list]) => {
       const label = document.createElement("h2");
       label.className = "section";
-      label.textContent = title;
+      label.textContent = tr(title);
       const group = document.createElement("div");
       group.className = "group";
       group.append(...list.sort(byName).map((f) => friendRow(f, busy)));
@@ -294,19 +296,19 @@ function renderSettings(next) {
   const busy = sessionBusy(next);
   const ready = u.state === "ready";
   const notes = {
-    checking: "Проверяем…",
-    current: `${next.version} · последняя версия`,
-    downloading: `Скачиваем ${u.version}…`,
-    ready: busy ? "Завершите сессию для обновления" : `${u.version} после перезапуска`,
-    failed: "Не удалось обновить. Проверьте ещё раз.",
+    checking: tr("Проверяем…"),
+    current: pick(`${next.version} · последняя версия`, `${next.version} · up to date`),
+    downloading: pick(`Скачиваем ${u.version}…`, `Downloading ${u.version}…`),
+    ready: busy ? tr("Завершите сессию для обновления") : pick(`${u.version} после перезапуска`, `Restart to use ${u.version}`),
+    failed: tr("Не удалось обновить. Проверьте ещё раз."),
   };
-  text("update-note", notes[u.state] ?? `Версия ${next.version}`);
-  text("update-check", ready ? "Перезапустить" : "Проверить");
+  text("update-note", notes[u.state] ?? pick(`Версия ${next.version}`, `Version ${next.version}`));
+  text("update-check", tr(ready ? "Перезапустить" : "Проверить"));
   $("update-check").dataset.action = ready ? "restart" : "check_update";
   $("update-check").disabled = ["checking", "downloading"].includes(u.state) || (ready && busy);
   show("update-banner", ready && !busy);
-  if (ready) text("update-title", `Обновление ${u.version}`);
-  line("video-feedback", next.guest.videoError ? next.guest.message : "", next.guest.videoError);
+  if (ready) text("update-title", pick(`Обновление ${u.version}`, `Update ${u.version}`));
+  line("video-feedback", next.guest.videoError ? notice(next.guest.message) : "", next.guest.videoError);
 }
 
 /* ---------------- state ---------------- */
@@ -335,6 +337,7 @@ function applyState(next) {
 }
 
 function toast(message) {
+  message = notice(message);
   if (settings.open) {
     line("settings-feedback", message);
     return;
@@ -433,6 +436,12 @@ $("nick-settings").addEventListener("submit", (e) => {
 
 for (const id of [...NUMBERS, "codec"]) $(id).addEventListener("input", save);
 for (const id of FLAGS) $(id).addEventListener("change", save);
+language.addEventListener("change", () => {
+  try { localStorage.setItem(languageKey, language.value); } catch { /* storage unavailable */ }
+  applyLanguage();
+  line("settings-feedback", "");
+  if (state) render(state);
+});
 
 window.duo = {
   applyState,

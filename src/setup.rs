@@ -94,60 +94,47 @@ pub fn fetch(data: &Path, item: &Download, check: impl Fn() -> Result<()>) -> Re
     Ok(target)
 }
 
-#[derive(Clone, Copy)]
-pub struct Components {
-    vigem: bool,
-    firewall: bool,
-}
-
-impl Components {
-    pub fn detect() -> Self {
-        Self {
-            vigem: vigem_present(),
-            firewall: firewall_ready(),
-        }
+fn firewall_ready(powershell: &Path, program: &Path) -> Result<bool> {
+    let status = Command::new(powershell)
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(include_str!("../scripts/check-firewall.ps1"))
+        .env("DUOLINK_CHECK_PROGRAM", program)
+        .env("DUOLINK_CHECK_PORT", TUNNEL_PORT.to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Не удалось проверить брандмауэр Windows.")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!("Не удалось проверить брандмауэр Windows."),
     }
+}
 
-    pub fn host_ready(&self) -> bool {
-        self.vigem && self.firewall
+/// Checks the host's requirements and installs missing components.
+pub fn prepare(data: PathBuf) -> Session {
+    Session::start(move |worker, _| run_install(worker, &data))
+}
+
+fn run_install(worker: &Worker, data: &Path) -> Result<String> {
+    let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
+    let program = std::env::current_exe()?;
+    let firewall = firewall_ready(&powershell, &program)?;
+    let have_driver = vigem_present();
+    if have_driver && firewall {
+        return Ok(String::new());
     }
-}
-
-fn firewall_ready() -> bool {
-    let Ok(netsh) = system_tool("netsh.exe") else {
-        return false;
-    };
-    ["DuoLink-v3-Tunnel", "DuoLink-v3-App"].iter().all(|name| {
-        Command::new(&netsh)
-            .args(["advfirewall", "firewall", "show", "rule"])
-            .arg(format!("name={name}"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
-}
-
-/// Installs the host's driver and firewall rules behind one UAC prompt.
-pub fn install(data: PathBuf, have: Components) -> Session {
-    Session::start(move |worker, _| run_install(worker, &data, have))
-}
-
-fn run_install(worker: &Worker, data: &Path, have: Components) -> Result<String> {
+    worker.check()?;
     fs::create_dir_all(data.join("logs"))?;
     let check = || worker.check();
-    let vigem = if have.vigem {
+    let vigem = if have_driver {
         None
     } else {
         worker.status("Скачиваем драйвер геймпада…");
         Some(fetch(data, &VIGEM, check)?)
     };
-    if vigem.is_none() && have.firewall {
-        return Ok("Всё установлено.".into());
-    }
-
     worker.status("Подтвердите в окне Windows…");
     let script = data.join("setup").join("install.ps1");
     write_script(&script, INSTALL_SCRIPT)?;
@@ -159,16 +146,28 @@ fn run_install(worker: &Worker, data: &Path, have: Components) -> Result<String>
     if let Some(path) = &vigem {
         params += &format!(" -ViGEm \"{}\" -ViGEmSha {}", path.display(), VIGEM.sha256);
     }
-    if !have.firewall {
+    if !firewall {
         params += &format!(
             " -Firewall -Port {TUNNEL_PORT} -Program \"{}\"",
-            std::env::current_exe()?.display()
+            program.display()
         );
     }
-    let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
     let code = run_elevated(&powershell, &params, || worker.check())?;
-    ensure!(code == 0, "Установка не удалась. Подробности в setup.log.");
-    Ok("Всё установлено.".into())
+    ensure!(matches!(code, 0 | 20), "Установка не удалась. Подробности в setup.log.");
+    if vigem.is_some() && !vigem_present() {
+        ensure!(code != 20, "Перезагрузите ПК, чтобы закончить установку драйвера геймпада.");
+        for _ in 0..20 {
+            worker.check()?;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if vigem_present() {
+                break;
+            }
+        }
+        ensure!(vigem_present(), "Windows не запустила драйвер геймпада. Подробности в setup.log.");
+    }
+    ensure!(firewall || firewall_ready(&powershell, &program)?,
+        "Правила DuoLink не действуют. Проверьте политику брандмауэра Windows.");
+    Ok(String::new())
 }
 
 /// Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page.
@@ -223,6 +222,20 @@ fn installed_exe() -> Result<PathBuf> {
     .join("Programs")
     .join("DuoLink")
     .join("DuoLink.exe"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the DuoLink firewall rules on this Windows installation"]
+    fn finds_active_firewall_rules_by_internal_name() {
+        let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
+        let program = installed_exe().unwrap();
+        assert!(firewall_ready(&powershell, &program).unwrap());
+        assert!(!firewall_ready(&powershell, &program.with_file_name("other.exe")).unwrap());
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {

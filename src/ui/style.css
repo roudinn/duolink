@@ -58,6 +58,7 @@ main, .sheet { scrollbar-width: thin; scrollbar-color: #555 transparent; }
 .title:focus, .session h1:focus, #video-title:focus { outline: none; }
 .stack { display: flex; flex-direction: column; gap: 12px; }
 .wide { gap: 14px; }
+#home { padding-top: 10px; }
 .hint { color: var(--faint); font-size: 13px; }
 
 /* cards */

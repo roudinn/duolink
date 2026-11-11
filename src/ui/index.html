@@ -7,6 +7,7 @@
   <title>DuoLink</title>
   <link rel="preload" href="/inter.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/style.css">
+  <script src="/i18n.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -35,7 +36,7 @@
     <!-- Play -->
     <section id="play" class="view">
       <div id="prepare" class="session" hidden>
-        <h1>Подготовка хоста</h1>
+        <h1 id="setup-title" tabindex="-1">Подготовка хоста</h1>
         <p id="setup-line" class="muted" role="status"></p>
       </div>
 
@@ -65,7 +66,6 @@
 
       <!-- Home -->
       <div id="home" class="stack wide">
-        <h1 id="play-title" class="title" tabindex="-1">Играть</h1>
         <button type="button" id="host-start" class="btn primary block" data-action="host_start">Создать сессию</button>
         <p id="host-result" class="line" role="status" hidden></p>
 
@@ -122,6 +122,12 @@
       <button type="button" class="round" data-action="close_settings" aria-label="Закрыть"><svg><use href="#i-close"/></svg></button>
     </header>
     <div class="sheet">
+      <div class="group">
+        <div class="row">
+          <label for="language" class="label">Язык</label>
+          <select id="language" class="inline"><option value="ru">Русский</option><option value="en">English</option></select>
+        </div>
+      </div>
       <p class="section">Профиль</p>
       <div class="group">
         <form id="nick-settings" class="row">
