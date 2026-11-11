@@ -13,11 +13,12 @@ let state;
 let view = "play";
 let confirmRemove = null;
 let toastTimer;
+const main = document.querySelector("main");
 
 const HOST = {
   working: "Создаём сессию",
   invite: "Ждём друга",
-  approval: "Запрос на подключение",
+  approval: "Подключение",
   live: "В игре",
   stopping: "Завершаем",
 };
@@ -31,9 +32,8 @@ const text = (id, value) => { const el = $(id); if (el.textContent !== value) el
 const show = (id, on) => { $(id).hidden = !on; };
 const initial = (name) => [...(name || "?")][0];
 
-function avatar(el, name, online = false) {
+function avatar(el, name) {
   el.textContent = initial(name);
-  el.classList.toggle("online", online);
 }
 
 function line(id, message, error = false) {
@@ -70,47 +70,31 @@ function go(next) {
   view = next;
   confirmRemove = null;
   if (state) render(state);
-  if (next === "friends") setTimeout(() => $("add-input").focus(), 50);
+  main.scrollTop = 0;
+  if (settings.open) return;
+  const title = next === "friends" ? "friends" :
+    state?.host.phase !== "idle" ? "host" : state?.guest.phase !== "idle" ? "guest" : "play";
+  $(`${title}-title`).focus();
 }
 
 function renderViews(next) {
-  const onboarding = !next.me.chosen;
-  show("onboarding", onboarding);
-  show("play", !onboarding && view === "play");
-  show("friends", !onboarding && view === "friends");
-  show("back", !onboarding && view === "friends");
-  show("brand", view !== "friends" || onboarding);
-  $("friends-tab").classList.toggle("on", view === "friends");
-  show("friends-tab", !onboarding);
+  show("play", view === "play");
+  show("friends", view === "friends");
+  show("nick-form", !next.me.chosen);
+  show("friends-content", next.me.chosen);
+  $("nav-icon").setAttribute("href", view === "friends" ? "#i-back" : "#i-people");
   const requests = next.friends.filter((f) => f.status === "incoming").length;
-  show("friends-badge", requests > 0);
-  text("friends-badge", String(requests));
+  text("nav-label", view === "friends" ? "К игре" : requests ? `Друзья (${requests})` : "Друзья");
 }
 
 /* ---------------- play ---------------- */
 
-function renderPrepare(next) {
-  const c = next.components;
-  const working = next.setup.phase !== "idle";
-  const rows = [
-    ["c-engines", c.sunshine && c.moonlight, working ? "Загрузка" : "Нужно"],
-    ["c-vigem", c.vigem, "При первой сессии"],
-    ["c-firewall", c.firewall, "При первой сессии"],
-  ];
-  for (const [id, ok, pending] of rows) {
-    const busy = !ok && working && (id === "c-engines" || next.fullSetup);
-    $(id).classList.toggle("done", ok);
-    $(id).classList.toggle("busy", busy);
-    $(id).querySelector("em").textContent = ok ? "Готово" : busy ? "Установка" : pending;
-  }
-  show("prepare", working || next.setup.error);
-  text("setup-line", working || next.setup.error ? next.setup.message : "");
-  show("install", next.setup.error && !working);
+function sessionBusy(next) {
+  return [next.host, next.guest, next.setup].some((pane) => pane.phase !== "idle");
 }
 
 function renderFacts(id, facts) {
   const dl = $(id);
-  show(id, facts.length > 0);
   const key = JSON.stringify(facts);
   if (dl.dataset.key === key) return;
   dl.dataset.key = key;
@@ -128,43 +112,42 @@ function renderSession(who, pane, table) {
   show(`${who}-live`, active);
   if (!active) {
     line(`${who}-result`, pane.message, pane.error);
+    $(`${who}-details`).open = false;
     return;
   }
-  text(`${who}-title`, table[pane.phase]);
-  text(`${who}-message`, pane.message);
-  show(`${who}-message`, Boolean(pane.message));
+  const title = table[pane.phase];
+  text(`${who}-title`, title);
+  const message = pane.message.replace(/[…\s]+$/, "") === title ? "" : pane.message;
+  line(`${who}-message`, message);
+  show(`${who}-details`, pane.facts.length > 0);
   renderFacts(`${who}-facts`, pane.facts);
   $(`${who}-stop`).disabled = pane.phase === "stopping";
 }
 
 function renderPlay(next) {
-  renderPrepare(next);
-  const hostActive = next.host.phase !== "idle";
-  const guestActive = next.guest.phase !== "idle";
+  const preparing = next.setup.phase !== "idle";
+  show("prepare", preparing);
+  text("setup-line", preparing ? next.setup.message : "");
 
   renderSession("host", next.host, HOST);
   const forFriend = Boolean(next.hostFor);
   show("invitation", next.host.phase === "invite" && !forFriend);
   show("approval", next.host.phase === "approval");
   text("code-box", next.host.code);
-  if (next.host.phase === "approval") text("host-title", `${next.host.peer.split(" · ")[0]} хочет подключиться`);
-  if (next.host.phase === "invite" && forFriend) text("host-title", `Ждём ${next.hostFor.name}`);
+  if (next.host.phase === "approval") {
+    line("host-message", `${next.host.peer} хочет подключиться.`);
+  }
+  if (next.host.phase === "invite" && forFriend) {
+    text("host-title", `Ждём ${next.hostFor.name}`);
+  }
 
   renderSession("guest", next.guest, GUEST);
   show("guest-keys", next.guest.phase === "live");
   text("guest-stop", next.guest.phase === "live" ? "Отключиться" : "Отменить");
-  guestCode.setAttribute("aria-invalid", String(next.guest.codeError));
-
-  // While waiting for a code-based guest, "По коду" stays available for a same-PC test.
-  show("home", !guestActive && (!hostActive || (next.host.phase === "invite" && !forFriend)));
-  show("host-card", !hostActive);
-
-  const invite = next.invitation;
-  show("friend-invite", Boolean(invite) && !guestActive);
-  if (invite) {
-    text("invite-name", invite.name);
-    avatar($("invite-avatar"), invite.name, true);
-  }
+  if (next.guest.codeError) guestCode.setAttribute("aria-invalid", "true");
+  else guestCode.removeAttribute("aria-invalid");
+  show("fix-video", next.guest.videoError);
+  show("home", !sessionBusy(next));
 }
 
 /* ---------------- friends ---------------- */
@@ -186,17 +169,21 @@ function removeButton(friend) {
   b.className = "round x";
   b.dataset.action = "ask_remove";
   b.dataset.id = friend.id;
-  b.setAttribute("aria-label", "Удалить");
-  b.innerHTML = '<svg><use href="#i-close"/></svg>';
+  const label = friend.status === "incoming" ? "Отклонить запрос" : friend.status === "outgoing" ? "Отозвать запрос" : "Удалить из друзей";
+  b.setAttribute("aria-label", `${label} ${friend.name}#${friend.tag}`);
+  b.title = label;
+  b.disabled = friend.sending;
+  b.innerHTML = '<svg aria-hidden="true"><use href="#i-close"/></svg>';
   return b;
 }
 
-function friendRow(friend, hosting) {
+function friendRow(friend, busy) {
   const row = document.createElement("div");
   row.className = "friend";
   const face = document.createElement("span");
   face.className = "avatar";
-  avatar(face, friend.name, friend.online);
+  face.setAttribute("aria-hidden", "true");
+  avatar(face, friend.name);
   const who = document.createElement("div");
   who.className = "who";
   const name = document.createElement("b");
@@ -205,58 +192,95 @@ function friendRow(friend, hosting) {
   tag.className = "tag";
   tag.textContent = `#${friend.tag}`;
   name.append(tag);
-  const note = document.createElement("small");
-  who.append(name, note);
+  who.append(name);
   row.append(face, who);
 
   if (confirmRemove === friend.id) {
     row.classList.add("confirm");
-    note.textContent = friend.status === "incoming" ? "Отклонить запрос?" : "Удалить из друзей?";
-    const yes = button(friend.status === "incoming" ? "Отклонить" : "Удалить", "remove_friend", friend.id);
-    yes.classList.add("danger");
-    row.append(button("Отмена", "cancel_remove"), yes);
+    const label = friend.status === "incoming" ? "Отклонить" : friend.status === "outgoing" ? "Отозвать" : "Удалить";
+    row.append(button("Отмена", "cancel_remove", friend.id), button(label, "remove_friend", friend.id));
     return row;
   }
   if (friend.status === "incoming") {
-    note.textContent = "хочет дружить";
-    row.append(button("Принять", "accept_friend", friend.id, true), removeButton(friend));
+    row.append(button(friend.sending ? "Принимаем…" : "Принять", "accept_friend", friend.id, true, friend.sending), removeButton(friend));
   } else if (friend.status === "outgoing") {
-    note.textContent = friend.sending ? "отправляем…" : "запрос отправлен";
+    if (friend.sending) {
+      const note = document.createElement("small");
+      note.textContent = "Отправляем…";
+      who.append(note);
+    }
     row.append(removeButton(friend));
   } else {
-    note.textContent = friend.online ? "в сети" : "не в сети";
-    row.append(button("Позвать", "invite_friend", friend.id, friend.online, hosting), removeButton(friend));
+    const invite = button("Позвать", "invite_friend", friend.id, false, busy);
+    if (busy) invite.title = "Сначала завершите сессию";
+    row.append(invite, removeButton(friend));
   }
   return row;
+}
+
+function replaceRows(root, rows) {
+  const active = document.activeElement;
+  const { action, id } = active?.dataset ?? {};
+  const restoreFocus = root.contains(active);
+  root.replaceChildren(...rows);
+  if (restoreFocus) focusAction(root, action, id);
+}
+
+function focusAction(root, action, id) {
+  const match = [...root.querySelectorAll("button[data-action]:enabled")]
+    .find((button) => button.dataset.action === action && button.dataset.id === id);
+  match?.focus();
+}
+
+function renderInvites(next) {
+  const busy = sessionBusy(next);
+  const invites = $("invites");
+  const key = JSON.stringify([next.invitations, busy]);
+  show("invites", next.invitations.length > 0);
+  if (invites.dataset.key === key) return;
+  invites.dataset.key = key;
+  replaceRows(invites, next.invitations.map(({ id, name }) => {
+    const row = document.createElement("div");
+    row.className = "notice";
+    const who = document.createElement("p");
+    const nick = document.createElement("b");
+    nick.textContent = name;
+    who.append(nick, " зовёт играть");
+    const join = button("Играть", "accept_invite", id, true, busy);
+    if (busy) join.title = "Сначала завершите сессию";
+    row.append(who, button("Отклонить", "decline_invite", id), join);
+    return row;
+  }));
 }
 
 function renderFriends(next) {
   text("me-name", next.me.name);
   text("me-tag", `#${next.me.tag}`);
   avatar($("me-avatar"), next.me.name);
+  $("me-chip").setAttribute("aria-label", `Скопировать ник ${next.me.name}#${next.me.tag}`);
   $("add-button").disabled = next.lookingUp;
+  text("add-button", next.lookingUp ? "Ищем…" : "Добавить");
 
-  const hosting = next.host.phase !== "idle";
+  const busy = sessionBusy(next);
   const byName = (a, b) => a.name.localeCompare(b.name);
   const sections = [
-    ["Запросы", next.friends.filter((f) => f.status === "incoming")],
-    ["В сети", next.friends.filter((f) => f.status === "friend" && f.online)],
-    ["Не в сети", next.friends.filter((f) => f.status === "friend" && !f.online)],
-    ["Исходящие", next.friends.filter((f) => f.status === "outgoing")],
+    ["Запросы в друзья", next.friends.filter((f) => f.status === "incoming")],
+    ["Друзья", next.friends.filter((f) => f.status === "friend")],
+    ["Исходящие запросы", next.friends.filter((f) => f.status === "outgoing")],
   ].filter(([, list]) => list.length);
 
-  const key = JSON.stringify([sections, hosting, confirmRemove]);
+  const key = JSON.stringify([sections, busy, confirmRemove]);
   const root = $("friend-sections");
   if (root.dataset.key !== key) {
     root.dataset.key = key;
-    root.replaceChildren(...sections.flatMap(([title, list]) => {
-      const label = document.createElement("p");
+    replaceRows(root, sections.flatMap(([title, list]) => {
+      const label = document.createElement("h2");
       label.className = "section";
       label.textContent = title;
       const group = document.createElement("div");
       group.className = "group";
-      group.append(...list.sort(byName).map((f) => friendRow(f, hosting)));
-      return [label, group];
+      group.append(...list.sort(byName).map((f) => friendRow(f, busy)));
+      return title === "Друзья" && sections.length === 1 ? [group] : [label, group];
     }));
   }
   show("friends-empty", next.friends.length === 0);
@@ -265,23 +289,24 @@ function renderFriends(next) {
 /* ---------------- settings ---------------- */
 
 function renderSettings(next) {
-  if (document.activeElement !== $("nick-edit")) $("nick-edit").value = next.me.name;
-  const hags = next.components.hags;
-  text("hags-note", hags === true ? "включено" : hags === false ? "выключено — включите на хосте" : "");
-  text("version-note", `версия ${next.version}`);
+  show("copy-friend-code", next.me.chosen);
   const u = next.update;
+  const busy = sessionBusy(next);
+  const ready = u.state === "ready";
   const notes = {
-    idle: "автоматически",
-    checking: "проверяем…",
-    current: "последняя версия",
-    downloading: `скачиваем ${u.version}…`,
-    ready: `${u.version} — после перезапуска`,
-    failed: "нет связи",
+    checking: "Проверяем…",
+    current: `${next.version} · последняя версия`,
+    downloading: `Скачиваем ${u.version}…`,
+    ready: busy ? "Завершите сессию для обновления" : `${u.version} после перезапуска`,
+    failed: "Не удалось обновить. Проверьте ещё раз.",
   };
-  text("update-note", notes[u.state] ?? "");
-  $("update-check").disabled = ["checking", "downloading", "ready"].includes(u.state);
-  show("update-banner", u.state === "ready");
-  if (u.state === "ready") text("update-title", `Доступна версия ${u.version}`);
+  text("update-note", notes[u.state] ?? `Версия ${next.version}`);
+  text("update-check", ready ? "Перезапустить" : "Проверить");
+  $("update-check").dataset.action = ready ? "restart" : "check_update";
+  $("update-check").disabled = ["checking", "downloading"].includes(u.state) || (ready && busy);
+  show("update-banner", ready && !busy);
+  if (ready) text("update-title", `Обновление ${u.version}`);
+  line("video-feedback", next.guest.videoError ? next.guest.message : "", next.guest.videoError);
 }
 
 /* ---------------- state ---------------- */
@@ -289,33 +314,43 @@ function renderSettings(next) {
 function render(next) {
   renderViews(next);
   renderPlay(next);
+  renderInvites(next);
   renderFriends(next);
   renderSettings(next);
-  const preview = $("nick-input").value.trim() || "nickname";
-  text("nick-preview", `${preview}#${next.me.tag}`);
 }
 
 function applyState(next) {
   const prev = state;
   state = next;
+  if (prev?.me.name !== next.me.name || prev?.me.chosen !== next.me.chosen) {
+    $("nick-edit").value = next.me.chosen ? next.me.name : "";
+  }
   render(next);
   if (prev?.guest.phase === "live" && next.guest.phase === "idle") guestCode.value = "";
   if (next.host.phase === "approval" && prev?.host.phase !== "approval") {
     go("play");
-    document.querySelector('[data-action="allow"]').focus();
   }
-  if (next.invitation && !prev?.invitation) go("play");
-  if (!next.me.chosen && (!prev || prev.me.chosen)) $("nick-input").focus();
-  if (next.guest.codeError && !prev?.guest.codeError) guestCode.focus();
+  if (next.me.chosen && !prev?.me.chosen && view === "friends" && !settings.open) $("add-input").focus();
+  if (next.guest.codeError && !prev?.guest.codeError && !settings.open && view === "play") guestCode.focus();
 }
 
 function toast(message) {
+  if (settings.open) {
+    line("settings-feedback", message);
+    return;
+  }
   text("toast", message);
   $("toast").hidden = true;
   void $("toast").offsetWidth;
   $("toast").hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => show("toast", false), 2600);
+  toastTimer = setTimeout(() => show("toast", false), 4000);
+}
+
+function cancelRemove(id) {
+  confirmRemove = null;
+  render(state);
+  focusAction($("friend-sections"), "ask_remove", id);
 }
 
 /* ---------------- events ---------------- */
@@ -326,21 +361,45 @@ document.addEventListener("click", (e) => {
   const { action, id } = b.dataset;
   switch (action) {
     case "settings": settings.showModal(); break;
+    case "video_settings":
+      settings.showModal();
+      $("video-title").focus();
+      $("video-title").scrollIntoView({ block: "start" });
+      break;
     case "close_settings": settings.close(); break;
-    case "go_friends": go(view === "friends" ? "play" : "friends"); break;
-    case "go_play": go("play"); break;
-    case "ask_remove": confirmRemove = id; render(state); break;
-    case "cancel_remove": confirmRemove = null; render(state); break;
-    case "remove_friend": confirmRemove = null; send("remove_friend", { id }); break;
-    case "accept_invite": send("accept_invite", { options: options() }); break;
-    case "invite_friend": send("invite_friend", { id }); go("play"); break;
+    case "toggle_view": go(view === "friends" ? "play" : "friends"); break;
+    case "ask_remove":
+      confirmRemove = id;
+      render(state);
+      focusAction($("friend-sections"), "cancel_remove", id);
+      break;
+    case "cancel_remove": cancelRemove(id); break;
+    case "remove_friend":
+      confirmRemove = null;
+      send("remove_friend", { id });
+      $("add-input").focus();
+      break;
+    case "accept_invite":
+      send("accept_invite", { id, options: options() });
+      go("play");
+      break;
+    case "invite_friend":
+      send("invite_friend", { id });
+      go("play");
+      break;
     default: send(action, id ? { id } : {});
   }
 });
 
 settings.addEventListener("click", (e) => { if (e.target === settings) settings.close(); });
+settings.addEventListener("close", () => line("settings-feedback", ""));
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && view === "friends" && !settings.open) go("play");
+  if (e.key !== "Escape" || view !== "friends" || settings.open) return;
+  if (confirmRemove) {
+    cancelRemove(confirmRemove);
+  } else {
+    go("play");
+  }
 });
 
 $("guest-form").addEventListener("submit", (e) => {
@@ -348,7 +407,10 @@ $("guest-form").addEventListener("submit", (e) => {
   save();
   send("guest_start", { code: guestCode.value, options: options() });
 });
-guestCode.addEventListener("input", () => guestCode.removeAttribute("aria-invalid"));
+guestCode.addEventListener("input", () => {
+  guestCode.removeAttribute("aria-invalid");
+  if (state?.guest.codeError) send("clear_code_error");
+});
 
 $("add-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -356,20 +418,17 @@ $("add-form").addEventListener("submit", (e) => {
   if (query) send("add_friend", { query });
 });
 
-$("nick-input").addEventListener("input", () => state && render(state));
 $("nick-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const name = $("nick-input").value.trim();
-  if (!NICK.test(name)) return toast("3–16 символов: латиница, цифры, _ . -");
+  if (!NICK.test(name)) return toast($("nick-hint").textContent);
   send("set_name", { name });
 });
 $("nick-settings").addEventListener("submit", (e) => {
   e.preventDefault();
   const name = $("nick-edit").value.trim();
-  if (!NICK.test(name)) return toast("3–16 символов: латиница, цифры, _ . -");
+  if (!NICK.test(name)) return toast($("nick-hint").textContent);
   send("set_name", { name });
-  $("nick-edit").blur();
-  toast("Сохранено");
 });
 
 for (const id of [...NUMBERS, "codec"]) $(id).addEventListener("input", save);

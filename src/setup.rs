@@ -11,7 +11,6 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_OBJECT_0},
@@ -23,8 +22,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    media::{MOONLIGHT, SUNSHINE},
-    platform::{hags_enabled, run_tool, system_tool, vigem_present},
+    platform::{run_tool, system_tool, vigem_present},
     session::{Session, Worker},
     tunnel::TUNNEL_PORT,
 };
@@ -96,31 +94,20 @@ pub fn fetch(data: &Path, item: &Download, check: impl Fn() -> Result<()>) -> Re
     Ok(target)
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy)]
 pub struct Components {
-    pub sunshine: bool,
-    pub moonlight: bool,
-    pub vigem: bool,
-    pub firewall: bool,
-    pub hags: Option<bool>,
+    vigem: bool,
+    firewall: bool,
 }
 
 impl Components {
-    pub fn detect(data: &Path) -> Self {
+    pub fn detect() -> Self {
         Self {
-            sunshine: SUNSHINE.path(data).is_file(),
-            moonlight: MOONLIGHT.path(data).is_file(),
             vigem: vigem_present(),
             firewall: firewall_ready(),
-            hags: hags_enabled(),
         }
     }
 
-    pub fn engines(&self) -> bool {
-        self.sunshine && self.moonlight
-    }
-
-    /// What hosting needs beyond the engines: the gamepad driver and firewall rules.
     pub fn host_ready(&self) -> bool {
         self.vigem && self.firewall
     }
@@ -143,29 +130,14 @@ fn firewall_ready() -> bool {
     })
 }
 
-/// Background setup. `elevated == false` only prefetches the streaming
-/// engines, which needs no prompt; `true` also installs the gamepad driver
-/// and firewall rules behind one UAC prompt.
-pub fn install(data: PathBuf, elevated: bool) -> Session {
-    Session::start(move |worker, _| run_install(worker, &data, elevated))
+/// Installs the host's driver and firewall rules behind one UAC prompt.
+pub fn install(data: PathBuf, have: Components) -> Session {
+    Session::start(move |worker, _| run_install(worker, &data, have))
 }
 
-fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
+fn run_install(worker: &Worker, data: &Path, have: Components) -> Result<String> {
     fs::create_dir_all(data.join("logs"))?;
     let check = || worker.check();
-    if !MOONLIGHT.path(data).is_file() {
-        worker.status("Скачиваем Moonlight (37 МБ)…");
-        MOONLIGHT.ensure(data, check)?;
-    }
-    if !SUNSHINE.path(data).is_file() {
-        worker.status("Скачиваем Sunshine (38 МБ)…");
-        SUNSHINE.ensure(data, check)?;
-    }
-    if !elevated {
-        return Ok("Движки загружены.".into());
-    }
-
-    let have = Components::detect(data);
     let vigem = if have.vigem {
         None
     } else {
@@ -194,10 +166,7 @@ fn run_install(worker: &Worker, data: &Path, elevated: bool) -> Result<String> {
         );
     }
     let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
-    let code = run_elevated(&powershell, &params, || {
-        worker.status("Устанавливаем драйвер геймпада…");
-        worker.check()
-    })?;
+    let code = run_elevated(&powershell, &params, || worker.check())?;
     ensure!(code == 0, "Установка не удалась. Подробности в setup.log.");
     Ok("Всё установлено.".into())
 }

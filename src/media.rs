@@ -507,7 +507,7 @@ pub fn reference_bitrate(mode: Mode, yuv444: bool) -> u32 {
     }
     let fps = mode.fps as f64;
     let rate = if fps <= 60.0 { fps } else { (fps / 60.0).sqrt() * 60.0 } / 30.0;
-    ((factor * rate).round() as u32) * 1000
+    ((factor * rate).round() * 1000.0) as u32
 }
 
 pub struct GuestStream {
@@ -684,6 +684,15 @@ mod tests {
         assert_eq!(prefs.auto_bitrate(fhd, Some(2.0)), (3_000, true));
         let manual = Preferences { bitrate: Some(80_000), ..Preferences::default() };
         assert_eq!(manual.auto_bitrate(fhd, Some(40.0)), (80_000, false));
+    }
+
+    #[test]
+    fn auto_bitrate_saturates_for_large_custom_modes() {
+        let preferences = Preferences::parse(&form("2000000000", "2000000000", "1000", "")).unwrap();
+        let host = Mode { width: 1920, height: 1080, fps: 60 };
+        let mode = preferences.mode(host, None);
+        assert_eq!(mode.fps, 1000);
+        assert_eq!(preferences.bitrate_for(mode), MAX_BITRATE_KBPS);
     }
 
     #[test]

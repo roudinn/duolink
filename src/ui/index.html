@@ -14,124 +14,104 @@
     <symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 19.5c.8-3.3 3.4-5 6.5-5s5.7 1.7 6.5 5"/><circle cx="17" cy="9" r="2.6"/><path d="M16.5 14.6c2.6.1 4.4 1.6 5 4.4"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h9m4 0h3M4 17h3m4 0h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="3"/><path d="M15.5 8.5V7a2.5 2.5 0 0 0-2.5-2.5H7A2.5 2.5 0 0 0 4.5 7v6A2.5 2.5 0 0 0 7 15.5h1.5"/></symbol>
-    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
-    <symbol id="i-back" viewBox="0 0 24 24"><path d="m14.5 6-6 6 6 6"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M20 12H4m6-6-6 6 6 6"/></symbol>
     <symbol id="i-paste" viewBox="0 0 24 24"><rect x="5.5" y="5" width="13" height="15.5" rx="3"/><path d="M9 5V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/></symbol>
   </svg>
 
   <header class="bar">
-    <button type="button" id="back" class="round" data-action="go_play" aria-label="Назад" hidden><svg><use href="#i-back"/></svg></button>
-    <span id="brand" class="brand">DuoLink</span>
-    <div class="tools">
-      <button type="button" id="friends-tab" class="round" data-action="go_friends" aria-label="Друзья">
-        <svg><use href="#i-people"/></svg><span id="friends-badge" class="badge" hidden></span>
+    <span class="brand">DuoLink</span>
+    <nav class="tools" aria-label="Разделы">
+      <button type="button" id="friends-tab" class="btn nav-button" data-action="toggle_view">
+        <svg aria-hidden="true"><use id="nav-icon" href="#i-people"/></svg><span id="nav-label">Друзья</span>
       </button>
-      <button type="button" class="round" data-action="settings" aria-label="Настройки"><svg><use href="#i-settings"/></svg></button>
-    </div>
+      <button type="button" class="round" data-action="settings" aria-label="Настройки" title="Настройки"><svg aria-hidden="true"><use href="#i-settings"/></svg></button>
+    </nav>
   </header>
 
   <main>
-    <!-- Onboarding -->
-    <section id="onboarding" class="view center" hidden>
-      <div class="hero">
-        <h1>Как вас зовут?</h1>
-        <p class="muted">Ник увидят друзья.</p>
-      </div>
-      <form id="nick-form" class="stack">
-        <input id="nick-input" class="field big" maxlength="16" placeholder="nickname" autocomplete="off" spellcheck="false" aria-label="Ник">
-        <p class="hint"><span id="nick-preview">nickname#0000</span></p>
-        <button type="submit" class="btn primary block">Продолжить</button>
-      </form>
-    </section>
+    <div id="invites" class="view notices" aria-label="Приглашения" hidden></div>
 
     <!-- Play -->
     <section id="play" class="view">
-      <div id="update-banner" class="notice" hidden>
-        <div><b id="update-title"></b><small>Скачано и проверено</small></div>
-        <button type="button" class="btn primary small" data-action="restart">Перезапустить</button>
-      </div>
-
-      <div id="friend-invite" class="notice invite" hidden>
-        <span id="invite-avatar" class="avatar"></span>
-        <div><b id="invite-name"></b><small>зовёт играть</small></div>
-        <button type="button" class="btn small" data-action="decline_invite">Позже</button>
-        <button type="button" class="btn primary small" data-action="accept_invite">Играть</button>
-      </div>
-
-      <div id="prepare" class="group" hidden>
-        <div class="row" id="c-engines"><span class="mark"></span><span class="label">Движки</span><em></em></div>
-        <div class="row" id="c-vigem"><span class="mark"></span><span class="label">Драйвер геймпада</span><em></em></div>
-        <div class="row" id="c-firewall"><span class="mark"></span><span class="label">Брандмауэр</span><em></em></div>
-        <div class="row foot"><span id="setup-line" class="muted"></span><button type="button" id="install" class="btn small" data-action="install" hidden>Повторить</button></div>
+      <div id="prepare" class="session" hidden>
+        <h1>Подготовка хоста</h1>
+        <p id="setup-line" class="muted" role="status"></p>
       </div>
 
       <!-- Live sessions -->
       <div id="host-live" class="session" hidden>
-        <h1 id="host-title"></h1>
+        <h1 id="host-title" tabindex="-1"></h1>
         <p id="host-message" class="muted" role="status"></p>
-        <div id="invitation" class="stack" hidden>
-          <button type="button" id="code-box" class="code" data-action="copy" title="Скопировать"></button>
-          <button type="button" class="btn primary block" data-action="copy"><svg><use href="#i-copy"/></svg>Скопировать код</button>
+        <div id="invitation" class="code-row" hidden>
+          <span id="code-box" class="code"></span>
+          <button type="button" class="btn primary" data-action="copy" aria-label="Скопировать код"><svg aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button>
         </div>
         <div id="approval" class="pair" hidden>
           <button type="button" class="btn block" data-action="deny">Отклонить</button>
           <button type="button" class="btn primary block" data-action="allow">Разрешить</button>
         </div>
-        <dl id="host-facts" class="facts" hidden></dl>
-        <button type="button" id="host-stop" class="btn danger block" data-action="host_stop">Завершить</button>
+        <details id="host-details" hidden><summary>Подробности</summary><dl id="host-facts" class="facts"></dl></details>
+        <button type="button" id="host-stop" class="btn block" data-action="host_stop">Завершить сессию</button>
       </div>
 
       <div id="guest-live" class="session" hidden>
-        <h1 id="guest-title"></h1>
+        <h1 id="guest-title" tabindex="-1"></h1>
         <p id="guest-message" class="muted" role="status"></p>
-        <dl id="guest-facts" class="facts" hidden></dl>
-        <p id="guest-keys" class="hint" hidden><kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>Q</kbd> — выйти из игры</p>
+        <details id="guest-details" hidden><summary>Подробности</summary><dl id="guest-facts" class="facts"></dl></details>
+        <p id="guest-keys" class="hint" hidden><kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>Q</kbd> — закрыть трансляцию</p>
         <button type="button" id="guest-stop" class="btn block" data-action="guest_stop">Отключиться</button>
       </div>
 
       <!-- Home -->
       <div id="home" class="stack wide">
-        <h1 class="title">Играть</h1>
-
-        <div id="host-card" class="card">
-          <div class="card-text"><b>Свою игру</b><small>Друг подключится и возьмёт геймпад</small></div>
-          <button type="button" id="host-start" class="btn primary block" data-action="host_start">Создать сессию</button>
-          <p id="host-result" class="line" role="status" hidden></p>
-        </div>
+        <h1 id="play-title" class="title" tabindex="-1">Играть</h1>
+        <button type="button" id="host-start" class="btn primary block" data-action="host_start">Создать сессию</button>
+        <p id="host-result" class="line" role="status" hidden></p>
 
         <form id="guest-form" class="card">
-          <div class="card-text"><b>По коду</b><small>Код присылает тот, кто создал сессию</small></div>
+          <label for="guest-code" class="field-label">Код сессии</label>
           <div class="field-wrap">
-            <input id="guest-code" class="field mono" placeholder="DL2-…" autocomplete="off" spellcheck="false" maxlength="256" aria-label="Код сессии">
-            <button type="button" class="inner" data-action="paste" aria-label="Вставить"><svg><use href="#i-paste"/></svg></button>
+            <input id="guest-code" class="field mono" placeholder="DL2-…" autocomplete="off" spellcheck="false" maxlength="256" aria-describedby="guest-result">
+            <button type="button" class="inner" data-action="paste" aria-label="Вставить код" title="Вставить код"><svg aria-hidden="true"><use href="#i-paste"/></svg></button>
           </div>
           <button type="submit" class="btn block">Подключиться</button>
           <p id="guest-result" class="line" role="status" hidden></p>
+          <button type="button" id="fix-video" class="btn small self-start" data-action="video_settings" hidden>Настройки видео</button>
         </form>
+      </div>
+
+      <div id="update-banner" class="notice" hidden>
+        <b id="update-title"></b>
+        <button type="button" class="btn small" data-action="restart">Перезапустить</button>
       </div>
     </section>
 
     <!-- Friends -->
     <section id="friends" class="view" hidden>
-      <h1 class="title">Друзья</h1>
+      <h1 id="friends-title" class="title" tabindex="-1">Друзья</h1>
 
-      <button type="button" class="me-chip" data-action="copy_handle" title="Скопировать">
-        <span id="me-avatar" class="avatar small"></span>
-        <span><b id="me-name"></b><span id="me-tag" class="tag"></span></span>
-        <svg><use href="#i-copy"/></svg>
-      </button>
-
-      <form id="add-form" class="field-wrap">
-        <input id="add-input" class="field" placeholder="ник#0000" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Добавить друга">
-        <button type="submit" id="add-button" class="inner accent" aria-label="Добавить"><svg><use href="#i-plus"/></svg></button>
+      <form id="nick-form" class="card" hidden>
+        <label for="nick-input" class="field-label">Ваш ник</label>
+        <input id="nick-input" class="field" maxlength="16" placeholder="ник" autocomplete="off" spellcheck="false" aria-describedby="nick-hint">
+        <p id="nick-hint" class="hint">3–16 символов. Латиница, цифры, _ . -</p>
+        <button type="submit" class="btn primary block">Сохранить ник</button>
       </form>
 
-      <div id="friend-sections"></div>
+      <div id="friends-content" class="stack wide" hidden>
+        <button type="button" id="me-chip" class="me-chip" data-action="copy_handle" title="Скопировать свой ник">
+          <span id="me-avatar" class="avatar small" aria-hidden="true"></span>
+          <span><b id="me-name"></b><span id="me-tag" class="tag"></span></span>
+          <svg aria-hidden="true"><use href="#i-copy"/></svg>
+        </button>
 
-      <div id="friends-empty" class="empty" hidden>
-        <b>Пока никого</b>
-        <p class="muted">Добавьте друга по нику с тегом.</p>
+        <form id="add-form" class="inline-form">
+          <input id="add-input" class="field" placeholder="ник#0000 или DLF-…" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Ник с тегом или код друга">
+          <button type="submit" id="add-button" class="btn">Добавить</button>
+        </form>
+
+        <div id="friend-sections" class="stack"></div>
+        <p id="friends-empty" class="empty muted" hidden>Список друзей пуст.</p>
       </div>
     </section>
   </main>
@@ -145,35 +125,40 @@
       <p class="section">Профиль</p>
       <div class="group">
         <form id="nick-settings" class="row">
-          <span class="label">Ник</span>
-          <input id="nick-edit" class="inline" maxlength="16" autocomplete="off" spellcheck="false" aria-label="Ник">
+          <label for="nick-edit" class="label">Ник</label>
+          <input id="nick-edit" class="inline" maxlength="16" placeholder="ник" autocomplete="off" spellcheck="false">
           <button type="submit" class="btn small">Сохранить</button>
         </form>
-        <div class="row"><span class="label">Код друга</span><span class="muted grow">запасной способ</span><button type="button" class="btn small" data-action="copy_code">Скопировать</button></div>
+        <div id="copy-friend-code" class="row" hidden><span class="label">Код друга</span><button type="button" class="btn small" data-action="copy_code">Скопировать</button></div>
       </div>
 
-      <p class="section">Видео</p>
+      <p id="video-title" class="section" tabindex="-1">Видео</p>
+      <p id="video-feedback" class="line" role="status" hidden></p>
       <div class="group">
-        <div class="row"><span class="label">Разрешение</span><span class="grow"></span>
-          <input id="width" class="inline num" inputmode="numeric" placeholder="авто" maxlength="5" aria-label="Ширина"><span class="muted">×</span>
-          <input id="height" class="inline num" inputmode="numeric" placeholder="авто" maxlength="5" aria-label="Высота"></div>
-        <div class="row"><span class="label">FPS</span><span class="grow"></span><input id="fps" class="inline num" inputmode="numeric" placeholder="авто" maxlength="3" aria-label="FPS"></div>
-        <div class="row"><span class="label">Битрейт, Мбит/с</span><span class="grow"></span><input id="bitrate" class="inline num" inputmode="numeric" placeholder="авто" maxlength="3" aria-label="Битрейт"></div>
-        <div class="row"><span class="label">Кодек</span><span class="grow"></span>
+        <div class="row"><span id="resolution-label" class="label">Разрешение</span>
+          <div class="dimensions" role="group" aria-labelledby="resolution-label">
+            <input id="width" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Ширина"><span class="muted" aria-hidden="true">×</span>
+            <input id="height" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Высота">
+          </div>
+        </div>
+        <div class="row"><label for="fps" class="label">FPS</label><input id="fps" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
+        <div class="row"><label for="bitrate" class="label">Битрейт, Мбит/с</label><input id="bitrate" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
+        <div class="row"><label for="codec" class="label">Кодек</label>
           <select id="codec" class="inline"><option value="auto">Авто</option><option value="hevc">HEVC</option><option value="av1">AV1</option><option value="h264">H.264</option></select></div>
-        <label class="row"><span class="label">YUV 4:4:4</span><span class="muted grow">чёткий текст</span><input id="yuv444" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">HDR</span><span class="grow"></span><input id="hdr" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Окно без рамки</span><span class="grow"></span><input id="windowed" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Статистика</span><span class="grow"></span><input id="stats" type="checkbox" role="switch"></label>
+        <label class="row"><span class="row-text"><span class="label">YUV 4:4:4</span><small>Цвет мелких деталей</small></span><input id="yuv444" type="checkbox" role="switch"></label>
+        <label class="row"><span class="label">HDR</span><input id="hdr" type="checkbox" role="switch"></label>
+        <label class="row"><span class="label">Окно без рамки</span><input id="windowed" type="checkbox" role="switch"></label>
+        <label class="row"><span class="label">Статистика трансляции</span><input id="stats" type="checkbox" role="switch"></label>
       </div>
 
       <p class="section">Система</p>
       <div class="group">
-        <div class="row"><span class="label">Планирование GPU</span><span id="hags-note" class="muted grow"></span><button type="button" class="btn small" data-action="graphics">Открыть</button></div>
-        <div class="row"><span class="label">Обновления</span><span id="update-note" class="muted grow"></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
-        <div class="row"><span class="label">Журналы</span><span id="version-note" class="muted grow"></span><button type="button" class="btn small" data-action="logs">Открыть</button></div>
+        <div class="row"><span class="label">Планирование GPU</span><button type="button" class="btn small" data-action="graphics" aria-label="Открыть настройки графики Windows">Открыть</button></div>
+        <div class="row"><span class="row-text"><span class="label">Обновления</span><small id="update-note"></small></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
+        <div class="row"><span class="label">Журналы</span><button type="button" class="btn small" data-action="logs" aria-label="Открыть журналы">Открыть</button></div>
       </div>
     </div>
+    <p id="settings-feedback" class="dialog-feedback" role="status" hidden></p>
   </dialog>
 
   <div id="toast" role="status" hidden></div>

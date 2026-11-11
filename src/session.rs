@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::{
     media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
     platform::{
-        HostLock, KeepAwake, WifiQuiet, background_recording, display_max_refresh, display_mode,
+        KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
         vigem_present,
     },
     protocol::{
@@ -105,9 +105,8 @@ impl Session {
         }
     }
 
-    /// `trusted`: the invite went only to a friend, so their join needs no approval.
-    pub fn host(data: PathBuf, trusted: bool) -> Self {
-        Self::start(move |worker, decision| host(worker, decision, data, trusted))
+    pub fn host(data: PathBuf) -> Self {
+        Self::start(move |worker, decision| host(worker, decision, data))
     }
 
     pub fn guest(data: PathBuf, invite: Invite, preferences: Preferences, nickname: String) -> Self {
@@ -198,14 +197,18 @@ fn report_drops(worker: &Worker, shown: &mut u64) {
     }
 }
 
-fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool) -> Result<String> {
+fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<String> {
     let address = Ipv4Addr::LOCALHOST;
-    let _lock = HostLock::acquire()?;
+    let _lock = ProcessLock::try_acquire(r"Local\DuoLink.Host.v1")
+        .context("Не удалось зарезервировать сессию хоста.")?
+        .context("На этом ПК уже открыта сессия DuoLink.")?;
     reserve_check(address)?;
     if !vigem_present() {
         worker.fact("Геймпад гостя", "Нет драйвера");
     }
-    worker.status("Готовим Sunshine…");
+    if !SUNSHINE.path(&data).is_file() {
+        worker.status("Скачиваем Sunshine…");
+    }
     let engine = SUNSHINE.ensure(&data, || worker.check())?;
     worker.check()?;
 
@@ -278,11 +281,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
     };
     // This invitation admits a single request. Once used, the listening socket closes.
     drop(listener);
-    if trusted {
-        worker.status(format!("{name} подключается…"));
-    } else {
-        worker.emit(Event::Approval(format!("{name} · {peer}")));
-    }
+    worker.emit(Event::Approval(name.clone()));
     worker.fact("Гость", format!("{name} · {peer}"));
     if background_recording() {
         worker.fact("Xbox Game Bar", "Фоновая запись включена");
@@ -302,11 +301,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf, trusted: bool)
 
     let mut last_ping = Instant::now();
     let by = Instant::now() + DECISION_TIMEOUT;
-    // A friend's invite needs no approval: only that friend ever saw the code.
     loop {
-        if trusted {
-            break;
-        }
         if worker.check().is_err() {
             let _ = wire.send(&Reply::Closed {
                 reason: "Хост закрыл сессию.".into(),
@@ -451,7 +446,9 @@ fn guest(
     mut preferences: Preferences,
     nickname: String,
 ) -> Result<String> {
-    worker.status("Готовим Moonlight…");
+    if !MOONLIGHT.path(&data).is_file() {
+        worker.status("Скачиваем Moonlight…");
+    }
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
     worker.check()?;
     let identity = Identity::generate("DuoLink Guest")?;
@@ -688,7 +685,7 @@ mod tests {
         );
         let data = data_dir().unwrap();
         let address = Ipv4Addr::LOCALHOST;
-        let host = Session::host(data.clone(), false);
+        let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(200), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),
@@ -775,7 +772,7 @@ mod tests {
             "media still listening after disconnect"
         );
 
-        let host = Session::host(data.clone(), false);
+        let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(20), |event| match event {
             Event::Invite(code) => Some(code),
             Event::Finished { message: error, .. } => panic!("{error}"),

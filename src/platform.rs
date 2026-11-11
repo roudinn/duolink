@@ -21,7 +21,7 @@ use windows_sys::{
                 SetInformationJobObject,
             },
             Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState},
-            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
+            Registry::{RRF_RT_REG_DWORD, RegGetValueW},
             Threading::{
                 ABOVE_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CreateMutexW, GetCurrentProcess,
                 GetCurrentThread, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
@@ -139,25 +139,20 @@ impl Drop for Handle {
     }
 }
 
-pub struct HostLock {
+pub struct ProcessLock {
     _handle: Handle,
 }
 
-impl HostLock {
-    pub fn acquire() -> Result<Self> {
-        let name: Vec<u16> = "Local\\DuoLink.Host.v1\0".encode_utf16().collect();
+impl ProcessLock {
+    pub fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         let error = unsafe { GetLastError() };
         if handle.is_null() {
-            return Err(io::Error::from_raw_os_error(error as i32))
-                .context("Не удалось зарезервировать сессию хоста.");
+            return Err(io::Error::from_raw_os_error(error as i32).into());
         }
         let handle = Handle(handle);
-        ensure!(
-            error != ERROR_ALREADY_EXISTS,
-            "На этом ПК уже открыта сессия DuoLink."
-        );
-        Ok(Self { _handle: handle })
+        Ok((error != ERROR_ALREADY_EXISTS).then_some(Self { _handle: handle }))
     }
 }
 
@@ -307,16 +302,6 @@ fn registry_dword(root: windows_sys::Win32::System::Registry::HKEY, key: &str, v
         )
     };
     (status == 0).then_some(data)
-}
-
-/// Hardware-accelerated GPU scheduling lets NVENC run with realtime priority.
-pub fn hags_enabled() -> Option<bool> {
-    registry_dword(
-        HKEY_LOCAL_MACHINE,
-        r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-        "HwSchMode",
-    )
-    .map(|mode| mode == 2)
 }
 
 /// Xbox Game Bar's "record what happened" keeps the GPU encoder busy in the

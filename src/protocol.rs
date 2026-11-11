@@ -86,7 +86,7 @@ impl Invite {
 
     pub fn decode(code: &str) -> Result<Self> {
         let payload = code.trim().strip_prefix(PREFIX).context(
-            "Код приглашения должен начинаться с DL2-. Обновите DuoLink на обоих ПК.",
+            "Код сессии начинается с DL2-.",
         )?;
         let bytes = URL_SAFE_NO_PAD
             .decode(payload)

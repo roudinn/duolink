@@ -1,13 +1,12 @@
 //! Friends without accounts or servers of our own.
 //!
 //! Every install owns an X25519 key pair. A user is `nickname#tag`, where the
-//! four-digit tag is derived from the public key. Three kinds of ntfy.sh
+//! four-digit tag is derived from the public key. Two kinds of ntfy.sh
 //! topics, all derived by hashing, carry everything:
 //!
 //! * directory — `nickname#tag` → public key, so friends can be added by name;
 //! * inbox — one per key; messages are sealed with AES-256-GCM under the
-//!   X25519 shared secret, which hides them and authenticates the sender;
-//! * presence — one per key; a heartbeat while DuoLink is open.
+//!   X25519 shared secret, which hides them and authenticates the sender.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -37,9 +36,7 @@ use crate::tunnel::{SIGNAL_SERVER, curl};
 const CODE_PREFIX: &str = "DLF-";
 /// Invites older than this are stale: the host's session code has expired.
 pub const INVITE_LIFETIME: u64 = 15 * 60;
-/// 72 presence posts per day, below the shared ntfy.sh quota of 250.
-pub const HEARTBEAT: Duration = Duration::from_secs(20 * 60);
-pub const ONLINE_WINDOW: u64 = HEARTBEAT.as_secs() + 4 * 60;
+const MAIL_WINDOW: u64 = 12 * 3600;
 /// ntfy.sh keeps messages for 12 hours, so the directory entry is refreshed
 /// well within that.
 pub const DIRECTORY_REFRESH: Duration = Duration::from_secs(4 * 3600);
@@ -124,7 +121,7 @@ pub struct Me {
     secret: StaticSecret,
     pub public: [u8; 32],
     pub name: String,
-    /// The user confirmed a nickname; until then DuoLink asks for one.
+    /// The user chose a public nickname for the friends directory.
     pub chosen: bool,
     path: PathBuf,
 }
@@ -156,25 +153,30 @@ impl Me {
             chosen: false,
             path,
         };
-        me.save()?;
+        me.save(&me.name, false)?;
         Ok(me)
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&self, name: &str, chosen: bool) -> Result<()> {
         let stored = StoredMe {
             secret: URL_SAFE_NO_PAD.encode(self.secret.to_bytes()),
-            name: self.name.clone(),
-            chosen: self.chosen,
+            name: name.to_owned(),
+            chosen,
         };
-        fs::create_dir_all(self.path.parent().unwrap())?;
-        fs::write(&self.path, serde_json::to_vec_pretty(&stored)?)?;
+        let parent = self.path.parent().unwrap();
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(file.as_file_mut(), &stored)?;
+        file.persist(&self.path)?;
         Ok(())
     }
 
     pub fn rename(&mut self, name: &str) -> Result<()> {
-        self.name = valid_nickname(name)?;
+        let name = valid_nickname(name)?;
+        self.save(&name, true).context("Не удалось сохранить ник.")?;
+        self.name = name;
         self.chosen = true;
-        self.save()
+        Ok(())
     }
 
     pub fn handle(&self) -> String {
@@ -325,15 +327,6 @@ impl Book {
         self.entries.retain(|f| f.public().as_ref() != Some(key));
         self.save();
     }
-
-    /// Keys whose presence we follow.
-    pub fn friend_keys(&self) -> Vec<[u8; 32]> {
-        self.entries
-            .iter()
-            .filter(|f| f.status == Status::Friend)
-            .filter_map(Friend::public)
-            .collect()
-    }
 }
 
 /* -------------------------------------------------------------- messages */
@@ -358,10 +351,6 @@ fn topic(kind: &str, data: &[u8]) -> String {
 
 pub fn inbox_topic(key: &[u8; 32]) -> String {
     topic("inbox", key)
-}
-
-fn presence_topic(key: &[u8; 32]) -> String {
-    topic("presence", key)
 }
 
 fn directory_topic(name: &str, tag: u16) -> String {
@@ -418,18 +407,6 @@ pub fn announce(me: &Me) {
     post_background(directory_topic(&me.name, tag(&me.public)), URL_SAFE_NO_PAD.encode(me.public));
 }
 
-pub fn heartbeat(key: &[u8; 32], online: bool) {
-    let topic = presence_topic(key);
-    thread::spawn(move || {
-        let _ = post_once(&topic, if online { "on" } else { "off" }, "10");
-    });
-}
-
-/// Like `heartbeat(.., false)` but waits, for use while closing.
-pub fn sign_off(key: &[u8; 32]) {
-    let _ = post_once(&presence_topic(key), "off", "3");
-}
-
 /// Finds the public key behind `name#tag`.
 pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
     let mut command = curl()?;
@@ -458,12 +435,12 @@ pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
 
 /* ----------------------------------------------------------------- inbox */
 
-pub enum Incoming {
-    Mail { time: u64, text: String },
-    Presence { key: [u8; 32], online: bool, time: u64 },
+pub struct Incoming {
+    pub time: u64,
+    pub text: String,
 }
 
-/// One long-lived subscription to our inbox and our friends' presence.
+/// One long-lived subscription to our inbox.
 pub struct Inbox {
     pub messages: Receiver<Incoming>,
     child: Arc<Mutex<Option<Child>>>,
@@ -472,12 +449,9 @@ pub struct Inbox {
 
 impl Inbox {
     /// `since`: latest mail time from the saved history.
-    pub fn listen(me: &[u8; 32], friends: &[[u8; 32]], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn listen(me: &[u8; 32], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let inbox = inbox_topic(me);
-        let presence: HashMap<String, [u8; 32]> = friends.iter().map(|key| (presence_topic(key), *key)).collect();
-        let mut topics = vec![inbox.clone()];
-        topics.extend(presence.keys().cloned());
-        let url = format!("{SIGNAL_SERVER}/{}/json", topics.join(","));
+        let url = format!("{SIGNAL_SERVER}/{inbox}/json");
 
         let (sender, messages): (Sender<Incoming>, _) = mpsc::channel();
         let child = Arc::new(Mutex::new(None::<Child>));
@@ -485,20 +459,15 @@ impl Inbox {
         {
             let (child, stop) = (child.clone(), stop.clone());
             thread::spawn(move || {
-                let mut seen = HashSet::new();
-                let clock = now();
-                let floor = clock.saturating_sub(ONLINE_WINDOW);
-                let mut cursor = since.max(floor);
-                if !presence.is_empty() {
-                    cursor = floor;
-                }
+                let mut cursor = since;
                 while !stop.load(Ordering::Relaxed) {
+                    let floor = now().saturating_sub(MAIL_WINDOW);
                     let spawned = curl().ok().and_then(|mut command| {
                         command
-                            .args(["--no-buffer", "--max-time", "900"])
+                            .args(["--fail", "--no-buffer", "--max-time", "900"])
                             // Replay the boundary second too. Multiple IDs
                             // can share that timestamp, even across reconnects.
-                            .arg(format!("{url}?since={}", cursor.saturating_sub(1)))
+                            .arg(format!("{url}?since={}", cursor.max(floor).saturating_sub(1)))
                             .stdin(Stdio::null())
                             .stdout(Stdio::piped())
                             .spawn()
@@ -520,25 +489,14 @@ impl Inbox {
                     }
                     for line in stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(Result::ok)) {
                         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                        if event["event"] != "message" {
+                        if event["event"] != "message" || event["topic"] != inbox {
                             continue;
                         }
-                        let id = event["id"].as_str().unwrap_or_default().to_string();
-                        if !seen.insert(id) {
-                            continue;
-                        }
-                        let time = event["time"].as_u64().unwrap_or_else(now);
-                        cursor = cursor.max(time);
-                        let text = event["message"].as_str().unwrap_or_default().to_string();
-                        let topic = event["topic"].as_str().unwrap_or_default();
-                        let incoming = if topic == inbox {
-                            Incoming::Mail { time, text }
-                        } else if let Some(key) = presence.get(topic) {
-                            Incoming::Presence { key: *key, online: text.trim() == "on", time }
-                        } else {
+                        let (Some(time), Some(text)) = (event["time"].as_u64(), event["message"].as_str()) else {
                             continue;
                         };
-                        if sender.send(incoming).is_err() {
+                        cursor = cursor.max(time);
+                        if sender.send(Incoming { time, text: text.to_owned() }).is_err() {
                             break;
                         }
                         wake();
@@ -572,6 +530,8 @@ impl Drop for Inbox {
 pub struct MailHistory {
     legacy_through: u64,
     received: HashMap<String, u64>,
+    #[serde(default)]
+    cancelled_invites: HashMap<String, u64>,
 }
 
 impl MailHistory {
@@ -589,8 +549,9 @@ impl MailHistory {
 
     pub fn remember(&mut self, time: u64, text: &str) -> bool {
         // Keep IDs through the replay window and the maximum POST retry time.
-        let floor = now().saturating_sub(ONLINE_WINDOW + 1);
+        let floor = now().saturating_sub(MAIL_WINDOW + 1);
         self.received.retain(|_, at| *at >= floor.saturating_sub(60));
+        self.cancelled_invites.retain(|_, at| *at >= floor);
         if time < floor || time <= self.legacy_through {
             return false;
         }
@@ -602,6 +563,14 @@ impl MailHistory {
                 true
             }
         }
+    }
+
+    pub fn cancel_invite(&mut self, id: &str, time: u64) {
+        self.cancelled_invites.insert(id.to_owned(), time);
+    }
+
+    pub fn invite_cancelled(&self, id: &str) -> bool {
+        self.cancelled_invites.contains_key(id)
     }
 
     pub fn save(&self, data: &Path) -> Result<()> {
@@ -635,6 +604,19 @@ mod tests {
         assert!(history.remember(time, "second"));
         assert!(!history.remember(time + 1, "first"));
         assert!(history.remember(time - 1, "late"));
+    }
+
+    #[test]
+    fn mail_history_keeps_cancelled_invites_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let time = now();
+        let mut history = MailHistory::default();
+        history.cancel_invite("alice-10", time);
+        history.save(dir.path()).unwrap();
+        let history = MailHistory::load(dir.path());
+        assert!(history.invite_cancelled("alice-10"));
+        assert!(!history.invite_cancelled("alice-11"));
+        assert!(!history.invite_cancelled("bob-10"));
     }
 
     #[test]
@@ -708,24 +690,23 @@ mod tests {
         book.set(&key, "mike", Status::Friend);
         let reloaded = Book::load(dir.path());
         assert_eq!(reloaded.entries[0].status, Status::Friend);
-        assert_eq!(reloaded.friend_keys(), vec![key]);
+        assert_eq!(reloaded.entries[0].public(), Some(key));
         book.set(&[8u8; 32], "<script>", Status::Incoming);
         assert_eq!(Book::load(dir.path()).find(&[8u8; 32]).unwrap().name, "friend");
         book.remove(&key);
         assert_eq!(Book::load(dir.path()).entries.len(), 1);
     }
 
-    /// Two identities: directory lookup, request, accept, invite and presence
-    /// through the real ntfy.sh.
+    /// Two identities: directory lookup and friend requests through ntfy.sh.
     #[test]
     #[ignore = "uses ntfy.sh over the internet"]
-    fn live_directory_mail_and_presence() {
+    fn live_directory_and_mail() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let suffix = &hex(&rand::random::<[u8; 3]>())[..5];
         let (alice, bob) = (me(a.path(), &format!("alice{suffix}")), me(b.path(), &format!("bob{suffix}")));
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let alice_inbox = Inbox::listen(&alice.public, &[bob.public], now(), wake.clone());
-        let bob_inbox = Inbox::listen(&bob.public, &[alice.public], now(), wake);
+        let alice_inbox = Inbox::listen(&alice.public, now(), wake.clone());
+        let bob_inbox = Inbox::listen(&bob.public, now(), wake);
         announce(&alice);
         thread::sleep(Duration::from_secs(3));
 
@@ -735,24 +716,13 @@ mod tests {
         eprintln!("lookup {} ms", started.elapsed().as_millis());
         assert!(lookup(&name, (number + 1) % 10_000).is_err());
 
-        let mail = |inbox: &Inbox, who: &Me| loop {
-            match inbox.messages.recv_timeout(Duration::from_secs(15)).expect("nothing arrived") {
-                Incoming::Mail { text, .. } => return who.open(&text).expect("cannot open"),
-                Incoming::Presence { .. } => continue,
-            }
+        let mail = |inbox: &Inbox, who: &Me| {
+            let message = inbox.messages.recv_timeout(Duration::from_secs(15)).expect("nothing arrived");
+            who.open(&message.text).expect("cannot open")
         };
         send(bob.seal(&alice.public, &Message::FriendRequest { name: bob.name.clone() }), &alice.public);
         assert_eq!(mail(&alice_inbox, &alice).0, bob.public);
         send(alice.seal(&bob.public, &Message::FriendAccept { name: alice.name.clone() }), &bob.public);
         assert!(matches!(mail(&bob_inbox, &bob).1, Message::FriendAccept { .. }));
-
-        heartbeat(&alice.public, true);
-        let online = loop {
-            match bob_inbox.messages.recv_timeout(Duration::from_secs(15)).expect("no presence") {
-                Incoming::Presence { key, online, .. } if key == alice.public => break online,
-                _ => continue,
-            }
-        };
-        assert!(online);
     }
 }

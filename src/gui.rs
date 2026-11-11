@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     fs,
     path::PathBuf,
@@ -28,8 +28,8 @@ use wry::{
 
 use crate::{
     friends::{
-        self, Book, DIRECTORY_REFRESH, HEARTBEAT, INVITE_LIFETIME, Inbox, Incoming, MailHistory, Me,
-        Message, ONLINE_WINDOW, Status,
+        self, Book, DIRECTORY_REFRESH, INVITE_LIFETIME, Inbox, Incoming, MailHistory, Me, Message,
+        Status,
     },
     media::{Form, Preferences},
     platform::{data_dir, open},
@@ -47,7 +47,6 @@ const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
     Ready,
-    Refresh,
     HostStart,
     HostStop,
     Allow,
@@ -55,8 +54,8 @@ enum Action {
     Copy,
     GuestStart { code: String, options: Form },
     GuestStop,
+    ClearCodeError,
     Paste,
-    Install,
     Graphics,
     CheckUpdate,
     Restart,
@@ -68,8 +67,8 @@ enum Action {
     CopyHandle,
     CopyCode,
     InviteFriend { id: String },
-    AcceptInvite { options: Form },
-    DeclineInvite,
+    AcceptInvite { id: String, options: Form },
+    DeclineInvite { id: String },
     /// Sent by background threads to wake the event loop.
     #[serde(skip_deserializing)]
     Wake,
@@ -81,7 +80,6 @@ struct FriendView {
     name: String,
     tag: String,
     status: Status,
-    online: bool,
     sending: bool,
 }
 
@@ -96,6 +94,7 @@ struct MeView {
 /// A friend's invite waiting for an answer.
 #[derive(Clone, Serialize)]
 struct Invitation {
+    id: String,
     name: String,
     #[serde(skip)]
     key: [u8; 32],
@@ -103,6 +102,14 @@ struct Invitation {
     code: String,
     #[serde(skip)]
     at: u64,
+    #[serde(skip)]
+    expires: u64,
+}
+
+impl Invitation {
+    fn id(key: &[u8; 32], at: u64) -> String {
+        format!("{}-{at}", friends::short_id(key))
+    }
 }
 
 /// The friend a running host session was created for.
@@ -115,8 +122,6 @@ struct HostFor {
     sent_at: Option<u64>,
     #[serde(skip)]
     joined: bool,
-    #[serde(skip)]
-    send_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -140,6 +145,7 @@ struct Pane {
     peer: String,
     error: bool,
     code_error: bool,
+    video_error: bool,
     facts: Vec<(&'static str, String)>,
     #[serde(skip)]
     session: Option<Session>,
@@ -153,6 +159,7 @@ impl Pane {
         self.peer.clear();
         self.error = false;
         self.code_error = false;
+        self.video_error = false;
     }
 
     fn begin(&mut self, session: Session, message: &str) {
@@ -164,6 +171,11 @@ impl Pane {
     fn fail(&mut self, message: impl Into<String>) {
         self.set(Phase::Idle, message);
         self.error = true;
+    }
+
+    fn fail_video(&mut self, error: anyhow::Error) {
+        self.fail(error.to_string());
+        self.video_error = true;
     }
 
     fn stop(&mut self) {
@@ -229,6 +241,7 @@ impl Pane {
 enum Job {
     Lookup { query: String, result: Result<[u8; 32]> },
     FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
+    FriendAccepted { key: [u8; 32], result: Result<()> },
     InviteSent { key: [u8; 32], at: u64, result: Result<()> },
 }
 
@@ -238,16 +251,11 @@ struct App {
     host: Pane,
     guest: Pane,
     setup: Pane,
-    components: Components,
-    /// The running setup includes the elevated step (gamepad driver, firewall).
-    full_setup: bool,
     version: &'static str,
-    /// Start hosting as soon as the running setup succeeds.
-    host_after_setup: bool,
     update: update::Status,
     me: MeView,
     friends: Vec<FriendView>,
-    invitation: Option<Invitation>,
+    invitations: Vec<Invitation>,
     host_for: Option<HostFor>,
     looking_up: bool,
     #[serde(skip)]
@@ -257,10 +265,6 @@ struct App {
     #[serde(skip)]
     inbox: Option<Inbox>,
     #[serde(skip)]
-    subscribed: Vec<[u8; 32]>,
-    #[serde(skip)]
-    presence: HashMap<[u8; 32], (u64, bool)>,
-    #[serde(skip)]
     mail_history: MailHistory,
     #[serde(skip)]
     sending_requests: HashSet<[u8; 32]>,
@@ -268,8 +272,6 @@ struct App {
     jobs: (Sender<Job>, Receiver<Job>),
     #[serde(skip)]
     wake: Arc<dyn Fn() + Send + Sync>,
-    #[serde(skip)]
-    next_presence: Option<Instant>,
     #[serde(skip)]
     attention: bool,
     #[serde(skip)]
@@ -284,18 +286,16 @@ impl App {
     fn new(data: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
         let identity = Me::load_or_create(&data)?;
         let book = Book::load(&data);
+        let updater = Updater::start(wake.clone());
         let mut app = Self {
             host: Pane::default(),
             guest: Pane::default(),
             setup: Pane::default(),
-            components: Components::detect(&data),
-            full_setup: false,
             version: env!("CARGO_PKG_VERSION"),
-            host_after_setup: false,
             update: update::Status::Idle,
             me: MeView { name: String::new(), tag: String::new(), chosen: false },
             friends: Vec::new(),
-            invitation: None,
+            invitations: Vec::new(),
             host_for: None,
             looking_up: false,
             mail_history: MailHistory::load(&data),
@@ -303,52 +303,27 @@ impl App {
             identity,
             book,
             inbox: None,
-            subscribed: Vec::new(),
-            presence: HashMap::new(),
             jobs: mpsc::channel(),
             wake,
-            next_presence: None,
             attention: false,
-            updater: Updater::start(),
+            updater,
             quit: false,
             data,
         };
-        if !app.components.engines() {
-            app.setup.begin(setup::install(app.data.clone(), false), "Загружаем компоненты…");
-        }
-        app.resubscribe();
         if app.identity.chosen {
+            app.listen();
             friends::announce(&app.identity);
         }
         app.sync();
         Ok(app)
     }
 
-    fn refresh_presence(&mut self, now: Instant) {
-        if self.identity.chosen && !self.subscribed.is_empty() {
-            if self.next_presence.is_none_or(|next| now >= next) {
-                friends::heartbeat(&self.identity.public, true);
-                self.next_presence = Some(now + HEARTBEAT);
-            }
-        } else if self.next_presence.take().is_some() {
-            friends::heartbeat(&self.identity.public, false);
-        }
-    }
-
-    /// Follows the presence of the current friend list.
-    fn resubscribe(&mut self) {
-        let keys = self.book.friend_keys();
-        if self.inbox.is_some() && keys == self.subscribed {
-            return;
-        }
-        self.inbox = Some(Inbox::listen(&self.identity.public, &keys, self.mail_history.latest(), self.wake.clone()));
-        self.subscribed = keys;
-    }
-
-    fn online(&self, key: &[u8; 32]) -> bool {
-        self.presence.get(key).is_some_and(|(seen, online)| {
-            *online && friends::now().saturating_sub(*seen) < ONLINE_WINDOW
-        })
+    fn listen(&mut self) {
+        self.inbox = Some(Inbox::listen(
+            &self.identity.public,
+            self.mail_history.latest(),
+            self.wake.clone(),
+        ));
     }
 
     /// Mirrors identity and friends into the serialized state.
@@ -362,19 +337,17 @@ impl App {
             .book
             .entries
             .iter()
-            .map(|f| {
-                let key = f.public().unwrap_or_default();
-                FriendView {
+            .filter_map(|f| {
+                let key = f.public()?;
+                Some(FriendView {
                     id: f.id(),
                     name: f.name.clone(),
                     tag: format!("{:04}", friends::tag(&key)),
                     status: f.status.clone(),
-                    online: f.status == Status::Friend && self.online(&key),
                     sending: self.sending_requests.contains(&key),
-                }
+                })
             })
             .collect();
-        self.resubscribe();
     }
 
     fn tell(&self, to: &[u8; 32], message: &Message) {
@@ -397,35 +370,43 @@ impl App {
         Some((friend, key))
     }
 
-    fn refresh(&mut self) {
-        self.components = Components::detect(&self.data);
-    }
-
-    fn start_full_setup(&mut self) {
-        // Supersede a background engine prefetch: the full setup fetches them too.
-        if let Some(prefetch) = self.setup.session.take() {
-            prefetch.cancel();
-        }
-        self.full_setup = true;
-        self.setup.begin(setup::install(self.data.clone(), true), "Готовим установку…");
+    fn session_idle(&self) -> bool {
+        self.guest.session.is_none() && self.setup.session.is_none() && self.host.session.is_none()
     }
 
     fn start_host(&mut self) {
-        let trusted = self.host_for.is_some();
-        self.host.begin(Session::host(self.data.clone(), trusted), "Создаём сессию…");
+        self.host.begin(Session::host(self.data.clone()), "Создаём сессию…");
     }
 
     /// Hosting needs the driver and firewall once; set them up first if missing.
     fn begin_hosting(&mut self) {
-        self.refresh();
-        if self.components.host_ready() {
+        let components = Components::detect();
+        if components.host_ready() {
             self.start_host();
         } else {
-            self.host_after_setup = true;
             self.host.set(Phase::Idle, "");
-            if !self.full_setup {
-                self.start_full_setup();
-            }
+            self.setup.begin(
+                setup::install(self.data.clone(), components),
+                "Готовим установку…",
+            );
+        }
+    }
+
+    fn start_guest(&mut self, invite: Invite, preferences: Preferences) {
+        let name = if self.identity.chosen { self.identity.name.clone() } else { String::new() };
+        self.guest.begin(
+            Session::guest(self.data.clone(), invite, preferences, name),
+            "Подключаемся…",
+        );
+    }
+
+    fn accept_friend(&mut self, key: [u8; 32]) {
+        if self.sending_requests.insert(key) {
+            self.send(
+                key,
+                &Message::FriendAccept { name: self.identity.name.clone() },
+                move |result| Job::FriendAccepted { key, result },
+            );
         }
     }
 
@@ -438,9 +419,7 @@ impl App {
         match self.book.find(&key).map(|f| f.status.clone()) {
             Some(Status::Friend) => toast(view, &format!("{handle} уже в друзьях."))?,
             Some(Status::Incoming) => {
-                self.book.set(&key, name, Status::Friend);
-                self.tell(&key, &Message::FriendAccept { name: self.identity.name.clone() });
-                toast(view, &format!("{handle} теперь в друзьях."))?;
+                self.accept_friend(key);
             }
             status => {
                 if !self.sending_requests.insert(key) {
@@ -461,7 +440,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_mail(&mut self, view: &WebView, from: [u8; 32], message: Message) -> Result<()> {
+    fn handle_mail(&mut self, view: &WebView, from: [u8; 32], message: Message, time: u64) -> Result<()> {
         let known = self.book.find(&from).cloned();
         let is_friend = known.as_ref().is_some_and(|f| f.status == Status::Friend);
         match message {
@@ -478,26 +457,40 @@ impl App {
                 }
             },
             Message::FriendAccept { name } => {
-                if known.is_some_and(|f| f.status != Status::Incoming) {
+                if known.is_some_and(|f| f.status == Status::Outgoing) {
                     self.book.set(&from, &name, Status::Friend);
                     toast(view, &format!("{} теперь в друзьях.", friends::handle(&name, &from)))?;
                 }
             }
-            Message::FriendRemove => self.book.remove(&from),
+            Message::FriendRemove => {
+                self.book.remove(&from);
+                self.invitations.retain(|invite| invite.key != from);
+            }
             Message::Rename { name } => {
                 if let Some(friend) = known {
                     self.book.set(&from, &name, friend.status);
                 }
             }
             Message::Invite { name, code, at } => {
-                if is_friend && friends::now().saturating_sub(at) < INVITE_LIFETIME {
+                let id = Invitation::id(&from, at);
+                let now = friends::now();
+                let expires = time.min(now).saturating_add(INVITE_LIFETIME);
+                let accepting_friend = known.is_some_and(|f| f.status == Status::Incoming)
+                    && self.sending_requests.contains(&from);
+                if (is_friend || accepting_friend)
+                    && expires > now
+                    && !self.mail_history.invite_cancelled(&id)
+                    && !self.invitations.iter().any(|invite| invite.key == from && invite.at >= at)
+                {
                     self.book.set(&from, &name, Status::Friend);
-                    self.presence.insert(from, (friends::now(), true));
-                    self.invitation = Some(Invitation {
-                        name: friends::handle(&name, &from),
+                    self.invitations.retain(|invite| invite.key != from);
+                    self.invitations.push(Invitation {
+                        id,
+                        name: self.book.find(&from).unwrap().handle(),
                         key: from,
                         code,
                         at,
+                        expires,
                     });
                     self.attention = true;
                 }
@@ -514,13 +507,13 @@ impl App {
                     toast(view, &format!("{name} отказался."))?;
                 }
             }
-            Message::InviteCancel { at } => {
-                if self.invitation.as_ref().is_some_and(|i| i.key == from && i.at == at) {
-                    self.invitation = None;
-                }
+            Message::InviteCancel { at } if is_friend || self.sending_requests.contains(&from) => {
+                let id = Invitation::id(&from, at);
+                self.mail_history.cancel_invite(&id, time);
+                self.invitations.retain(|invite| invite.id != id);
             }
+            Message::InviteCancel { .. } => {}
         }
-        self.sync();
         Ok(())
     }
 
@@ -532,8 +525,7 @@ impl App {
     fn action(&mut self, action: Action, view: &WebView) -> Result<()> {
         match action {
             Action::Ready | Action::Wake => {}
-            Action::Refresh => self.refresh(),
-            Action::HostStart if self.host.session.is_none() => {
+            Action::HostStart if self.session_idle() => {
                 self.host_for = None;
                 self.begin_hosting();
             }
@@ -541,13 +533,10 @@ impl App {
             Action::Allow => self.host.decide(true),
             Action::Deny => self.host.decide(false),
             Action::Copy if self.host.phase == Phase::Invite => copy(view, &self.host.code, "Код скопирован")?,
-            Action::GuestStart { code, options } if self.guest.session.is_none() => match Invite::decode(&code) {
+            Action::GuestStart { code, options } if self.session_idle() => match Invite::decode(&code) {
                 Ok(invite) => match Preferences::parse(&options) {
-                    Ok(preferences) => self.guest.begin(
-                        Session::guest(self.data.clone(), invite, preferences, self.identity.name.clone()),
-                        "Подключаемся…",
-                    ),
-                    Err(error) => self.guest.fail(error.to_string()),
+                    Ok(preferences) => self.start_guest(invite, preferences),
+                    Err(error) => self.guest.fail_video(error),
                 },
                 Err(error) => {
                     self.guest.fail(if code.trim().is_empty() { "Вставьте код.".into() } else { error.to_string() });
@@ -555,16 +544,16 @@ impl App {
                 }
             },
             Action::GuestStop => self.guest.stop(),
-            Action::Paste => match clipboard_win::get_clipboard_string() {
-                Ok(text) => {
+            Action::ClearCodeError if self.guest.code_error => self.guest.set(Phase::Idle, ""),
+            Action::Paste if self.session_idle() => match clipboard_win::get_clipboard_string() {
+                Ok(text) if !text.trim().is_empty() => {
                     let code: String = text.trim().chars().take(256).collect();
                     view.evaluate_script(&format!("window.duo.pasted({});", serde_json::to_string(&code)?))?;
                     self.guest.set(Phase::Idle, "");
                 }
-                Err(_) => toast(view, "Буфер обмена пуст.")?,
+                _ => toast(view, "В буфере обмена нет текста.")?,
             },
-            Action::Install if !self.full_setup => self.start_full_setup(),
-            Action::CheckUpdate => match &self.updater {
+            Action::CheckUpdate if matches!(self.update, update::Status::Idle | update::Status::Current | update::Status::Failed(_)) => match &self.updater {
                 Some(updater) => {
                     updater.check_now();
                     self.update = update::Status::Checking;
@@ -572,7 +561,7 @@ impl App {
                 None => toast(view, "В этой сборке обновления выключены.")?,
             },
             Action::Restart if matches!(self.update, update::Status::Ready(_)) => {
-                if self.host.session.is_some() || self.guest.session.is_some() {
+                if !self.session_idle() {
                     toast(view, "Сначала завершите сессию.")?;
                 } else if let Some(updater) = &self.updater {
                     match updater.relaunch() {
@@ -587,12 +576,14 @@ impl App {
                 let _ = fs::create_dir_all(&directory);
                 open_or_toast(view, directory.as_os_str())?;
             }
-            Action::SetName { name } => {
+            Action::SetName { name } if !self.identity.chosen || self.identity.name != name.trim() => {
                 let first = !self.identity.chosen;
                 match self.identity.rename(&name) {
                     Ok(()) => {
                         friends::announce(&self.identity);
-                        if !first {
+                        if first {
+                            self.listen();
+                        } else {
                             for friend in self.book.entries.iter().filter(|f| f.status != Status::Incoming) {
                                 if let Some(key) = friend.public() {
                                     self.tell(&key, &Message::Rename { name: self.identity.name.clone() });
@@ -600,11 +591,12 @@ impl App {
                             }
                         }
                         self.sync();
+                        toast(view, "Ник сохранён.")?;
                     }
                     Err(error) => toast(view, &error.to_string())?,
                 }
             }
-            Action::AddFriend { query } => {
+            Action::AddFriend { query } if self.identity.chosen => {
                 let query = query.trim().to_string();
                 if query.starts_with("DLF-") {
                     match friends::parse_code(&query) {
@@ -627,49 +619,55 @@ impl App {
                     }
                 }
             }
-            Action::AcceptFriend { id } => {
-                if let Some((friend, key)) = self.friend(&id) {
-                    self.book.set(&key, &friend.name, Status::Friend);
-                    self.tell(&key, &Message::FriendAccept { name: self.identity.name.clone() });
+            Action::AcceptFriend { id } if self.identity.chosen => {
+                if let Some((_, key)) = self.friend(&id).filter(|(f, _)| f.status == Status::Incoming) {
+                    self.accept_friend(key);
                     self.sync();
                 }
             }
             Action::RemoveFriend { id } => {
-                if let Some((_, key)) = self.friend(&id) {
+                if let Some((_, key)) = self.friend(&id).filter(|(_, key)| !self.sending_requests.contains(key)) {
                     self.book.remove(&key);
-                    self.presence.remove(&key);
+                    self.invitations.retain(|invite| invite.key != key);
                     self.tell(&key, &Message::FriendRemove);
                     self.sync();
                 }
             }
-            Action::CopyHandle => copy(view, &self.identity.handle(), "Ник скопирован")?,
-            Action::CopyCode => copy(view, &self.identity.code(), "Код друга скопирован")?,
-            Action::InviteFriend { id } if self.host.session.is_none() => {
+            Action::CopyHandle if self.identity.chosen => copy(view, &self.identity.handle(), "Ник скопирован")?,
+            Action::CopyCode if self.identity.chosen => copy(view, &self.identity.code(), "Код друга скопирован")?,
+            Action::InviteFriend { id } if self.identity.chosen && self.session_idle() => {
                 if let Some((friend, key)) = self.friend(&id).filter(|(f, _)| f.status == Status::Friend) {
                     self.host_for = Some(HostFor {
-                        name: friend.handle(), key, sent_at: None, joined: false, send_error: None,
+                        name: friend.handle(), key, sent_at: None, joined: false,
                     });
                     self.begin_hosting();
                 }
             }
-            Action::AcceptInvite { options } => {
-                if let Some(invitation) = self.invitation.take() {
-                    if self.guest.session.is_some() {
-                        toast(view, "Сначала отключитесь.")?;
-                        self.invitation = Some(invitation);
+            Action::AcceptInvite { id, options } if self.session_idle() => {
+                if let Some(index) = self.invitations.iter().position(|invite| invite.id == id) {
+                    if self.invitations[index].expires <= friends::now() {
+                        self.invitations.remove(index);
+                        self.guest.fail("Приглашение истекло.");
                     } else {
-                        match (Invite::decode(&invitation.code), Preferences::parse(&options)) {
-                            (Ok(invite), Ok(preferences)) => self.guest.begin(
-                                Session::guest(self.data.clone(), invite, preferences, self.identity.name.clone()),
-                                "Подключаемся…",
-                            ),
-                            (Err(error), _) | (_, Err(error)) => self.guest.fail(error.to_string()),
+                        match Invite::decode(&self.invitations[index].code) {
+                            Ok(invite) => match Preferences::parse(&options) {
+                                Ok(preferences) => {
+                                    self.invitations.remove(index);
+                                    self.start_guest(invite, preferences);
+                                }
+                                Err(error) => self.guest.fail_video(error),
+                            },
+                            Err(error) => {
+                                self.invitations.remove(index);
+                                self.guest.fail(error.to_string());
+                            }
                         }
                     }
                 }
             }
-            Action::DeclineInvite => {
-                if let Some(invitation) = self.invitation.take() {
+            Action::DeclineInvite { id } => {
+                if let Some(index) = self.invitations.iter().position(|invite| invite.id == id) {
+                    let invitation = self.invitations.remove(index);
                     self.tell(&invitation.key, &Message::InviteDecline { at: invitation.at });
                 }
             }
@@ -679,7 +677,9 @@ impl App {
     }
 
     fn poll(&mut self, view: &WebView) {
+        let awaiting_approval = self.host.phase == Phase::Approval;
         let (host, host_done) = self.host.poll(true);
+        self.attention |= !awaiting_approval && self.host.phase == Phase::Approval;
         let (guest, _) = self.guest.poll(false);
         let (setup, setup_done) = self.setup.poll(false);
         let mut changed = host || guest || setup;
@@ -691,15 +691,15 @@ impl App {
             }
         }
         if setup_done {
-            let full = std::mem::take(&mut self.full_setup);
-            self.refresh();
-            if full && std::mem::take(&mut self.host_after_setup) {
-                if self.setup.error {
-                    self.host_for = None;
-                    self.host.fail("Без драйвера геймпада друг не сможет играть.");
-                } else if self.host.session.is_none() {
-                    self.start_host();
-                }
+            if self.setup.error || !Components::detect().host_ready() {
+                self.host_for = None;
+                self.host.fail(if self.setup.error {
+                    self.setup.message.clone()
+                } else {
+                    "Windows не обнаружила драйвер геймпада или правило брандмауэра.".into()
+                });
+            } else {
+                self.start_host();
             }
         }
 
@@ -723,37 +723,24 @@ impl App {
             if let (Some(at), false) = (target.sent_at, target.joined) {
                 self.tell(&target.key, &Message::InviteCancel { at });
             }
-            if let Some(error) = target.send_error {
-                self.host.fail(error);
-            }
             changed = true;
         }
-        if self.invitation.as_ref().is_some_and(|i| friends::now().saturating_sub(i.at) >= INVITE_LIFETIME) {
-            self.invitation = None;
-            changed = true;
-        }
+        let count = self.invitations.len();
+        let now = friends::now();
+        self.invitations.retain(|invite| invite.expires > now);
+        changed |= self.invitations.len() != count;
 
         let incoming: Vec<Incoming> = self.inbox.as_ref().map(|i| i.messages.try_iter().collect()).unwrap_or_default();
         let mut mail_changed = false;
-        for item in incoming {
-            match item {
-                Incoming::Mail { time, text } => {
-                    if let Some((from, message)) = self.identity.open(&text)
-                        && self.mail_history.remember(time, &text)
-                    {
-                        let _ = self.handle_mail(view, from, message);
-                        mail_changed = true;
-                    }
-                }
-                Incoming::Presence { key, online, time } => {
-                    let current = self.presence.entry(key).or_insert((0, false));
-                    if time >= current.0 {
-                        *current = (time, online);
-                    }
-                }
+        for Incoming { time, text } in incoming {
+            if let Some((from, message)) = self.identity.open(&text)
+                && self.mail_history.remember(time, &text)
+            {
+                let _ = self.handle_mail(view, from, message, time);
+                mail_changed = true;
             }
-            changed = true;
         }
+        changed |= mail_changed;
         if mail_changed && self.mail_history.save(&self.data).is_err() {
             let _ = toast(view, "Не удалось сохранить историю сообщений.");
         }
@@ -785,14 +772,28 @@ impl App {
                         }
                     }
                 }
+                Job::FriendAccepted { key, result } => {
+                    self.sending_requests.remove(&key);
+                    if let Some(friend) = self.book.find(&key).filter(|entry| entry.status == Status::Incoming) {
+                        match result {
+                            Ok(()) => {
+                                let name = friend.name.clone();
+                                self.book.set(&key, &name, Status::Friend);
+                            }
+                            Err(error) => {
+                                let _ = toast(view, &error.to_string());
+                            }
+                        }
+                    }
+                }
                 Job::InviteSent { key, at, result } => {
-                    if let Some(target) = self.host_for.as_mut().filter(|target| target.key == key && target.sent_at == Some(at)) {
+                    if self.host_for.as_ref().is_some_and(|target| target.key == key && target.sent_at == Some(at)) {
                         if self.host.phase == Phase::Invite {
                             match result {
                                 Ok(()) => self.host.message = "Приглашение отправлено.".into(),
                                 Err(error) => {
-                                    target.send_error = Some(format!("{error} Попробуйте по коду."));
-                                    self.host.stop();
+                                    self.host_for = None;
+                                    self.host.message = format!("{error} Отправьте другу код сессии.");
                                 }
                             }
                         }
@@ -811,26 +812,21 @@ impl App {
         }
     }
 
-    /// Presence expires with time; refresh the list now and then.
-    fn tick(&mut self, view: &WebView) {
-        let before: Vec<bool> = self.friends.iter().map(|f| f.online).collect();
-        self.sync();
-        if self.friends.iter().map(|f| f.online).collect::<Vec<_>>() != before {
-            let _ = self.update(view);
-        }
+    fn next_invite_expiry(&self) -> Option<Instant> {
+        let expires = self.invitations.iter().map(|invite| invite.expires).min()?;
+        Some(Instant::now() + Duration::from_secs(expires.saturating_sub(friends::now())))
     }
 
     fn active(&self) -> bool {
         self.host.session.is_some()
             || self.guest.session.is_some()
             || self.setup.session.is_some()
-            || matches!(
-                self.update,
-                update::Status::Idle | update::Status::Checking | update::Status::Downloading(_)
-            ) && self.updater.is_some()
     }
 
     fn shutdown(&mut self) {
+        if let Some(updater) = &self.updater {
+            updater.stop();
+        }
         let sessions = [self.host.session.as_ref(), self.guest.session.as_ref(), self.setup.session.as_ref()];
         for session in sessions.into_iter().flatten() {
             session.cancel();
@@ -839,9 +835,6 @@ impl App {
             && let (Some(at), false) = (target.sent_at, target.joined)
         {
             friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
-        }
-        if self.next_presence.is_some() {
-            friends::sign_off(&self.identity.public);
         }
         self.inbox = None;
         let by = Instant::now() + Duration::from_secs(2);
@@ -938,7 +931,6 @@ pub fn run() -> Result<()> {
         }),
     )?;
     window.set_visible(true);
-    let mut next_tick = Instant::now() + Duration::from_secs(20);
     let mut next_announce = Instant::now() + DIRECTORY_REFRESH;
 
     event_loop.run(move |event, _, control| {
@@ -960,11 +952,6 @@ pub fn run() -> Result<()> {
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
                 let now = Instant::now();
-                app.refresh_presence(now);
-                if now >= next_tick {
-                    app.tick(&view);
-                    next_tick = now + Duration::from_secs(20);
-                }
                 if now >= next_announce {
                     if app.identity.chosen {
                         friends::announce(&app.identity);
@@ -983,8 +970,8 @@ pub fn run() -> Result<()> {
         *control = if app.active() {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(80))
         } else {
-            // Wake up now and then so presence can expire on screen.
-            ControlFlow::WaitUntil(next_tick.min(next_announce))
+            let deadline = app.next_invite_expiry().map_or(next_announce, |expires| expires.min(next_announce));
+            ControlFlow::WaitUntil(deadline)
         };
     });
 }
