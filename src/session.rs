@@ -497,6 +497,10 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             next_log = Instant::now() + Duration::from_millis(50);
             if stream.ready(address)? {
                 engine_ready = true;
+                stream.scan_problem();
+                if let Some(problem) = stream.problem() {
+                    worker.fact("Sunshine", problem);
+                }
             } else {
                 ensure!(Instant::now() < engine_by, "Sunshine не запустился. Подробности в host.log.");
             }
@@ -522,6 +526,11 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                 engine_ready = false;
                 engine_by = Instant::now() + START_TIMEOUT;
             } else {
+                if let Some(problem) = stream.problem() {
+                    let mut guest = guests.remove(at);
+                    close(&mut guest.wire, problem);
+                    continue;
+                }
                 tunnel.stop_probes();
                 wifi.get_or_insert_with(|| quiet_wifi(worker));
                 let guest = &guests[at];

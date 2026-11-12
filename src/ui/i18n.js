@@ -66,6 +66,8 @@ const EN = Object.freeze({
   "Отключаемся": "Disconnecting",
   "Отменить": "Cancel",
   "мс": "ms",
+  "Sunshine на ПК хоста не смог прочитать свои файлы. Хосту: пришлите файл host.log из папки журналов DuoLink.": "Sunshine on the host PC could not read its files. Host: send the host.log file from DuoLink's logs folder.",
+  "Sunshine": "Sunshine",
   "Создаём лобби": "Creating lobby",
   "Лобби": "Lobby",
   "Отправьте код друзьям.": "Send the code to your friends.",

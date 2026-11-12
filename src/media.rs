@@ -220,13 +220,68 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
     )
 }
 
+/// Removes what earlier sessions left in `base`: Sunshine may still hold a file
+/// when its folder is deleted, and the folder holds a session key. Only one host
+/// session runs per PC, so nothing else here is in use.
+fn sweep(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("duolink-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn is_ascii_path(path: &Path) -> bool {
+    path.to_str().is_some_and(str::is_ascii)
+}
+
+/// Where Sunshine finds this session's files: the folder, the name its config
+/// uses for it, and the config file argument.
+///
+/// Sunshine opens `apps.json` and `state.json` through narrow (ANSI) paths. Under
+/// a Windows user name with other than Latin letters (for example "Пользователь")
+/// that fails: it starts with no trusted guest and every guest is "not paired".
+/// For such paths the session files go to a Latin-only folder instead.
+fn session_folder(config: &Path) -> Result<(TempDir, String, String)> {
+    if !is_ascii_path(config) {
+        let roots = ["ProgramData", "PUBLIC", "SystemDrive"].into_iter().filter_map(|variable| {
+            let base = std::env::var_os(variable).map(PathBuf::from)?;
+            let base = if variable == "SystemDrive" { PathBuf::from(format!("{}\\", base.display())) } else { base };
+            Some(base.join("DuoLink").join("host"))
+        });
+        for base in roots {
+            if !is_ascii_path(&base) || fs::create_dir_all(&base).is_err() {
+                continue;
+            }
+            sweep(&base);
+            if let Ok(directory) = Builder::new().prefix("duolink-").tempdir_in(&base) {
+                let full = directory.path().to_string_lossy().replace('\\', "/");
+                if full.is_ascii() {
+                    let conf = format!("{full}/sunshine.conf");
+                    return Ok((directory, full, conf));
+                }
+            }
+        }
+    }
+    sweep(config);
+    let directory = Builder::new().prefix("duolink-").tempdir_in(config)?;
+    let rel = directory.path().file_name().unwrap().to_string_lossy().into_owned();
+    let conf = format!("config/{rel}/sunshine.conf");
+    Ok((directory, rel, conf))
+}
+
 pub struct HostStream {
     process: Process,
     _directory: TempDir,
     output: PathBuf,
     offset: u64,
     tail: String,
+    problem: bool,
 }
+
+/// Shown to the host and to guests when Sunshine started without its files.
+pub const SUNSHINE_FILES: &str = "Sunshine на ПК хоста не смог прочитать свои файлы. Хосту: пришлите файл host.log из папки журналов DuoLink.";
 
 impl HostStream {
     #[allow(clippy::too_many_arguments)]
@@ -244,8 +299,8 @@ impl HostStream {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
         fs::create_dir_all(&config)?;
-        let directory = Builder::new().prefix("duolink-").tempdir_in(&config)?;
-        let rel = directory.path().file_name().unwrap().to_string_lossy();
+        let (directory, rel, conf_arg) = session_folder(&config)?;
+        let rel = rel.as_str();
         fs::write(directory.path().join("server.pem"), &identity.cert_pem)?;
         fs::write(directory.path().join("server.key"), &identity.key_pem)?;
         fs::write(
@@ -266,13 +321,13 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            host_config(&rel, address, fec, refresh_hz),
+            host_config(rel, address, fec, refresh_hz),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
             Command::new(exe)
                 .current_dir(root)
-                .arg(format!("config/{rel}/sunshine.conf"))
+                .arg(&conf_arg)
                 .stdin(Stdio::null())
                 .stdout(output.try_clone()?)
                 .stderr(output),
@@ -284,7 +339,20 @@ impl HostStream {
             output: output_path,
             offset: 0,
             tail: String::new(),
+            problem: false,
         })
+    }
+
+    /// Reads what Sunshine printed while starting: files it could not open mean
+    /// no trusted guest and no app, however the rest looks.
+    pub fn scan_problem(&mut self) {
+        if let Ok(log) = fs::read(&self.output) {
+            self.problem = String::from_utf8_lossy(&log).contains("cannot open file");
+        }
+    }
+
+    pub fn problem(&self) -> Option<&'static str> {
+        self.problem.then_some(SUNSHINE_FILES)
     }
 
     pub fn ready(&mut self, address: Ipv4Addr) -> Result<bool> {
@@ -678,6 +746,21 @@ fn guest_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sunshine_files_avoid_non_latin_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let config = base.path().join("Пользователь").join("config");
+        fs::create_dir_all(&config).unwrap();
+        let (directory, rel, conf) = session_folder(&config).unwrap();
+        assert!(rel.is_ascii() && conf.is_ascii(), "{rel} {conf}");
+        assert!(directory.path().is_dir());
+        // A Latin path keeps the short form Sunshine resolves under its config folder.
+        let plain = base.path().join("plain").join("config");
+        fs::create_dir_all(&plain).unwrap();
+        let (_, rel, conf) = session_folder(&plain).unwrap();
+        assert!(!rel.contains('/') && conf == format!("config/{rel}/sunshine.conf"));
+    }
 
     fn form(width: &str, height: &str, fps: &str, bitrate: &str) -> Form {
         Form {
