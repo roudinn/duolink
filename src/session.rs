@@ -692,6 +692,25 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     Ok(reason.into())
 }
 
+/// Why Moonlight gave up, from its own log: the generic message says nothing
+/// the player can act on.
+fn moonlight_failure(data: &std::path::Path) -> String {
+    let log = std::fs::read(data.join("logs").join("guest.log")).unwrap_or_default();
+    explain_moonlight_log(&String::from_utf8_lossy(&log)).into()
+}
+
+fn explain_moonlight_log(log: &str) -> &'static str {
+    if log.contains("Found unexpected PC") {
+        // The host answered with another identity: a different DuoLink
+        // version, or a leftover Sunshine from an earlier session.
+        "У хоста другая версия DuoLink или остался старый процесс. Пусть хост выйдет из DuoLink через значок в трее, обновит программу и создаст лобби заново."
+    } else if log.contains("Не удалось подключиться") || log.contains("Failed to connect") {
+        "Moonlight не смог подключиться к хосту. Проверьте, что у хоста открыто лобби и стоит та же версия DuoLink."
+    } else {
+        "Moonlight закрылся с ошибкой. Подробности в guest.log."
+    }
+}
+
 pub(crate) fn clean_name(name: &str) -> String {
     let result: String = name
         .trim()
@@ -808,7 +827,7 @@ fn guest(
             if status.success() && streaming {
                 return Ok("Поток закрыт.".into());
             }
-            bail!("Moonlight закрылся с ошибкой. Подробности в guest.log.");
+            bail!("{}", moonlight_failure(&data));
         }
         if !tunnel.alive() || last_pong.elapsed() > SILENCE {
             // The host may have said goodbye just before the tunnel closed.
@@ -908,6 +927,15 @@ fn guest(
 mod tests {
     use super::*;
     use crate::platform::data_dir;
+
+    #[test]
+    fn moonlight_failures_are_explained() {
+        let mismatch = "00:00:02 - Qt Info: Found unexpected PC \"DuoLink\" looking for \"DuoLink\"
+                        00:00:31 - Qt Critical: Не удалось подключиться к c5e7d281";
+        assert!(explain_moonlight_log(mismatch).contains("другая версия DuoLink"));
+        assert!(explain_moonlight_log("Qt Critical: Failed to connect to x").contains("не смог подключиться"));
+        assert!(explain_moonlight_log("").contains("guest.log"));
+    }
 
     #[test]
     fn a_failed_reply_only_removes_its_guest() {

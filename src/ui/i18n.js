@@ -162,6 +162,8 @@ const EN = Object.freeze({
   "Sunshine не запустился. Подробности в host.log.": "Sunshine couldn't start. See host.log.",
   "Не найдена папка Sunshine.": "The Sunshine folder is missing.",
   "Moonlight закрылся с ошибкой. Подробности в guest.log.": "Moonlight exited with an error. See guest.log.",
+  "У хоста другая версия DuoLink или остался старый процесс. Пусть хост выйдет из DuoLink через значок в трее, обновит программу и создаст лобби заново.": "The host has a different DuoLink version or a leftover process. Ask the host to quit DuoLink from the tray icon, update it and create the lobby again.",
+  "Moonlight не смог подключиться к хосту. Проверьте, что у хоста открыто лобби и стоит та же версия DuoLink.": "Moonlight could not connect to the host. Check that the host's lobby is open and runs the same DuoLink version.",
   "Сообщение слишком длинное.": "The message is too long.",
   "Соединение закрыто.": "Connection closed.",
   "Неверный формат сообщения DuoLink.": "Invalid DuoLink message.",
