@@ -25,7 +25,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-use crate::platform::{ProcessLock, run_tool, system_tool};
+use crate::platform::{ProcessLock, system_tool};
 
 const REPOSITORY: &str = "roudinn/duolink";
 const ASSET: &str = "DuoLink.exe";
@@ -98,7 +98,13 @@ struct Release {
     version: String,
     url: String,
     sha256: String,
+    size: u64,
 }
+
+/// Parallel ranges: GitHub's CDN sometimes hands one connection a few hundred
+/// KB/s while the next gets megabytes, so several connections finish in about
+/// the time of the fastest.
+const PARTS: u64 = 4;
 
 fn latest() -> Result<Release> {
     let output = curl()?.args([
@@ -131,6 +137,7 @@ fn latest() -> Result<Release> {
         version: version.trim_start_matches('v').to_string(),
         url: url.to_string(),
         sha256: sha256.to_ascii_lowercase(),
+        size: asset["size"].as_u64().unwrap_or(0),
     })
 }
 
@@ -148,7 +155,73 @@ fn sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn install(exe: &Path, release: &Release, stopping: &Mutex<bool>) -> Result<()> {
+/// Downloads `release` into `target` over several connections at once.
+/// A connection slower than 100 KB/s for 4 s is dropped and opened again.
+fn download(release: &Release, target: &Path, progress: &dyn Fn(u8), stopping: &Mutex<bool>) -> Result<()> {
+    let cancelled = || -> Result<()> {
+        ensure!(!*stopping.lock().unwrap(), "Обновление отменено.");
+        Ok(())
+    };
+    let parts = if release.size >= 1 << 20 { PARTS } else { 1 };
+    let chunk = release.size.div_ceil(parts).max(1);
+    let files: Vec<PathBuf> = (0..parts).map(|i| target.with_extension(format!("part{i}"))).collect();
+    let mut running = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let mut command = curl()?;
+        command
+            .args(["--max-time", "300", "--retry", "5", "--retry-all-errors", "--retry-delay", "0"])
+            .args(["--speed-limit", "100000", "--speed-time", "4"]);
+        if parts > 1 {
+            let start = i as u64 * chunk;
+            let end = (start + chunk).min(release.size) - 1;
+            command.args(["--range", &format!("{start}-{end}")]);
+        }
+        let child = command
+            .arg("--output")
+            .arg(file)
+            .arg(&release.url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Не удалось запустить загрузку.")?;
+        running.push(child);
+    }
+    let result = (|| -> Result<()> {
+        loop {
+            cancelled()?;
+            let mut done = true;
+            for child in &mut running {
+                match child.try_wait()? {
+                    Some(status) => ensure!(status.success(), "Не удалось скачать обновление."),
+                    None => done = false,
+                }
+            }
+            if release.size > 0 {
+                let have: u64 = files.iter().filter_map(|f| fs::metadata(f).ok()).map(|m| m.len()).sum();
+                progress((have * 100 / release.size).min(99) as u8);
+            }
+            if done {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+    })();
+    if result.is_err() {
+        for child in &mut running {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    result?;
+    let mut whole = File::create(target)?;
+    for file in &files {
+        std::io::copy(&mut File::open(file)?, &mut whole)?;
+        let _ = fs::remove_file(file);
+    }
+    Ok(())
+}
+
+fn install(exe: &Path, release: &Release, progress: &dyn Fn(u8), stopping: &Mutex<bool>) -> Result<()> {
     let _lock = update_lock(exe)?.context("Обновление уже выполняется в другом окне.")?;
     if sha256(exe)? == release.sha256 {
         return Ok(());
@@ -156,18 +229,7 @@ fn install(exe: &Path, release: &Release, stopping: &Mutex<bool>) -> Result<()> 
     let parent = exe.parent().context("Нет папки программы.")?;
     let stage = tempfile::Builder::new().prefix(".update-").tempdir_in(parent)?;
     let staged = stage.path().join(ASSET);
-    run_tool(
-        curl()?
-            .args(["--max-time", "300", "--output"])
-            .arg(&staged)
-            .arg(&release.url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        || {
-            ensure!(!*stopping.lock().unwrap(), "Обновление отменено.");
-            Ok(())
-        },
-    ).context("Не удалось скачать обновление.")?;
+    download(release, &staged, progress, stopping).context("Не удалось скачать обновление.")?;
     ensure!(sha256(&staged)? == release.sha256, "Контрольная сумма обновления не совпала.");
     let mut header = [0u8; 2];
     File::open(&staged)?.read_exact(&mut header)?;
@@ -198,7 +260,16 @@ fn check(exe: &Path, report: impl Fn(Status), stopping: &Mutex<bool>) -> Status 
         return Status::Current;
     }
     report(Status::Downloading(release.version.clone()));
-    match install(exe, &release, stopping) {
+    let shown = Mutex::new(0u8);
+    let progress = |percent: u8| {
+        // Every 5 %, so the window is not redrawn for every block.
+        let mut last = shown.lock().unwrap();
+        if percent >= *last + 5 {
+            *last = percent;
+            report(Status::Downloading(format!("{} · {percent} %", release.version)));
+        }
+    };
+    match install(exe, &release, &progress, stopping) {
         Ok(()) => Status::Ready(release.version),
         Err(error) => Status::Failed(format!("{error:#}")),
     }
@@ -306,7 +377,9 @@ mod tests {
         let release = latest().unwrap();
         eprintln!("latest release {} sha256 {}", release.version, release.sha256);
         let stopping = Mutex::new(false);
-        install(&exe, &release, &stopping).unwrap();
+        let started = std::time::Instant::now();
+        install(&exe, &release, &|p| eprintln!("{p} %"), &stopping).unwrap();
+        eprintln!("downloaded in {:?}", started.elapsed());
         assert_eq!(sha256(&exe).unwrap(), release.sha256);
         assert_eq!(fs::read(old_path(&exe)).unwrap(), b"MZ old build");
         assert_eq!(fs::read_dir(folder.path()).unwrap().count(), 2);
@@ -314,7 +387,7 @@ mod tests {
         // A tampered digest must leave the installed exe untouched.
         let installed = sha256(&exe).unwrap();
         let bad = Release { sha256: "0".repeat(64), ..release };
-        assert!(install(&exe, &bad, &stopping).is_err());
+        assert!(install(&exe, &bad, &|_| {}, &stopping).is_err());
         assert_eq!(sha256(&exe).unwrap(), installed);
         assert_eq!(fs::read_dir(folder.path()).unwrap().count(), 2);
     }
