@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::PathBuf,
@@ -17,16 +18,20 @@ use uuid::Uuid;
 
 use crate::{
     audio::{AUDIO_PORT, AudioRecipient, GuestAudio, HostAudio, voice_app},
-    media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
+    media::{
+        DEFAULT_FEC, GuestStream, HostStream, MAX_BITRATE_KBPS, MIN_AUTO_BITRATE_KBPS, MOONLIGHT,
+        PATH_SHARE, Preferences, SUNSHINE, UNMEASURED_BITRATE_KBPS, fec_for_loss, lobby_bitrate_limit, lobby_wire_budget,
+        stream_wire_kbps,
+    },
     platform::{
         KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
         vigem_present,
     },
     protocol::{
-        CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config,
-        new_token, valid_pem,
+        CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Reply, Request, StreamBandwidth, Wire,
+        client_config, new_token, valid_pem,
     },
-    tunnel::{GuestTunnel, HostTunnel, PROBE_MBPS, describe_peer, dropped},
+    tunnel::{GuestTunnel, HostTunnel, PROBE_MBPS, PeerNetwork, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -244,11 +249,25 @@ struct Guest {
     port: u16,
     fec: Option<u8>,
     audio_opus: bool,
+    network: PeerNetwork,
+    bandwidth: Option<StreamBandwidth>,
+    bitrate_kbps: u32,
     state: PlayerState,
     /// Ready has gone out; Sunshine's next "client connected" is this guest.
     sent_ready: bool,
     since: Instant,
     last_ping: Instant,
+}
+
+impl Guest {
+    /// Allow for DuoLink's separate audio stream on top of the Sunshine request.
+    fn audio_kbps(&self, own_audio: bool) -> u32 {
+        match (own_audio, self.audio_opus) {
+            (false, _) => 0,
+            (true, true) => 256,
+            (true, false) => 1_700,
+        }
+    }
 }
 
 struct Knock {
@@ -352,6 +371,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut joined_once = false;
     let mut knocks: Vec<Knock> = Vec::new();
     let mut guests: Vec<Guest> = Vec::new();
+    let mut capacity_by_network = HashMap::<PeerNetwork, u32>::new();
     let mut next_id = 1u32;
     let mut shown: Vec<Player> = Vec::new();
     let mut audio_recipients: Vec<AudioRecipient> = Vec::new();
@@ -413,6 +433,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             continue;
                         }
                         joined_once = true;
+                        tunnel.manage_guest(knock.port);
                         guests.push(Guest {
                             id: next_id,
                             wire: knock.wire,
@@ -420,6 +441,11 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             port: knock.port,
                             fec: wanted,
                             audio_opus,
+                            network: tunnel.link(knock.port).map_or(PeerNetwork::Internet, |link| {
+                                PeerNetwork::from_address(link.address)
+                            }),
+                            bandwidth: None,
+                            bitrate_kbps: 0,
                             state: PlayerState::Waiting,
                             sent_ready: false,
                             since: Instant::now(),
@@ -498,17 +524,54 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             } else {
                 tunnel.stop_probes();
                 wifi.get_or_insert_with(|| quiet_wifi(worker));
+                let guest = &guests[at];
+                let own_audio = audio.is_some();
+                let measured = guest.bandwidth.and_then(|report| report.path_kbps);
+                let capacity = measured.max(capacity_by_network.get(&guest.network).copied());
+                let reserved = guests
+                    .iter()
+                    .filter(|other| other.sent_ready && other.network == guest.network)
+                    .map(|other| stream_wire_kbps(other.bitrate_kbps, other.audio_kbps(own_audio)))
+                    .fold(0, u32::saturating_add);
+                let auto_bitrate_kbps = guest.bandwidth.map(|_| {
+                    if guest.network == PeerNetwork::ThisPc {
+                        return MAX_BITRATE_KBPS;
+                    }
+                    lobby_bitrate_limit(capacity, reserved, guest.audio_kbps(own_audio))
+                });
+                let bitrate_kbps = guest
+                    .bandwidth
+                    .and_then(|report| report.manual_kbps)
+                    .or(auto_bitrate_kbps)
+                    .unwrap_or(UNMEASURED_BITRATE_KBPS);
+                // A manual choice stays exact, but must fit the shared uplink.
+                // Legacy clients do not advertise/accept a cap; their estimated
+                // reservation is still charged to every subsequent modern guest.
+                if guest.network != PeerNetwork::ThisPc && guest.bandwidth.is_some()
+                    && (bitrate_kbps < MIN_AUTO_BITRATE_KBPS
+                        || stream_wire_kbps(bitrate_kbps, guest.audio_kbps(own_audio))
+                            > lobby_wire_budget(capacity).saturating_sub(reserved))
+                {
+                    let mut guest = guests.remove(at);
+                    close(&mut guest.wire, "Канал хоста занят. Снизьте битрейт или подключитесь позже.");
+                    continue;
+                }
                 let reply = Reply::Ready {
                     host: host_id,
                     certificate: identity.cert_pem.clone(),
                     mode,
-                    own_audio: audio.is_some(),
-                    audio_opus: audio.is_some() && guests[at].audio_opus,
+                    own_audio,
+                    audio_opus: own_audio && guest.audio_opus,
+                    auto_bitrate_kbps,
                     client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
                 };
                 if let Some(guest) = reply_to_guest(&mut guests, at, &reply) {
                     guest.sent_ready = true;
                     guest.since = Instant::now();
+                    guest.bitrate_kbps = bitrate_kbps;
+                    if let Some(capacity) = capacity {
+                        capacity_by_network.insert(guest.network, capacity);
+                    }
                 }
             }
         }
@@ -530,8 +593,24 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                         guest.last_ping = Instant::now();
                         guest.wire.send(&Reply::Pong).is_ok()
                     }
-                    Ok(Some(Request::Measured { fec })) => {
+                    Ok(Some(Request::Measured { fec, bandwidth })) => {
                         guest.fec = Some(fec);
+                        if !guest.sent_ready {
+                            guest.bandwidth = bandwidth.map(|report| StreamBandwidth {
+                                path_kbps: report.path_kbps
+                                    .filter(|&kbps| kbps > 0)
+                                    .map(|kbps| kbps.min(PROBE_MBPS * 1_000)),
+                                manual_kbps: report.manual_kbps
+                                    .filter(|kbps| (MIN_AUTO_BITRATE_KBPS..=MAX_BITRATE_KBPS).contains(kbps)),
+                            });
+                        }
+                        guest.last_ping = Instant::now();
+                        true
+                    }
+                    Ok(Some(Request::Bitrate { kbps })) if guest.sent_ready && guest.bandwidth.is_some() => {
+                        if (MIN_AUTO_BITRATE_KBPS..=guest.bitrate_kbps).contains(&kbps) {
+                            guest.bitrate_kbps = kbps;
+                        }
                         guest.last_ping = Instant::now();
                         true
                     }
@@ -546,6 +625,14 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             } else {
                 index += 1;
             }
+        }
+
+        // A removed lobby entry must also stop video and virtual input, even
+        // when its client ignores Closed or loses only the control connection.
+        tunnel.retain_guests(&guests.iter().map(|guest| guest.port).collect::<Vec<_>>());
+        if guests.iter().all(|guest| !guest.sent_ready) {
+            tunnel.resume_probes();
+            capacity_by_network.clear();
         }
 
         // The window: who is here, and how far away, ten times a second.
@@ -566,7 +653,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     name: guest.name.clone(),
                     state: guest.state,
                     latency: link.map(|link| link.rtt.as_secs_f64() * 1000.0),
-                    place: link.map_or("", |link| describe_peer(link.address)),
+                    place: link.map_or("", |_| guest.network.label()),
                 });
             }
             if let Some(audio) = &audio {
@@ -667,7 +754,7 @@ fn guest(
     .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");
     let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
-    let path_mbps = channel.map(|c| c.mbps);
+    let path_kbps = channel.map(|c| (c.mbps * 1_000.0) as u32);
     if let Some(channel) = channel {
         worker.fact(
             "Канал",
@@ -693,7 +780,10 @@ fn guest(
         }
         None => DEFAULT_FEC,
     };
-    wire.send(&Request::Measured { fec }).context("Не удалось связаться с хостом.")?;
+    wire.send(&Request::Measured {
+        fec,
+        bandwidth: Some(StreamBandwidth { path_kbps, manual_kbps: preferences.bitrate }),
+    }).context("Не удалось связаться с хостом.")?;
     worker.status("Ждём, пока хост разрешит…");
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
     let mut next_latency = Instant::now();
@@ -758,6 +848,7 @@ fn guest(
                 mode,
                 own_audio,
                 audio_opus,
+                auto_bitrate_kbps,
                 client: Some(client),
             }) if stream.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let desktop = display_mode().ok();
@@ -766,18 +857,16 @@ fn guest(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Хост прислал неверные данные."
                 );
-                // Highest visible quality, unless a frame could not cross the
-                // measured path in half a frame interval.
-                let (bitrate, capped) = preferences.auto_bitrate(mode, path_mbps);
+                let (bitrate, capped) = preferences.auto_bitrate(mode, path_kbps, auto_bitrate_kbps);
+                if auto_bitrate_kbps.is_some() {
+                    wire.send(&Request::Bitrate { kbps: bitrate })?;
+                }
                 preferences.bitrate = Some(bitrate);
                 worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
+                let rate = format!("{:.1} Мбит/с", bitrate as f64 / 1_000.0);
                 worker.fact(
                     "Битрейт",
-                    if capped {
-                        format!("{} Мбит/с · по каналу", bitrate.div_ceil(1000))
-                    } else {
-                        format!("{} Мбит/с", bitrate.div_ceil(1000))
-                    },
+                    if capped { format!("{rate} · по каналу") } else { rate },
                 );
                 worker.fact("Кодек", preferences.codec.label());
                 worker.status("Открываем игру…");
@@ -842,6 +931,9 @@ mod tests {
                 port: from.port(),
                 fec: Some(DEFAULT_FEC),
                 audio_opus: false,
+                network: PeerNetwork::ThisPc,
+                bandwidth: None,
+                bitrate_kbps: 0,
                 state: PlayerState::Starting,
                 sent_ready: false,
                 since: now,
@@ -1083,6 +1175,31 @@ mod tests {
         thread::sleep(Duration::from_secs(2));
         let host_log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
         assert!(host_log.matches("CLIENT CONNECTED").count() >= 2, "second stream did not connect");
+
+        // Optional GPU integration: spectators are not limited by four XInput slots.
+        let mut spectators = Vec::new();
+        if std::env::var_os("DUOLINK_TEST_SPECTATORS").is_some() {
+            for number in 3..=5 {
+                let spectator = Session::guest(data.clone(), Invite::decode(&code).unwrap(), prefs, format!("Зритель {number}"));
+                let id = waiting(&host);
+                host.decide(id, true);
+                until(&spectator, Duration::from_secs(50), |event| match event {
+                    Event::Streaming => Some(String::new()),
+                    Event::Finished { message: error, .. } => panic!("{error}"),
+                    _ => None,
+                });
+                spectators.push(spectator);
+            }
+            thread::sleep(Duration::from_secs(3));
+            assert!(spectators.iter().all(|session| !session.finished()));
+            assert!(std::fs::read_to_string(data.join("logs/host.log")).unwrap().matches("CLIENT CONNECTED").count() >= 5);
+            for spectator in &spectators { spectator.cancel(); }
+            for spectator in &spectators {
+                until(spectator, Duration::from_secs(10), |event| match event {
+                    Event::Finished { .. } => Some(String::new()), _ => None,
+                });
+            }
+        }
 
         // The first guest leaves; the lobby stays and the second keeps playing.
         guest.cancel();

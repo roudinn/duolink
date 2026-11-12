@@ -1,0 +1,23 @@
+
+running 1 test
+BEFORE v1.12.3 policy: 4200 + 15000 + 15000 kbps; loss_every=0
+guest=0, packet_ms p50=255.102 p95=256.659 p99=257.094, frame_ms p50=255.842 p95=256.744 p99=257.094, gaps>50ms=13, complete=277, partial=296
+guest=1, packet_ms p50=255.845 p95=257.199 p99=257.565, frame_ms p50=NaN p95=NaN p99=NaN, gaps>50ms=0, complete=0, partial=567
+guest=2, packet_ms p50=256.067 p95=257.229 p99=257.565, frame_ms p50=NaN p95=NaN p99=NaN, gaps>50ms=0, complete=0, partial=557
+shaper dropped=16774 UDP packets (queue + configured loss)
+AFTER: wire rates [5526, 1456], one late guest refused; loss_every=0
+guest=0, packet_ms p50=8.436 p95=10.054 p99=10.463, frame_ms p50=9.518 p95=10.366 p99=10.651, gaps>50ms=0, complete=577, partial=0
+guest=1, packet_ms p50=8.570 p95=9.935 p99=10.554, frame_ms p50=8.570 p95=9.935 p99=10.554, gaps>50ms=0, complete=577, partial=0
+shaper dropped=0 UDP packets (queue + configured loss)
+BEFORE v1.12.3 policy: 4200 + 15000 + 15000 kbps; loss_every=100
+guest=0, packet_ms p50=255.011 p95=256.679 p99=257.083, frame_ms p50=255.815 p95=256.814 p99=257.161, gaps>50ms=14, complete=272, partial=305
+guest=1, packet_ms p50=255.870 p95=257.098 p99=257.469, frame_ms p50=NaN p95=NaN p99=NaN, gaps>50ms=0, complete=0, partial=571
+guest=2, packet_ms p50=255.968 p95=257.162 p99=257.648, frame_ms p50=NaN p95=NaN p99=NaN, gaps>50ms=0, complete=0, partial=552
+shaper dropped=16838 UDP packets (queue + configured loss)
+AFTER: wire rates [5526, 1456], one late guest refused; loss_every=100
+guest=0, packet_ms p50=8.418 p95=9.978 p99=10.462, frame_ms p50=9.477 p95=10.375 p99=10.708, gaps>50ms=0, complete=544, partial=33
+guest=1, packet_ms p50=8.579 p95=10.067 p99=10.656, frame_ms p50=8.579 p95=10.067 p99=10.656, gaps>50ms=0, complete=576, partial=0
+shaper dropped=44 UDP packets (queue + configured loss)
+test tunnel::network_qa::constrained_shared_upload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 28.98s

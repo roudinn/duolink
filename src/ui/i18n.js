@@ -76,6 +76,7 @@ const EN = Object.freeze({
   "Позван": "Invited",
   "Игроки": "Players",
   "Хост отключил вас.": "The host removed you.",
+  "Канал хоста занят. Снизьте битрейт или подключитесь позже.": "The host's upload is full. Lower the bitrate or try again later.",
   "Лобби заполнено.": "The lobby is full.",
   "На ПК хоста нет свободных слотов для геймпадов.": "The host PC has no free controller slots.",
   "Обновите DuoLink: у хоста новая версия.": "Update DuoLink: the host has a newer version.",
