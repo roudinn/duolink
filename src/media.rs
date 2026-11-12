@@ -384,6 +384,7 @@ const QUALITY_SCALE: f64 = 1.5;
 /// frame is at most bitrate/fps, so at 35 % of the path it crosses the link in
 /// about a third of a frame interval, and the router never builds a queue.
 pub const PATH_SHARE: f64 = 0.35;
+const UNMEASURED_BITRATE_KBPS: u32 = 15_000;
 
 impl Preferences {
     pub fn parse(form: &Form) -> Result<Self> {
@@ -461,10 +462,10 @@ impl Preferences {
         }
         match path_mbps {
             Some(mbps) => {
-                let budget = ((mbps * PATH_SHARE * 1000.0) as u32).max(3_000);
+                let budget = ((mbps * PATH_SHARE * 1000.0) as u32).max(500);
                 if budget < ceiling { (budget, true) } else { (ceiling, false) }
             }
-            None => (ceiling, false),
+            None => (ceiling.min(UNMEASURED_BITRATE_KBPS), false),
         }
     }
 }
@@ -686,10 +687,10 @@ mod tests {
         let fhd = m(1920, 1080, 60);
         assert_eq!(prefs.bitrate_for(fhd), 30_000);
         assert_eq!(prefs.bitrate_for(m(7680, 4320, 240)), MAX_BITRATE_KBPS);
-        assert_eq!(prefs.auto_bitrate(fhd, None), (30_000, false));
+        assert_eq!(prefs.auto_bitrate(fhd, None), (15_000, false));
         assert_eq!(prefs.auto_bitrate(fhd, Some(300.0)), (30_000, false));
         assert_eq!(prefs.auto_bitrate(fhd, Some(40.0)), (14_000, true));
-        assert_eq!(prefs.auto_bitrate(fhd, Some(2.0)), (3_000, true));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(2.0)), (700, true));
         let manual = Preferences { bitrate: Some(80_000), ..Preferences::default() };
         assert_eq!(manual.auto_bitrate(fhd, Some(40.0)), (80_000, false));
     }

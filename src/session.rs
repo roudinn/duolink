@@ -34,6 +34,7 @@ const SILENCE: Duration = Duration::from_secs(6);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(90);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MEASURE_TIMEOUT: Duration = Duration::from_secs(9);
 
 #[derive(Debug)]
 pub enum Event {
@@ -241,7 +242,7 @@ struct Guest {
     name: String,
     /// Local port of the control socket: identifies the guest's tunnel link.
     port: u16,
-    fec: u8,
+    fec: Option<u8>,
     state: PlayerState,
     /// Ready has gone out; Sunshine's next "client connected" is this guest.
     sent_ready: bool,
@@ -413,7 +414,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             wire: knock.wire,
                             name: clean_name(&name),
                             port: knock.port,
-                            fec: wanted.unwrap_or(DEFAULT_FEC),
+                            fec: wanted,
                             state: PlayerState::Waiting,
                             sent_ready: false,
                             since: Instant::now(),
@@ -474,18 +475,23 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         let opening = guests.iter().any(|g| g.state == PlayerState::Starting && g.sent_ready);
         if engine_ready
             && !opening
-            && let Some(at) = guests.iter().position(|g| g.state == PlayerState::Starting)
+            && let Some(at) = guests.iter().position(|g| {
+                g.state == PlayerState::Starting
+                    && (g.fec.is_some() || g.since.elapsed() >= MEASURE_TIMEOUT)
+            })
         {
             // The first guest on a lossy path: restart Sunshine with more
             // redundancy while nobody is watching yet.
             let busy = guests.iter().any(|g| g.state == PlayerState::Playing);
-            if !busy && guests[at].fec > fec {
-                fec = guests[at].fec;
+            let wanted_fec = guests[at].fec.unwrap_or(DEFAULT_FEC);
+            if !busy && wanted_fec > fec {
+                fec = wanted_fec;
                 drop(stream);
                 stream = start_engine(fec)?;
                 engine_ready = false;
                 engine_by = Instant::now() + START_TIMEOUT;
             } else {
+                tunnel.stop_probes();
                 wifi.get_or_insert_with(|| quiet_wifi(worker));
                 let reply = Reply::Ready {
                     host: host_id,
@@ -511,14 +517,16 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                 PlayerState::Playing => None,
             };
             let expired = timeout.filter(|(limit, _)| guest.since.elapsed() > *limit);
-            let alive = guest.last_ping.elapsed() <= SILENCE
+            let silence = if guest.fec.is_none() { MEASURE_TIMEOUT + SILENCE } else { SILENCE };
+            let alive = guest.last_ping.elapsed() <= silence
                 && match guest.wire.poll::<Request>() {
                     Ok(Some(Request::Ping)) => {
                         guest.last_ping = Instant::now();
                         guest.wire.send(&Reply::Pong).is_ok()
                     }
                     Ok(Some(Request::Measured { fec })) => {
-                        guest.fec = fec;
+                        guest.fec = Some(fec);
+                        guest.last_ping = Instant::now();
                         true
                     }
                     Ok(None) => true,
@@ -652,7 +660,7 @@ fn guest(
     .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");
     let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
-    let path_mbps = channel.filter(|c| c.limited).map(|c| c.mbps);
+    let path_mbps = channel.map(|c| c.mbps);
     if let Some(channel) = channel {
         worker.fact(
             "Канал",
@@ -665,9 +673,12 @@ fn guest(
     }
     // Random loss at the rate the stream will actually use (video + FEC +
     // audio) decides how much redundancy Sunshine adds.
-    worker.status("Меряем потери…");
-    let working_rate = path_mbps.map_or(150.0, |mbps| mbps * PATH_SHARE * 1.3).clamp(5.0, 150.0);
-    let fec = match tunnel.measure(working_rate as u32, Duration::from_millis(1000)) {
+    let loss_probe = channel.and_then(|channel| {
+        worker.status("Меряем потери…");
+        let rate = (channel.mbps * PATH_SHARE * 1.3).clamp(5.0, 150.0) as u32;
+        tunnel.measure(rate, Duration::from_millis(1000))
+    });
+    let fec = match loss_probe {
         Some(probe) => {
             let fec = fec_for_loss(probe.loss);
             worker.fact("Потери", format!("{:.1} % · коррекция {fec} %", probe.loss * 100.0));
@@ -818,7 +829,7 @@ mod tests {
                 wire,
                 name: format!("Guest {id}"),
                 port: from.port(),
-                fec: DEFAULT_FEC,
+                fec: Some(DEFAULT_FEC),
                 state: PlayerState::Starting,
                 sent_ready: false,
                 since: now,

@@ -455,29 +455,41 @@ fn enlarge(socket: socket2::SockRef<'_>) {
     let _ = socket.set_send_buffer_size(SEND_BUFFER);
 }
 
-/// Host side of the bandwidth probe: a fixed-rate burst of datagrams, then
-/// the number of bytes offered on the probe stream.
-async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: quinn::RecvStream) {
+#[derive(Default)]
+struct ProbeGate {
+    streaming: AtomicBool,
+    running: tokio::sync::Mutex<()>,
+}
+
+/// Host side of the bandwidth probe. A zero count means it was skipped.
+async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: quinn::RecvStream, probes: &ProbeGate) {
     let mut request = [0u8; 8];
     if recv.read_exact(&mut request).await.is_err() {
         return;
     }
-    let mbps = u32::from_be_bytes(request[..4].try_into().unwrap()).clamp(1, 1000);
+    let mbps = u32::from_be_bytes(request[..4].try_into().unwrap()).clamp(1, PROBE_MBPS);
     let time = Duration::from_millis(u32::from_be_bytes(request[4..].try_into().unwrap()).clamp(100, 1500) as u64);
     let size = conn.max_datagram_size().unwrap_or(1100).clamp(64, 1100);
     let payload = vec![0u8; size - 2];
     let rate = mbps as f64 * 1e6 / 8.0;
     let start = Instant::now();
     let mut sent: u64 = 0;
-    while start.elapsed() < time {
-        let due = (start.elapsed().as_secs_f64() * rate) as u64;
-        while sent < due {
-            if conn.send_datagram(tag(PROBE_PORT, &payload)).is_err() {
-                break;
+    if !probes.streaming.load(Ordering::Acquire)
+        && let Ok(_guard) = probes.running.try_lock()
+    {
+        while !probes.streaming.load(Ordering::Acquire) && start.elapsed() < time {
+            let due = (start.elapsed().as_secs_f64() * rate) as u64;
+            while sent < due && !probes.streaming.load(Ordering::Acquire) {
+                if conn.send_datagram(tag(PROBE_PORT, &payload)).is_err() {
+                    break;
+                }
+                sent += size as u64;
             }
-            sent += size as u64;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        if probes.streaming.load(Ordering::Acquire) {
+            sent = 0;
+        }
     }
     let _ = reply.write_all(&sent.to_be_bytes()).await;
     let _ = reply.finish();
@@ -595,7 +607,7 @@ fn reset(error: &std::io::Error) -> bool {
 }
 
 /// Host side: Sunshine's ports reached through 127.0.0.1.
-async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<LinkPorts>>) {
+async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<LinkPorts>>, probes: Arc<ProbeGate>) {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(ping_loop(conn.clone(), pinger.clone()));
     let mut sockets = HashMap::new();
@@ -647,6 +659,7 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
     while let Ok((send, mut recv)) = conn.accept_bi().await {
         let conn = conn.clone();
         let ports = ports.clone();
+        let probes = probes.clone();
         tokio::spawn(async move {
             let mut header = [0u8; 2];
             if recv.read_exact(&mut header).await.is_err() {
@@ -654,7 +667,7 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
             }
             let port = u16::from_be_bytes(header);
             if port == PROBE_PORT {
-                probe_send(conn, send, recv).await;
+                probe_send(conn, send, recv, &probes).await;
                 return;
             }
             if !TCP_PORTS.contains(&port) {
@@ -895,6 +908,7 @@ pub struct HostTunnel {
     pub reflexive: Reflexive,
     pub forwarded: bool,
     links: Arc<Mutex<Vec<Link>>>,
+    probes: Arc<ProbeGate>,
     alive: Arc<AtomicBool>,
     _mapping: Option<PortMapping>,
     _signal: Option<Subscription>,
@@ -944,7 +958,8 @@ impl HostTunnel {
         };
 
         let links = Arc::new(Mutex::new(Vec::<Link>::new()));
-        runtime.spawn(accept(endpoint.clone(), token, links.clone()));
+        let probes = Arc::new(ProbeGate::default());
+        runtime.spawn(accept(endpoint.clone(), token, links.clone(), probes.clone()));
 
         let alive = Arc::new(AtomicBool::new(true));
         // Keep our NAT mapping (and so the reflexive candidate) open while we wait.
@@ -975,10 +990,16 @@ impl HostTunnel {
             reflexive,
             forwarded: mapping.is_some(),
             links,
+            probes,
             alive,
             _mapping: mapping.map(|(_, mapping)| mapping),
             _signal: signal,
         })
+    }
+
+    /// Keep test traffic off the uplink once the lobby starts streaming.
+    pub fn stop_probes(&self) {
+        self.probes.streaming.store(true, Ordering::Release);
     }
 
     /// The guest whose control connection reached the session from `control_port`,
@@ -1034,9 +1055,10 @@ impl Drop for HostTunnel {
     }
 }
 
-async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>>) {
+async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>>, probes: Arc<ProbeGate>) {
     while let Some(incoming) = endpoint.accept().await {
         let links = links.clone();
+        let probes = probes.clone();
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             let handshake = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1060,7 +1082,7 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>
             links.lock().unwrap().push(Link { conn: conn.clone(), pinger: pinger.clone(), ports: ports.clone() });
             let _ = send.write_all(&[1]).await;
             let _ = send.finish();
-            serve_host(conn, pinger, ports).await;
+            serve_host(conn, pinger, ports, probes).await;
             links.lock().unwrap().retain(|link| link.conn.stable_id() != id);
         });
     }
@@ -1228,11 +1250,14 @@ impl GuestTunnel {
             .ok()
             .flatten()
         })?;
+        if offered == 0 {
+            return None;
+        }
         // Stragglers still in flight.
         thread::sleep(Duration::from_millis(150));
         let stats = self.probe.lock().unwrap();
         let span = stats.last?.duration_since(stats.first?);
-        if offered == 0 || span < Duration::from_millis(100) {
+        if span < Duration::from_millis(100) {
             return None;
         }
         let measured = stats.bytes as f64 * 8.0 / span.as_secs_f64() / 1e6;
@@ -1315,7 +1340,8 @@ mod tests {
             let client = Endpoint::client(localhost).unwrap();
             let config = client_config(identity.fingerprint()).unwrap();
             let links = Arc::new(Mutex::new(Vec::new()));
-            tokio::spawn(accept(endpoint.clone(), token, links.clone()));
+            let probes = Arc::new(ProbeGate::default());
+            tokio::spawn(accept(endpoint.clone(), token, links.clone(), probes.clone()));
             let host = HostTunnel {
                 runtime: None,
                 endpoint,
@@ -1323,6 +1349,7 @@ mod tests {
                 reflexive: Reflexive::default(),
                 forwarded: false,
                 links,
+                probes,
                 alive: Arc::new(AtomicBool::new(true)),
                 _mapping: None,
                 _signal: None,
@@ -1347,6 +1374,20 @@ mod tests {
                     }
                 }
             };
+            let probe = async |guest: &Connection, time_ms: u32| {
+                let (mut send, recv) = guest.open_bi().await.unwrap();
+                let mut request = PROBE_PORT.to_be_bytes().to_vec();
+                request.extend_from_slice(&20u32.to_be_bytes());
+                request.extend_from_slice(&time_ms.to_be_bytes());
+                send.write_all(&request).await.unwrap();
+                send.finish().unwrap();
+                recv
+            };
+            let offered = async |mut recv: quinn::RecvStream| {
+                let mut total = [0; 8];
+                recv.read_exact(&mut total).await.unwrap();
+                u64::from_be_bytes(total)
+            };
 
             tokio::time::timeout(Duration::from_secs(5), async {
                 let (first, _first_send, _first_recv, mut first_tcp, first_port) = join().await;
@@ -1363,6 +1404,34 @@ mod tests {
                 audio.send_to(b"second", second_route).await.unwrap();
                 assert_eq!(&receive_audio(&first).await[..], b"first");
                 assert_eq!(&receive_audio(&second).await[..], b"second");
+
+                assert!(offered(probe(&others[0].0, 120).await).await > 0);
+                let ongoing = probe(&first, 1500).await;
+                loop {
+                    let datagram = first.read_datagram().await.unwrap();
+                    if datagram.starts_with(&PROBE_PORT.to_be_bytes()) {
+                        break;
+                    }
+                }
+                assert_eq!(offered(probe(&second, 700).await).await, 0);
+                host.stop_probes();
+                assert_eq!(offered(ongoing).await, 0);
+                assert_eq!(offered(probe(&second, 700).await).await, 0);
+
+                let mut round_trips = Vec::new();
+                for index in 0..200u64 {
+                    let started = Instant::now();
+                    second.send_datagram(tag(PING_PORT, &index.to_be_bytes())).unwrap();
+                    loop {
+                        let reply = second.read_datagram().await.unwrap();
+                        if reply == tag(PONG_PORT, &index.to_be_bytes()) {
+                            break;
+                        }
+                    }
+                    round_trips.push(started.elapsed());
+                }
+                let (median, p99, _) = percentiles(round_trips);
+                eprintln!("local QUIC RTT with seven guests: median {median:.0} µs, p99 {p99:.0} µs");
 
                 first.close(VarInt::from_u32(0), b"bye");
                 assert_eq!(first_tcp.read(&mut [0; 1]).await.unwrap(), 0);
