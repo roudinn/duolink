@@ -375,6 +375,9 @@ function renderFriends(next) {
 
 function renderSettings(next) {
   show("copy-friend-code", next.me.chosen);
+  show("discord-row", next.discord !== null);
+  if (next.discord !== null) $("discord").checked = next.discord;
+  $("autostart").checked = next.autostart;
   const u = next.update;
   const busy = sessionBusy(next);
   const ready = u.state === "ready";
@@ -529,6 +532,8 @@ $("nick-settings").addEventListener("submit", (e) => {
   send("set_name", { name });
 });
 
+$("discord").addEventListener("change", (e) => send("set_discord", { on: e.target.checked }));
+$("autostart").addEventListener("change", (e) => send("set_autostart", { on: e.target.checked }));
 for (const id of [...NUMBERS, "codec"]) $(id).addEventListener("input", save);
 for (const id of FLAGS) $(id).addEventListener("change", save);
 language.addEventListener("change", () => {

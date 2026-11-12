@@ -3,7 +3,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender},
@@ -34,6 +34,7 @@ use crate::{
     media::{Form, Preferences},
     platform::{data_dir, open},
     protocol::Invite,
+    presence::{Presence, Status as PresenceStatus},
     session::{Event, Player, PlayerState, Session},
     setup,
     update::{self, Updater},
@@ -148,6 +149,8 @@ enum Action {
     /// Sent by background threads to wake the event loop.
     #[serde(skip_deserializing)]
     Wake,
+    SetDiscord { on: bool },
+    SetAutostart { on: bool },
     /// Tray click, tray menu or a second launch: bring the window back.
     #[serde(skip_deserializing)]
     Show,
@@ -353,6 +356,9 @@ struct App {
     setup: Pane,
     version: &'static str,
     update: update::Status,
+    /// Discord status switch; `None` when this build has no Discord application.
+    discord: Option<bool>,
+    autostart: bool,
     me: MeView,
     friends: Vec<FriendView>,
     invitations: Vec<Invitation>,
@@ -379,6 +385,10 @@ struct App {
     #[serde(skip)]
     quit: bool,
     #[serde(skip)]
+    presence: Option<Presence>,
+    #[serde(skip)]
+    shown_presence: Option<PresenceStatus>,
+    #[serde(skip)]
     launched: Instant,
     /// The user stopped hosting while the driver/firewall check was running.
     #[serde(skip)]
@@ -397,6 +407,8 @@ impl App {
             setup: Pane::default(),
             version: env!("CARGO_PKG_VERSION"),
             update: update::Status::Idle,
+            discord: Presence::start().map(|_| discord_pref(&data)),
+            autostart: crate::platform::autostart_enabled(),
             me: MeView { name: String::new(), tag: String::new(), chosen: false },
             friends: Vec::new(),
             invitations: Vec::new(),
@@ -412,6 +424,8 @@ impl App {
             attention: false,
             updater,
             quit: false,
+            presence: Presence::start(),
+            shown_presence: None,
             launched: Instant::now(),
             setup_cancelled: false,
             data,
@@ -621,6 +635,18 @@ impl App {
     fn action(&mut self, action: Action, view: &WebView) -> Result<()> {
         match action {
             Action::Ready | Action::Wake | Action::Show => {}
+            Action::SetDiscord { on } if self.discord.is_some() => {
+                self.discord = Some(on);
+                save_discord_pref(&self.data, on);
+                self.shown_presence = None;
+                if !on && let Some(presence) = &self.presence {
+                    presence.set(PresenceStatus::Off);
+                }
+            }
+            Action::SetAutostart { on } => match crate::platform::set_autostart(on) {
+                Ok(()) => self.autostart = on,
+                Err(error) => toast(view, &format!("Не удалось изменить автозапуск: {error:#}"))?,
+            },
             Action::Quit => self.quit = true,
             Action::HostStart if self.session_idle() => {
                 self.host_for.clear();
@@ -786,7 +812,28 @@ impl App {
         self.update(view)
     }
 
+    /// What the Discord status should say right now.
+    fn presence_status(&self) -> PresenceStatus {
+        if self.guest.phase == Phase::Live {
+            return PresenceStatus::Playing;
+        }
+        if matches!(self.host.phase, Phase::Invite | Phase::Live) && !self.host.code.is_empty() {
+            let playing = self.host.players.iter().filter(|p| p.state == PlayerState::Playing).count();
+            // The game sees four controllers; spectators can make it more.
+            let players = playing + 1;
+            return PresenceStatus::Lobby { players, max: players.max(4) };
+        }
+        PresenceStatus::Idle
+    }
+
     fn poll(&mut self, view: &WebView) {
+        if let (Some(presence), Some(true)) = (&self.presence, self.discord) {
+            let status = self.presence_status();
+            if self.shown_presence.as_ref() != Some(&status) {
+                presence.set(status.clone());
+                self.shown_presence = Some(status);
+            }
+        }
         let waiting = self.host.waiting();
         let (host, host_done) = self.host.poll(true);
         // Someone new knocked: get the host's attention.
@@ -1005,7 +1052,20 @@ fn asset(path: &str) -> Response<Cow<'static, [u8]>> {
         .unwrap()
 }
 
-pub fn run() -> Result<()> {
+/// Discord status on by default; the switch in settings is remembered here.
+fn discord_pref(data: &Path) -> bool {
+    fs::read(data.join("prefs.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value["discord"].as_bool())
+        .unwrap_or(true)
+}
+
+fn save_discord_pref(data: &Path, on: bool) {
+    let _ = fs::write(data.join("prefs.json"), serde_json::json!({ "discord": on }).to_string());
+}
+
+pub fn run(hidden: bool) -> Result<()> {
     let data = data_dir()?;
     fs::create_dir_all(&data)?;
     let mut context = WebContext::new(Some(data.join("interface")));
@@ -1070,7 +1130,11 @@ pub fn run() -> Result<()> {
         let _ = shower.send_event(Action::Show);
     });
     let mut app = App::new(data, wake, updater)?;
-    window.set_visible(true);
+    if hidden {
+        memory_level(&view, true);
+    } else {
+        window.set_visible(true);
+    }
     let mut next_announce = Instant::now() + DIRECTORY_REFRESH;
 
     event_loop.run(move |event, _, control| {

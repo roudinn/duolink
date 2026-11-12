@@ -5,6 +5,7 @@ mod friends;
 mod gui;
 mod media;
 mod platform;
+mod presence;
 mod protocol;
 mod session;
 mod setup;
@@ -38,7 +39,9 @@ fn main() {
     };
     update::cleanup();
     platform::prioritize_self();
-    if let Err(error) = gui::run() {
+    // Started by Windows at sign-in: stay in the tray.
+    let hidden = std::env::args().any(|arg| arg == "--tray");
+    if let Err(error) = gui::run(hidden) {
         message(&format!("{error:#}"), MB_ICONERROR);
     }
 }

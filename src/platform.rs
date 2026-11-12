@@ -541,3 +541,38 @@ pub fn on_show_request(show: impl Fn() + Send + 'static) {
         }
     });
 }
+
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "DuoLink";
+
+/// Whether Windows starts DuoLink at sign-in (the per-user Run key).
+pub fn autostart_enabled() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let key: Vec<u16> = RUN_KEY.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = RUN_VALUE.encode_utf16().chain(Some(0)).collect();
+    let mut size = 0u32;
+    unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) == 0
+    }
+}
+
+/// Turns the sign-in start on or off. Only this user's Run key changes.
+pub fn set_autostart(on: bool) -> Result<()> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+    let key: Vec<u16> = RUN_KEY.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = RUN_VALUE.encode_utf16().chain(Some(0)).collect();
+    let status = if on {
+        let exe = std::env::current_exe()?;
+        let command: Vec<u16> = format!("\"{}\" --tray", exe.display()).encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), REG_SZ, command.as_ptr().cast(), (command.len() * 2) as u32)
+        }
+    } else {
+        let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
+        // Already absent is as good as removed.
+        if status == 2 { 0 } else { status }
+    };
+    ensure!(status == 0, "Windows отказала в записи (код {status}).");
+    Ok(())
+}
