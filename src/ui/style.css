@@ -168,6 +168,9 @@ input[role="switch"]:checked::after { background: var(--accent-ink); transform: 
 .session > .muted { margin-top: -6px; }
 .ping { display: inline-flex; align-items: baseline; gap: 4px; align-self: flex-start; margin-top: -6px; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--muted); }
 .ping small { font-size: inherit; font-weight: 500; }
+.players .friend { min-height: 58px; }
+.players .who small { font-variant-numeric: tabular-nums; }
+.players .friend:not(:hover):not(:focus-within) .x { opacity: 0; }
 .code-row { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: var(--card); background: var(--surface); }
 .code { flex: 1; min-width: 0; padding: 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 14px/1.6 "Cascadia Mono", Consolas, monospace; user-select: all; }
 details summary { width: fit-content; padding: 8px 4px; cursor: pointer; color: var(--muted); }

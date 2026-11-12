@@ -245,9 +245,14 @@ pub enum Request {
         /// Forward error correction the guest measured it needs, in percent.
         #[serde(default)]
         fec: Option<u8>,
+        /// The guest takes the client key from Ready (lobby hosts, 1.10+).
+        #[serde(default)]
+        lobby: bool,
     },
     Ping,
     Leave,
+    /// What the guest's path needs, measured while the host decides.
+    Measured { fec: u8 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,12 +267,21 @@ pub enum Reply {
         /// Game audio comes from DuoLink without voice chat; Moonlight stays silent.
         #[serde(default)]
         own_audio: bool,
+        /// The client identity Sunshine already trusts.
+        #[serde(default)]
+        client: Option<ClientKey>,
     },
     Connected,
     Pong,
     Closed {
         reason: String,
     },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ClientKey {
+    pub certificate: String,
+    pub key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

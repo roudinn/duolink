@@ -23,10 +23,10 @@ use crate::{
         vigem_present,
     },
     protocol::{
-        CONTROL_PORT, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config,
+        CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config,
         new_token, valid_pem,
     },
-    tunnel::{GUEST_LOOPBACK, GuestTunnel, HostTunnel, PROBE_MBPS, describe_peer, dropped},
+    tunnel::{GuestTunnel, HostTunnel, MAX_GUESTS, PROBE_MBPS, describe_peer, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -39,7 +39,8 @@ const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub enum Event {
     Status(String),
     Invite(String),
-    Approval(String),
+    /// Everyone in the lobby, whenever that changes (and their ping, ten times a second).
+    Players(Vec<Player>),
     /// A labelled fact about the live session (mode, bitrate, route…).
     Fact(&'static str, String),
     Streaming,
@@ -75,14 +76,14 @@ impl Worker {
 pub struct Session {
     pub events: Receiver<Event>,
     cancelled: Arc<AtomicBool>,
-    decision: Sender<bool>,
+    commands: Sender<Command>,
     task: Option<thread::JoinHandle<()>>,
 }
 
 impl Session {
-    pub(crate) fn start(run: impl FnOnce(&Worker, Receiver<bool>) -> Result<String> + Send + 'static) -> Self {
+    pub(crate) fn start(run: impl FnOnce(&Worker, Receiver<Command>) -> Result<String> + Send + 'static) -> Self {
         let (events, receiver) = mpsc::channel();
-        let (decision, decisions) = mpsc::channel();
+        let (commands, decisions) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             events,
@@ -103,7 +104,7 @@ impl Session {
         Self {
             events: receiver,
             cancelled,
-            decision,
+            commands,
             task: Some(task),
         }
     }
@@ -116,8 +117,12 @@ impl Session {
         Self::start(move |worker, _| guest(worker, data, invite, preferences, nickname))
     }
 
-    pub fn decide(&self, approve: bool) {
-        let _ = self.decision.send(approve);
+    pub fn decide(&self, id: u32, approve: bool) {
+        let _ = self.commands.send(Command::Decide(id, approve));
+    }
+
+    pub fn kick(&self, id: u32) {
+        let _ = self.commands.send(Command::Kick(id));
     }
 
     pub fn cancel(&self) {
@@ -202,14 +207,62 @@ fn report_drops(worker: &Worker, shown: &mut u64) {
     }
 }
 
-fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<String> {
+/// Someone in the lobby, as the host's window shows them.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Player {
+    pub id: u32,
+    pub name: String,
+    pub state: PlayerState,
+    /// Round trip in milliseconds.
+    pub latency: Option<f64>,
+    pub place: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerState {
+    /// Asked to join; the host has not answered yet.
+    Waiting,
+    /// Approved; queued for its stream or opening it.
+    Starting,
+    Playing,
+}
+
+/// What the host's window asks of a running lobby.
+pub enum Command {
+    Decide(u32, bool),
+    Kick(u32),
+}
+
+struct Guest {
+    id: u32,
+    wire: HostWire,
+    name: String,
+    /// Local port of the control socket: identifies the guest's tunnel link.
+    port: u16,
+    fec: u8,
+    state: PlayerState,
+    /// Ready has gone out; Sunshine's next "client connected" is this guest.
+    sent_ready: bool,
+    since: Instant,
+    last_ping: Instant,
+}
+
+struct Knock {
+    wire: HostWire,
+    port: u16,
+    by: Instant,
+}
+
+fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<String> {
     let address = Ipv4Addr::LOCALHOST;
     let _lock = ProcessLock::try_acquire(r"Local\DuoLink.Host.v1")
         .context("Не удалось зарезервировать сессию хоста.")?
         .context("На этом ПК уже открыта сессия DuoLink.")?;
     reserve_check(address)?;
     if !vigem_present() {
-        worker.fact("Геймпад гостя", "Нет драйвера");
+        worker.fact("Геймпады", "Нет драйвера");
     }
     if !SUNSHINE.path(&data).is_file() {
         worker.status("Скачиваем Sunshine…");
@@ -218,11 +271,39 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     worker.check()?;
 
     let identity = Identity::generate("DuoLink Host")?;
+    // One client identity for every guest: Sunshine trusts it from the start,
+    // so a new guest never waits for a restart.
+    let client = Identity::generate("DuoLink Guest")?;
+    let host_id = Uuid::new_v4();
+    let mut mode = display_mode()?;
+    let current_hz = mode.fps;
+    mode.fps = display_max_refresh().unwrap_or(current_hz);
+    let mut fec = DEFAULT_FEC;
+    // Sunshine starts while the code travels to the friends: by the time
+    // someone joins, it is already listening.
+    let start_engine = |fec: u8| {
+        HostStream::start(&engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec)
+    };
+    let mut stream = start_engine(fec)?;
+    let mut engine_by = Instant::now() + START_TIMEOUT;
+    let mut engine_ready = false;
+
     let token = new_token();
     worker.status("Открываем доступ…");
     let tunnel = HostTunnel::open(&identity, token)?;
     worker.check()?;
     worker.fact("Доступ", reachability(&tunnel));
+    worker.fact(
+        "Экран",
+        if mode.fps > current_hz {
+            format!("{}×{} · {current_hz} → {} Гц", mode.width, mode.height, mode.fps)
+        } else {
+            format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps)
+        },
+    );
+    if background_recording() {
+        worker.fact("Xbox Game Bar", "Фоновая запись включена");
+    }
     let invite = Invite {
         token,
         fingerprint: identity.fingerprint(),
@@ -232,154 +313,7 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
     let listener = TcpListener::bind((address, CONTROL_PORT))
         .with_context(|| format!("Не удалось открыть порт {CONTROL_PORT}."))?;
     listener.set_nonblocking(true)?;
-    worker.emit(Event::Invite(invite.encode()));
-
-    let expires = Instant::now() + CODE_TIMEOUT;
-    let (mut wire, name, peer, certificate, fec) = loop {
-        worker.check()?;
-        ensure!(
-            Instant::now() < expires,
-            "Код истёк."
-        );
-        let (socket, _) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(70));
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        configure_socket(&socket)?;
-        let mut wire = Wire::new(StreamOwned::new(
-            ServerConnection::new(tls.clone())?,
-            socket,
-        ));
-        let hello = Instant::now() + Duration::from_secs(4);
-        let request = loop {
-            worker.check()?;
-            if Instant::now() >= hello {
-                break None;
-            }
-            match wire.poll::<Request>() {
-                Ok(Some(request)) => break Some(request),
-                Ok(None) => {}
-                Err(_) => break None,
-            }
-        };
-        if let Some(Request::Join {
-            token,
-            name,
-            certificate,
-            fec,
-        }) = request
-            && invite.authorizes(&token)
-            && valid_pem(&certificate)
-        {
-            let name = clean_name(&name);
-            wire.send(&Reply::Pending)?;
-            let peer = tunnel.peer().map(|(addr, _)| addr.ip().to_string()).unwrap_or_default();
-            break (wire, name, peer, certificate, fec.unwrap_or(DEFAULT_FEC));
-        }
-        let _ = wire.send(&Reply::Closed {
-            reason: "Неверный код.".into(),
-        });
-    };
-    // This invitation admits a single request. Once used, the listening socket closes.
-    drop(listener);
-    worker.emit(Event::Approval(name.clone()));
-    worker.fact("Гость", format!("{name} · {peer}"));
-    if background_recording() {
-        worker.fact("Xbox Game Bar", "Фоновая запись включена");
-    }
-    let mut next_rtt = Instant::now();
-    let mut next_latency = Instant::now();
-    let mut drops_shown = dropped();
-    let mut report = |worker: &Worker| {
-        if Instant::now() >= next_latency
-            && let Some((_, rtt)) = tunnel.peer()
-        {
-            worker.emit(Event::Latency(rtt));
-            next_latency = Instant::now() + LATENCY_EVERY;
-        }
-        if Instant::now() >= next_rtt
-            && let Some((addr, rtt)) = tunnel.peer()
-        {
-            worker.fact("Соединение", connection_fact(describe_peer(addr), rtt));
-            report_drops(worker, &mut drops_shown);
-            next_rtt = Instant::now() + Duration::from_secs(2);
-        }
-    };
-    report(worker);
-
-    let mut last_ping = Instant::now();
-    let by = Instant::now() + DECISION_TIMEOUT;
-    loop {
-        if worker.check().is_err() {
-            let _ = wire.send(&Reply::Closed {
-                reason: "Хост закрыл сессию.".into(),
-            });
-            return Ok("Сессия завершена.".into());
-        }
-        if Instant::now() >= by {
-            wire.send(&Reply::Closed {
-                reason: "Хост не ответил.".into(),
-            })?;
-            return Ok("Запрос истёк.".into());
-        }
-        match decision.try_recv() {
-            Ok(true) => break,
-            Ok(false) => {
-                wire.send(&Reply::Closed {
-                    reason: "Хост отклонил подключение.".into(),
-                })?;
-                return Ok("Запрос отклонён.".into());
-            }
-            Err(_) => {}
-        }
-        if !host_tick(&mut wire, &mut last_ping)? {
-            return Ok("Гость отменил подключение.".into());
-        }
-    }
-
-    worker.status("Запускаем…");
-    let _wifi = quiet_wifi(worker);
-    wire.send(&Reply::Preparing)?;
-    let host_id = Uuid::new_v4();
-    let mut mode = display_mode()?;
-    let current_hz = mode.fps;
-    mode.fps = display_max_refresh().unwrap_or(current_hz);
-    worker.fact(
-        "Экран",
-        if mode.fps > current_hz {
-            format!("{}×{} · {current_hz} → {} Гц", mode.width, mode.height, mode.fps)
-        } else {
-            format!("{}×{} · {} Гц", mode.width, mode.height, mode.fps)
-        },
-    );
-    // Desktop Duplication stops producing frames once the display sleeps.
-    let _awake = KeepAwake::hold();
-    let mut stream = HostStream::start(
-        &engine,
-        &data,
-        address,
-        &identity,
-        host_id,
-        &name,
-        &certificate,
-        fec,
-    )?;
-    let by = Instant::now() + START_TIMEOUT;
-    while !stream.ready(address)? {
-        worker.check()?;
-        ensure!(
-            Instant::now() < by,
-            "Sunshine не запустился. Подробности в host.log."
-        );
-        if !host_tick(&mut wire, &mut last_ping)? {
-            return Ok("Гость отменил подключение.".into());
-        }
-    }
-    // Game audio without the voice-chat app, so the guest never hears themself.
+    // Game audio without the voice-chat app, so nobody hears themself.
     let audio = match HostAudio::start(address) {
         Ok(audio) => {
             worker.fact(
@@ -396,64 +330,241 @@ fn host(worker: &Worker, decision: Receiver<bool>, data: PathBuf) -> Result<Stri
             None
         }
     };
-    wire.send(&Reply::Ready {
-        host: host_id,
-        certificate: identity.cert_pem,
-        mode,
-        own_audio: audio.is_some(),
-    })?;
+    let _awake = KeepAwake::hold();
+    let mut wifi = None;
+    worker.emit(Event::Invite(invite.encode()));
 
-    let by = Instant::now() + START_TIMEOUT;
-    let mut streaming = false;
-    let reason = loop {
-        if worker.check().is_err() {
-            break "Хост завершил сессию.";
-        }
-        if tunnel.peer().is_none() {
-            // The tunnel is gone: the guest closed DuoLink or the network dropped.
-            break "Гость отключился.";
-        }
-        report(worker);
-        let (connected, disconnected) = stream.events()?;
-        if disconnected {
-            break "Поток закрыт.";
-        }
-        if connected && !streaming {
-            streaming = true;
-            worker.emit(Event::Streaming);
-            wire.send(&Reply::Connected)?;
-        }
-        if !streaming && Instant::now() >= by {
-            break "Поток не запустился. Подробности в host.log.";
-        }
-        if !host_tick(&mut wire, &mut last_ping)? {
-            break "Гость отключился.";
-        }
+    let expires = Instant::now() + CODE_TIMEOUT;
+    let mut joined_once = false;
+    let mut knocks: Vec<Knock> = Vec::new();
+    let mut guests: Vec<Guest> = Vec::new();
+    let mut next_id = 1u32;
+    let mut shown: Vec<Player> = Vec::new();
+    let mut next_players = Instant::now();
+    let mut playing_before = false;
+    let mut drops_shown = dropped();
+    let mut next_drops = Instant::now();
+    let mut next_log = Instant::now();
+
+    let close = |wire: &mut HostWire, reason: &str| {
+        let _ = wire.send(&Reply::Closed { reason: reason.into() });
     };
-    // Closing Sunshine removes the virtual controller before notifying the guest.
+    let reason = 'lobby: loop {
+        if worker.check().is_err() {
+            break "Сессия завершена.";
+        }
+        if guests.is_empty() && knocks.is_empty() && !joined_once && Instant::now() >= expires {
+            break "Код истёк.";
+        }
+
+        // Someone opened the control channel through the tunnel.
+        loop {
+            match listener.accept() {
+                Ok((socket, from)) => {
+                    configure_socket(&socket)?;
+                    socket.set_read_timeout(Some(Duration::from_millis(2)))?;
+                    let wire = Wire::new(StreamOwned::new(ServerConnection::new(tls.clone())?, socket));
+                    knocks.push(Knock { wire, port: from.port(), by: Instant::now() + Duration::from_secs(4) });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut index = 0;
+        while index < knocks.len() {
+            let knock = &mut knocks[index];
+            let request = match knock.wire.poll::<Request>() {
+                Ok(Some(request)) => Some(request),
+                Ok(None) if Instant::now() < knock.by => {
+                    index += 1;
+                    continue;
+                }
+                _ => None,
+            };
+            let mut knock = knocks.swap_remove(index);
+            match request {
+                Some(Request::Join { token, name, lobby, fec: wanted, .. }) if invite.authorizes(&token) => {
+                    if !lobby {
+                        close(&mut knock.wire, "Обновите DuoLink: у хоста новая версия.");
+                    } else if guests.len() >= MAX_GUESTS {
+                        close(&mut knock.wire, "Лобби заполнено.");
+                    } else {
+                        knock.wire.send(&Reply::Pending)?;
+                        joined_once = true;
+                        guests.push(Guest {
+                            id: next_id,
+                            wire: knock.wire,
+                            name: clean_name(&name),
+                            port: knock.port,
+                            fec: wanted.unwrap_or(DEFAULT_FEC),
+                            state: PlayerState::Waiting,
+                            sent_ready: false,
+                            since: Instant::now(),
+                            last_ping: Instant::now(),
+                        });
+                        next_id += 1;
+                    }
+                }
+                _ => close(&mut knock.wire, "Неверный код."),
+            }
+        }
+
+        for command in commands.try_iter() {
+            match command {
+                Command::Decide(id, approve) => {
+                    if let Some(at) = guests.iter().position(|g| g.id == id && g.state == PlayerState::Waiting) {
+                        if approve {
+                            let guest = &mut guests[at];
+                            guest.state = PlayerState::Starting;
+                            guest.since = Instant::now();
+                            let _ = guest.wire.send(&Reply::Preparing);
+                        } else {
+                            let mut guest = guests.remove(at);
+                            close(&mut guest.wire, "Хост отклонил подключение.");
+                        }
+                    }
+                }
+                Command::Kick(id) => {
+                    if let Some(at) = guests.iter().position(|g| g.id == id) {
+                        let mut guest = guests.remove(at);
+                        close(&mut guest.wire, "Хост отключил вас.");
+                    }
+                }
+            }
+        }
+
+        // Sunshine: up, still running, and who just connected.
+        if engine_ready && Instant::now() >= next_log {
+            next_log = Instant::now() + Duration::from_millis(50);
+            let (connected, _) = stream.events()?;
+            for _ in 0..connected {
+                if let Some(guest) = guests
+                    .iter_mut()
+                    .filter(|g| g.state == PlayerState::Starting && g.sent_ready)
+                    .min_by_key(|g| g.since)
+                {
+                    guest.state = PlayerState::Playing;
+                    let _ = guest.wire.send(&Reply::Connected);
+                }
+            }
+        } else if !engine_ready && Instant::now() >= next_log {
+            next_log = Instant::now() + Duration::from_millis(50);
+            if stream.ready(address)? {
+                engine_ready = true;
+            } else {
+                ensure!(Instant::now() < engine_by, "Sunshine не запустился. Подробности в host.log.");
+            }
+        }
+
+        // One stream opens at a time, so Sunshine's "connected" maps to one guest.
+        let opening = guests.iter().any(|g| g.state == PlayerState::Starting && g.sent_ready);
+        if engine_ready
+            && !opening
+            && let Some(at) = guests.iter().position(|g| g.state == PlayerState::Starting)
+        {
+            // The first guest on a lossy path: restart Sunshine with more
+            // redundancy while nobody is watching yet.
+            let busy = guests.iter().any(|g| g.state == PlayerState::Playing);
+            if !busy && guests[at].fec > fec {
+                fec = guests[at].fec;
+                drop(std::mem::replace(&mut stream, start_engine(fec)?));
+                engine_ready = false;
+                engine_by = Instant::now() + START_TIMEOUT;
+            } else {
+                wifi.get_or_insert_with(|| quiet_wifi(worker));
+                let guest = &mut guests[at];
+                guest.wire.send(&Reply::Ready {
+                    host: host_id,
+                    certificate: identity.cert_pem.clone(),
+                    mode,
+                    own_audio: audio.is_some(),
+                    client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
+                })?;
+                guest.sent_ready = true;
+                guest.since = Instant::now();
+            }
+        }
+
+        // Heartbeats, departures and timeouts.
+        let mut index = 0;
+        while index < guests.len() {
+            let guest = &mut guests[index];
+            let timeout = match guest.state {
+                PlayerState::Waiting => Some((DECISION_TIMEOUT, "Хост не ответил.")),
+                PlayerState::Starting => Some((START_TIMEOUT * 2, "Поток не запустился.")),
+                PlayerState::Playing => None,
+            };
+            let expired = timeout.filter(|(limit, _)| guest.since.elapsed() > *limit);
+            let alive = guest.last_ping.elapsed() <= SILENCE
+                && match guest.wire.poll::<Request>() {
+                    Ok(Some(Request::Ping)) => {
+                        guest.last_ping = Instant::now();
+                        guest.wire.send(&Reply::Pong).is_ok()
+                    }
+                    Ok(Some(Request::Measured { fec })) => {
+                        guest.fec = fec;
+                        true
+                    }
+                    Ok(None) => true,
+                    _ => false,
+                };
+            if let Some((_, reason)) = expired {
+                close(&mut guest.wire, reason);
+                guests.remove(index);
+            } else if !alive {
+                guests.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+
+        // The window: who is here, and how far away, ten times a second.
+        if Instant::now() >= next_players {
+            next_players = Instant::now() + LATENCY_EVERY;
+            let players: Vec<Player> = guests
+                .iter()
+                .map(|g| {
+                    let link = tunnel.link(g.port);
+                    Player {
+                        id: g.id,
+                        name: g.name.clone(),
+                        state: g.state,
+                        latency: link.map(|(_, rtt)| rtt.as_secs_f64() * 1000.0),
+                        place: link.map_or("", |(addr, _)| describe_peer(addr)),
+                    }
+                })
+                .collect();
+            if players != shown {
+                shown = players.clone();
+                worker.emit(Event::Players(players));
+            }
+            let playing = guests.iter().any(|g| g.state == PlayerState::Playing);
+            if playing && !playing_before {
+                worker.emit(Event::Streaming);
+            } else if !playing && playing_before {
+                worker.emit(Event::Invite(invite.encode()));
+            }
+            playing_before = playing;
+        }
+        if Instant::now() >= next_drops {
+            next_drops = Instant::now() + Duration::from_secs(2);
+            report_drops(worker, &mut drops_shown);
+        }
+        if guests.iter().all(|g| g.state != PlayerState::Playing) {
+            stream.check_running()?;
+        }
+        thread::sleep(Duration::from_millis(4));
+        continue 'lobby;
+    };
+    // Closing Sunshine removes the virtual controllers before telling the guests.
     drop(stream);
     drop(audio);
-    let _ = wire.send(&Reply::Closed {
-        reason: reason.into(),
-    });
-    drop(wire);
+    for guest in &mut guests {
+        close(&mut guest.wire, "Хост завершил сессию.");
+    }
+    drop(guests);
     drop(tunnel);
     Ok(reason.into())
-}
-
-fn host_tick(wire: &mut HostWire, last_ping: &mut Instant) -> Result<bool> {
-    if last_ping.elapsed() > SILENCE {
-        return Ok(false);
-    }
-    match wire.poll::<Request>() {
-        Ok(Some(Request::Ping)) => {
-            *last_ping = Instant::now();
-            wire.send(&Reply::Pong)?;
-        }
-        Ok(None) => {}
-        _ => return Ok(false),
-    }
-    Ok(true)
 }
 
 pub(crate) fn clean_name(name: &str) -> String {
@@ -482,7 +593,6 @@ fn guest(
     }
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
     worker.check()?;
-    let identity = Identity::generate("DuoLink Guest")?;
 
     worker.status("Ищем хост…");
     let tunnel = GuestTunnel::connect(invite.token, invite.fingerprint, &invite.candidates, || {
@@ -490,6 +600,31 @@ fn guest(
     })?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     let _wifi = quiet_wifi(worker);
+    worker.status("Ждём хост…");
+    let loopback = tunnel.loopback;
+    let endpoint = SocketAddr::from((loopback, CONTROL_PORT));
+    let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
+        .context("Хост не ответил.")?;
+    socket.set_read_timeout(Some(Duration::from_secs(4)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(4)))?;
+    let mut tls = ClientConnection::new(
+        client_config(&invite),
+        ServerName::from(std::net::IpAddr::from(loopback)),
+    )?;
+    tls.complete_io(&mut socket)
+        .context("Не удалось связаться с хостом.")?;
+    configure_socket(&socket)?;
+    let mut wire = Wire::new(StreamOwned::new(tls, socket));
+    // Ask first: the host sees the request at once, and the path is measured
+    // while they decide instead of before.
+    wire.send(&Request::Join {
+        token: invite.token,
+        name: clean_name(&nickname),
+        certificate: String::new(),
+        fec: None,
+        lobby: true,
+    })
+    .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");
     let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
     let path_mbps = channel.filter(|c| c.limited).map(|c| c.mbps);
@@ -515,30 +650,11 @@ fn guest(
         }
         None => DEFAULT_FEC,
     };
+    wire.send(&Request::Measured { fec }).context("Не удалось связаться с хостом.")?;
+    worker.status("Ждём, пока хост разрешит…");
     let mut next_rtt = Instant::now() + Duration::from_secs(2);
     let mut next_latency = Instant::now();
     let mut drops_shown = dropped();
-    worker.status("Ждём хост…");
-    let endpoint = SocketAddr::from((GUEST_LOOPBACK, CONTROL_PORT));
-    let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5))
-        .context("Хост не ответил.")?;
-    socket.set_read_timeout(Some(Duration::from_secs(4)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(4)))?;
-    let mut tls = ClientConnection::new(
-        client_config(&invite),
-        ServerName::from(std::net::IpAddr::from(GUEST_LOOPBACK)),
-    )?;
-    tls.complete_io(&mut socket)
-        .context("Не удалось связаться с хостом.")?;
-    configure_socket(&socket)?;
-    let mut wire = Wire::new(StreamOwned::new(tls, socket));
-    wire.send(&Request::Join {
-        token: invite.token,
-        name: clean_name(&nickname),
-        certificate: identity.cert_pem.clone(),
-        fec: Some(fec),
-    })
-    .context("Не удалось связаться с хостом.")?;
 
     let mut last_pong = Instant::now();
     let mut next_ping = Instant::now();
@@ -598,7 +714,8 @@ fn guest(
                 certificate,
                 mode,
                 own_audio,
-            }) if stream.is_none() && valid_pem(&certificate) => {
+                client: Some(client),
+            }) if stream.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let mode = preferences.mode(mode, display_mode().ok());
                 ensure!(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
@@ -622,18 +739,18 @@ fn guest(
                 stream = Some(GuestStream::start(
                     &engine,
                     &data,
-                    GUEST_LOOPBACK,
+                    loopback,
                     tunnel.same_machine,
                     own_audio,
                     host,
                     &certificate,
-                    &identity,
+                    &client,
                     mode,
                     preferences,
                 )?);
                 if own_audio {
                     _guest_audio = Some(GuestAudio::start(
-                        SocketAddr::from((GUEST_LOOPBACK, AUDIO_PORT)),
+                        SocketAddr::from((loopback, AUDIO_PORT)),
                         tunnel.same_machine,
                     )?);
                 }
@@ -669,13 +786,28 @@ mod tests {
                 .expect("timed out");
             match &event {
                 Event::Invite(_) => eprintln!("Одноразовый код создан"),
-                Event::Approval(_) => eprintln!("Запрос гостя получен"),
+                Event::Players(players) => eprintln!("Игроки: {players:?}"),
+                Event::Latency(_) => {}
                 _ => eprintln!("{event:?}"),
             }
             if let Some(value) = accept(event) {
                 return value;
             }
         }
+    }
+
+    /// Waits for someone to ask to join and returns their id.
+    fn waiting(host: &Session) -> u32 {
+        until(host, Duration::from_secs(60), |event| match event {
+            Event::Players(players) => players
+                .iter()
+                .find(|p| p.state == PlayerState::Waiting)
+                .map(|p| p.id.to_string()),
+            Event::Finished { message: error, .. } => panic!("{error}"),
+            _ => None,
+        })
+        .parse()
+        .unwrap()
     }
 
     /// WASAPI loopback, which Sunshine captures, delivers nothing while no
@@ -778,16 +910,8 @@ mod tests {
         })
         .unwrap();
         let guest = Session::guest(data.clone(), invite, prefs, "Тест".into());
-        until(&host, Duration::from_secs(20), |event| match event {
-            Event::Approval(_) => Some(String::new()),
-            Event::Finished { message: error, .. } => panic!("{error}"),
-            _ => None,
-        });
-        assert!(
-            TcpStream::connect((address, MEDIA_PORT)).is_err(),
-            "media open before approval"
-        );
-        host.decide(true);
+        let first = waiting(&host);
+        host.decide(first, true);
         for session in [&host, &guest] {
             until(session, Duration::from_secs(50), |event| match event {
                 Event::Streaming => Some(String::new()),
@@ -806,8 +930,6 @@ mod tests {
                     log.contains("mode=1920x1080x144"),
                     "the requested stream mode was not forwarded"
                 );
-                let host_log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
-                assert!(host_log.contains("CLIENT CONNECTED"));
                 break;
             }
             assert!(
@@ -816,7 +938,6 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(250));
         }
-        assert!(TcpStream::connect((address, MEDIA_PORT)).is_ok());
         // DUOLINK_TEST_HOLD=<seconds> keeps the stream open for a manual look;
         // closing Moonlight (Ctrl+Alt+Shift+Q) ends it early.
         if let Some(hold) = std::env::var("DUOLINK_TEST_HOLD").ok().and_then(|s| s.parse().ok()) {
@@ -829,20 +950,44 @@ mod tests {
                 return;
             }
         }
-        guest.cancel();
-        let result = until(&host, Duration::from_secs(8), |event| match event {
-            Event::Finished {
-                message: reason, ..
-            } => Some(reason),
+
+        // A second guest joins the same lobby with the same code and gets its own stream.
+        let second = Session::guest(data.clone(), Invite::decode(&code).unwrap(), prefs, "Второй".into());
+        let id = waiting(&host);
+        assert_ne!(id, first);
+        host.decide(id, true);
+        until(&second, Duration::from_secs(50), |event| match event {
+            Event::Streaming => Some(String::new()),
+            Event::Finished { message: error, .. } => panic!("{error}"),
             _ => None,
         });
-        assert!(
-            result.contains("отключился") || result.contains("закрыт"),
-            "{result}"
-        );
+        thread::sleep(Duration::from_secs(2));
+        let host_log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
+        assert!(host_log.matches("CLIENT CONNECTED").count() >= 2, "second stream did not connect");
+
+        // The first guest leaves; the lobby stays and the second keeps playing.
+        guest.cancel();
+        until(&host, Duration::from_secs(10), |event| match event {
+            Event::Players(players) if players.len() == 1 && players[0].name == "Второй" => Some(String::new()),
+            Event::Finished { message: error, .. } => panic!("{error}"),
+            _ => None,
+        });
+        assert!(!second.finished());
+
+        host.cancel();
+        let result = until(&second, Duration::from_secs(10), |event| match event {
+            Event::Finished { message: reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert!(result.contains("Хост завершил") || result.contains("закрыт"), "{result}");
+        until(&host, Duration::from_secs(10), |event| match event {
+            Event::Finished { .. } => Some(String::new()),
+            _ => None,
+        });
+        thread::sleep(Duration::from_millis(500));
         assert!(
             TcpStream::connect((address, MEDIA_PORT)).is_err(),
-            "media still listening after disconnect"
+            "media still listening after the lobby closed"
         );
 
         let host = Session::host(data.clone());
@@ -852,12 +997,8 @@ mod tests {
             _ => None,
         });
         let guest = Session::guest(data, Invite::decode(&code).unwrap(), prefs, "Тест".into());
-        until(&host, Duration::from_secs(20), |event| match event {
-            Event::Approval(_) => Some(String::new()),
-            Event::Finished { message: error, .. } => panic!("{error}"),
-            _ => None,
-        });
-        host.decide(false);
+        let id = waiting(&host);
+        host.decide(id, false);
         let result = until(&guest, Duration::from_secs(8), |event| match event {
             Event::Finished {
                 message: reason, ..
@@ -865,6 +1006,6 @@ mod tests {
             _ => None,
         });
         assert!(result.contains("Хост отклонил подключение"), "{result}");
-        assert!(TcpStream::connect((address, MEDIA_PORT)).is_err());
+        host.cancel();
     }
 }

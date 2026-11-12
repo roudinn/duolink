@@ -52,7 +52,10 @@ use crate::{
 
 pub const TUNNEL_PORT: u16 = 48170;
 /// Where the guest mirrors the host's ports, so a host on the same PC (127.0.0.1) never collides.
+/// A second guest on the same PC (tests) takes the next address.
 pub const GUEST_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+/// Guests in one lobby at once; Sunshine runs one encoder per guest.
+pub const MAX_GUESTS: usize = 4;
 const HOST_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA_PORT + 21];
 pub const UDP_PORTS: [u16; 4] = [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
@@ -594,7 +597,7 @@ fn reset(error: &std::io::Error) -> bool {
 }
 
 /// Host side: Sunshine's ports reached through 127.0.0.1.
-async fn serve_host(conn: Connection, pinger: Arc<Pinger>) {
+async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Vec<u16>>>) {
     tokio::spawn(ping_loop(conn.clone(), pinger.clone()));
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
@@ -636,6 +639,7 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>) {
     };
     while let Ok((send, mut recv)) = conn.accept_bi().await {
         let conn = conn.clone();
+        let control = control.clone();
         tokio::spawn(async move {
             let mut header = [0u8; 2];
             if recv.read_exact(&mut header).await.is_err() {
@@ -650,6 +654,12 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>) {
                 return;
             }
             if let Ok(tcp) = TcpStream::connect((HOST_LOOPBACK, port)).await {
+                // The session sees this socket's port and so knows which guest it is.
+                if port == CONTROL_PORT
+                    && let Ok(local) = tcp.local_addr()
+                {
+                    control.lock().unwrap().push(local.port());
+                }
                 pipe(tcp, send, recv).await;
             }
         });
@@ -869,8 +879,7 @@ pub struct HostTunnel {
     pub candidates: Vec<Candidate>,
     pub reflexive: Reflexive,
     pub forwarded: bool,
-    peer: Arc<Mutex<Option<Connection>>>,
-    pinger: Arc<Pinger>,
+    links: Arc<Mutex<Vec<Link>>>,
     alive: Arc<AtomicBool>,
     _mapping: Option<PortMapping>,
     _signal: Option<Subscription>,
@@ -919,9 +928,8 @@ impl HostTunnel {
             )?
         };
 
-        let peer = Arc::new(Mutex::new(None::<Connection>));
-        let pinger = Pinger::new();
-        runtime.spawn(accept(endpoint.clone(), token, peer.clone(), pinger.clone()));
+        let links = Arc::new(Mutex::new(Vec::<Link>::new()));
+        runtime.spawn(accept(endpoint.clone(), token, links.clone()));
 
         let alive = Arc::new(AtomicBool::new(true));
         // Keep our NAT mapping (and so the reflexive candidate) open while we wait.
@@ -951,28 +959,39 @@ impl HostTunnel {
             candidates,
             reflexive,
             forwarded: mapping.is_some(),
-            peer,
-            pinger,
+            links,
             alive,
             _mapping: mapping.map(|(_, mapping)| mapping),
             _signal: signal,
         })
     }
 
-    /// The authenticated guest, while its connection is up.
-    pub fn peer(&self) -> Option<(SocketAddr, Duration)> {
-        let peer = self.peer.lock().unwrap();
-        let conn = peer.as_ref()?;
-        conn.close_reason()
-            .is_none()
-            .then(|| (conn.remote_address(), self.pinger.rtt().unwrap_or_else(|| conn.rtt())))
+    /// The guest whose control connection reached the session from `control_port`,
+    /// while its tunnel is up: where it is and the current round trip.
+    pub fn link(&self, control_port: u16) -> Option<(SocketAddr, Duration)> {
+        let links = self.links.lock().unwrap();
+        let link = links.iter().find(|l| l.control.lock().unwrap().contains(&control_port))?;
+        link.conn.close_reason().is_none().then(|| {
+            (link.conn.remote_address(), link.pinger.rtt().unwrap_or_else(|| link.conn.rtt()))
+        })
     }
+
+    fn anyone(&self) -> bool {
+        self.links.lock().unwrap().iter().any(|l| l.conn.close_reason().is_none())
+    }
+}
+
+struct Link {
+    conn: Connection,
+    pinger: Arc<Pinger>,
+    /// Local ports of the session's control sockets opened through this link.
+    control: Arc<Mutex<Vec<u16>>>,
 }
 
 impl Drop for HostTunnel {
     fn drop(&mut self) {
         // Let the last control message (e.g. «rejected») reach the guest first.
-        if self.peer().is_some() {
+        if self.anyone() {
             thread::sleep(Duration::from_millis(300));
         }
         let _guard = self.runtime.as_ref().map(Runtime::enter);
@@ -984,21 +1003,19 @@ impl Drop for HostTunnel {
     }
 }
 
-async fn accept(
-    endpoint: Endpoint,
-    token: [u8; 16],
-    peer: Arc<Mutex<Option<Connection>>>,
-    pinger: Arc<Pinger>,
-) {
-    // A connection that died before the session began must not hold the slot.
-    let taken = |slot: &Option<Connection>| slot.as_ref().is_some_and(|c| c.close_reason().is_none());
+async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>>) {
+    // Connections that died must not hold a seat; a few spare seats let a
+    // reconnecting guest in before its old link times out.
+    let full = |links: &mut Vec<Link>| {
+        links.retain(|l| l.conn.close_reason().is_none());
+        links.len() >= MAX_GUESTS + 2
+    };
     while let Some(incoming) = endpoint.accept().await {
-        if taken(&peer.lock().unwrap()) {
+        if full(&mut links.lock().unwrap()) {
             incoming.refuse();
             continue;
         }
-        let peer = peer.clone();
-        let pinger = pinger.clone();
+        let links = links.clone();
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             let handshake = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1016,17 +1033,19 @@ async fn accept(
                 conn.close(VarInt::from_u32(3), b"denied");
                 return;
             }
+            let pinger = Pinger::new();
+            let control = Arc::new(Mutex::new(Vec::new()));
             {
-                let mut slot = peer.lock().unwrap();
-                if taken(&slot) {
+                let mut links = links.lock().unwrap();
+                if full(&mut links) {
                     conn.close(VarInt::from_u32(4), b"busy");
                     return;
                 }
-                *slot = Some(conn.clone());
+                links.push(Link { conn: conn.clone(), pinger: pinger.clone(), control: control.clone() });
             }
             let _ = send.write_all(&[1]).await;
             let _ = send.finish();
-            serve_host(conn, pinger).await;
+            serve_host(conn, pinger, control).await;
         });
     }
 }
@@ -1041,6 +1060,8 @@ pub struct GuestTunnel {
     pinger: Arc<Pinger>,
     pub kind: PathKind,
     pub same_machine: bool,
+    /// Where this guest mirrors the host's ports.
+    pub loopback: Ipv4Addr,
 }
 
 impl GuestTunnel {
@@ -1125,24 +1146,35 @@ impl GuestTunnel {
         // Let the losing attempts go.
         runtime.spawn(async move { while receiver.recv().await.is_some() {} });
 
-        let (listeners, sockets) = runtime.block_on(async {
+        let bind = |loopback: Ipv4Addr| runtime.block_on(async move {
             let mut listeners = Vec::new();
             for port in TCP_PORTS {
-                let listener = TcpListener::bind((GUEST_LOOPBACK, port))
+                let listener = TcpListener::bind((loopback, port))
                     .await
                     .with_context(|| format!("Порт {port} занят другой программой."))?;
                 listeners.push((port, listener));
             }
             let mut sockets = Vec::new();
             for port in UDP_PORTS {
-                let socket = UdpSocket::bind((GUEST_LOOPBACK, port))
+                let socket = UdpSocket::bind((loopback, port))
                     .await
                     .with_context(|| format!("Порт {port} занят другой программой."))?;
                 enlarge(socket2::SockRef::from(&socket));
                 sockets.push((port, socket));
             }
             anyhow::Ok((listeners, sockets))
-        })?;
+        });
+        let [a, b, c, d] = GUEST_LOOPBACK.octets();
+        let mut bound = bind(GUEST_LOOPBACK);
+        let mut loopback = GUEST_LOOPBACK;
+        for next in 1..8u8 {
+            if bound.is_ok() {
+                break;
+            }
+            loopback = Ipv4Addr::new(a, b, c, d + next);
+            bound = bind(loopback);
+        }
+        let (listeners, sockets) = bound?;
         let probe = Arc::new(Mutex::new(ProbeStats::default()));
         let pinger = Pinger::new();
         runtime.spawn(serve_guest(conn.clone(), listeners, sockets, probe.clone(), pinger.clone()));
@@ -1156,6 +1188,7 @@ impl GuestTunnel {
             pinger,
             kind,
             same_machine,
+            loopback,
         })
     }
 

@@ -225,7 +225,8 @@ impl Updater {
         let stopping = Arc::new(Mutex::new(false));
         let worker_stopping = stopping.clone();
         thread::spawn(move || {
-            let mut wait = Duration::from_secs(5);
+            // Right away: an update found at launch installs before anything starts.
+            let mut wait = Duration::ZERO;
             loop {
                 match triggers.recv_timeout(wait) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}

@@ -19,9 +19,8 @@ const wideQuery = window.matchMedia("(min-width: 721px)");
 const wide = () => wideQuery.matches;
 
 const HOST = {
-  working: "Создаём сессию",
-  invite: "Ждём друга",
-  approval: "Подключение",
+  working: "Создаём лобби",
+  invite: "Лобби",
   live: "В игре",
   stopping: "Завершаем",
 };
@@ -126,7 +125,7 @@ function renderSession(who, pane, table) {
   show(`${who}-details`, pane.facts.length > 0);
   renderFacts(`${who}-facts`, pane.facts);
   $(`${who}-stop`).disabled = pane.phase === "stopping";
-  renderPing(`${who}-ping`, pane);
+  if (who === "guest") renderPing("guest-ping", pane);
 }
 
 // Live round trip: digits only.
@@ -150,16 +149,13 @@ function renderPlay(next) {
   $("setup-stop").disabled = next.setup.phase === "stopping";
 
   renderSession("host", next.host, HOST);
-  const forFriend = Boolean(next.hostFor);
-  show("invitation", next.host.phase === "invite" && !forFriend);
-  show("approval", next.host.phase === "approval");
+  const lobby = ["invite", "live"].includes(next.host.phase) && Boolean(next.host.code);
+  show("invitation", lobby);
   text("code-box", next.host.code);
-  if (next.host.phase === "approval") {
-    const peer = next.host.peer === "Гость" ? tr("Гость") : next.host.peer;
-    line("host-message", pick(`${peer} хочет подключиться.`, `${peer} wants to connect.`));
-  }
-  if (next.host.phase === "invite" && forFriend) {
-    text("host-title", pick(`Ждём ${next.hostFor.name}`, `Waiting for ${next.hostFor.name}`));
+  renderPlayers(lobby ? next.host.players : []);
+  if (next.host.phase === "invite" && next.host.players.length === 0 && next.hostFor.length) {
+    const names = next.hostFor.map((f) => f.name.split("#")[0]).join(", ");
+    line("host-message", pick(`Позвали: ${names}. Можно позвать ещё или отправить код.`, `Invited: ${names}. Invite more or send the code.`));
   }
 
   renderSession("guest", next.guest, GUEST);
@@ -169,6 +165,49 @@ function renderPlay(next) {
   else guestCode.removeAttribute("aria-invalid");
   show("fix-video", next.guest.videoError);
   show("home", !sessionBusy(next));
+}
+
+// The lobby: who asked to join, who is opening the game, who plays and their ping.
+function renderPlayers(players) {
+  const root = $("players");
+  show("players", players.length > 0);
+  const key = JSON.stringify([language.value, players]);
+  if (root.dataset.key === key) return;
+  root.dataset.key = key;
+  replaceRows(root, players.map((player) => {
+    const row = document.createElement("div");
+    row.className = "friend";
+    const face = document.createElement("span");
+    face.className = "avatar";
+    face.setAttribute("aria-hidden", "true");
+    avatar(face, player.name);
+    const who = document.createElement("div");
+    who.className = "who";
+    const name = document.createElement("b");
+    name.textContent = player.name;
+    const note = document.createElement("small");
+    const ping = typeof player.latency === "number"
+      ? `${player.latency < 10 ? player.latency.toFixed(1) : Math.round(player.latency)} ${tr("мс")}` : "";
+    note.textContent = player.state === "waiting" ? tr("Хочет играть")
+      : player.state === "starting" ? tr("Открывает игру…") : ping;
+    who.append(name, note);
+    row.append(face, who);
+    const id = String(player.id);
+    if (player.state === "waiting") {
+      row.append(button("Отклонить", "deny", id), button("Разрешить", "allow", id, true));
+    } else {
+      const kick = document.createElement("button");
+      kick.type = "button";
+      kick.className = "round x";
+      kick.dataset.action = "kick";
+      kick.dataset.id = id;
+      kick.title = tr("Отключить");
+      kick.setAttribute("aria-label", `${tr("Отключить")} ${player.name}`);
+      kick.innerHTML = '<svg aria-hidden="true"><use href="#i-close"/></svg>';
+      row.append(kick);
+    }
+    return row;
+  }));
 }
 
 /* ---------------- friends ---------------- */
@@ -198,7 +237,7 @@ function removeButton(friend) {
   return b;
 }
 
-function friendRow(friend, busy) {
+function friendRow(friend, busy, invited) {
   const row = document.createElement("div");
   row.className = "friend";
   const face = document.createElement("span");
@@ -232,7 +271,7 @@ function friendRow(friend, busy) {
     }
     row.append(removeButton(friend));
   } else {
-    const invite = button("Позвать", "invite_friend", friend.id, false, busy);
+    const invite = button(invited ? "Позван" : "Позвать", "invite_friend", friend.id, false, busy || invited);
     if (busy) invite.title = tr("Сначала завершите сессию");
     row.append(invite, removeButton(friend));
   }
@@ -282,7 +321,10 @@ function renderFriends(next) {
   $("add-button").disabled = next.lookingUp;
   text("add-button", tr(next.lookingUp ? "Ищем…" : "Добавить"));
 
-  const busy = sessionBusy(next);
+  // A running lobby takes more friends; a guest session or setup does not.
+  const lobbyOpen = next.host.phase !== "idle" || next.setup.phase !== "idle";
+  const busy = next.guest.phase !== "idle" || (sessionBusy(next) && !lobbyOpen);
+  const invited = new Set(lobbyOpen ? next.hostFor.map((f) => f.name) : []);
   const byName = (a, b) => a.name.localeCompare(b.name);
   const sections = [
     ["Запросы в друзья", next.friends.filter((f) => f.status === "incoming")],
@@ -290,7 +332,7 @@ function renderFriends(next) {
     ["Исходящие запросы", next.friends.filter((f) => f.status === "outgoing")],
   ].filter(([, list]) => list.length);
 
-  const key = JSON.stringify([language.value, sections, busy, confirmRemove]);
+  const key = JSON.stringify([language.value, sections, busy, confirmRemove, [...invited]]);
   const root = $("friend-sections");
   if (root.dataset.key !== key) {
     root.dataset.key = key;
@@ -300,7 +342,7 @@ function renderFriends(next) {
       label.textContent = tr(title);
       const group = document.createElement("div");
       group.className = "group";
-      group.append(...list.sort(byName).map((f) => friendRow(f, busy)));
+      group.append(...list.sort(byName).map((f) => friendRow(f, busy, invited.has(`${f.name}#${f.tag}`))));
       // The panel is already titled "Друзья"; a second heading would repeat it.
       return title === "Друзья" ? [group] : [label, group];
     }));
@@ -326,8 +368,11 @@ function renderSettings(next) {
   text("update-check", tr(ready ? "Перезапустить" : "Проверить"));
   $("update-check").dataset.action = ready ? "restart" : "check_update";
   $("update-check").disabled = ["checking", "downloading"].includes(u.state) || (ready && busy);
-  show("update-banner", ready && !busy);
+  const downloading = u.state === "downloading";
+  show("update-banner", (ready || downloading) && !busy);
+  show("update-restart", ready);
   if (ready) text("update-title", pick(`Обновление ${u.version}`, `Update ${u.version}`));
+  if (downloading) text("update-title", pick(`Обновляем до ${u.version}…`, `Updating to ${u.version}…`));
   line("video-feedback", next.guest.videoError ? notice(next.guest.message) : "", next.guest.videoError);
 }
 
@@ -409,6 +454,11 @@ document.addEventListener("click", (e) => {
     case "invite_friend":
       send("invite_friend", { id });
       if (!wide()) go("play");
+      break;
+    case "allow":
+    case "deny":
+    case "kick":
+      send(action, { id: Number(id) });
       break;
     default: send(action, id ? { id } : {});
   }

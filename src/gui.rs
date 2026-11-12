@@ -34,7 +34,7 @@ use crate::{
     media::{Form, Preferences},
     platform::{data_dir, open},
     protocol::Invite,
-    session::{Event, Session},
+    session::{Event, Player, PlayerState, Session},
     setup,
     update::{self, Updater},
 };
@@ -42,6 +42,44 @@ use crate::{
 const VIEW: &str = "duolink://localhost/index.html";
 const WINDOWS_VIEW: &str = "https://duolink.localhost/index.html";
 const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
+/// An update found this soon after launch installs and restarts on its own.
+const AUTO_RESTART: Duration = Duration::from_secs(120);
+/// WebView2 without what a local two-screen UI never uses: less memory, no
+/// background traffic, and no GPU process competing with the game's encoder.
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,\
+OptimizationHints,AutofillServerCommunication,MediaRouter,SpareRendererForSitePerProcess \
+--disable-background-networking --disable-component-update --disable-default-apps --disable-sync \
+--no-first-run --renderer-process-limit=1 --disable-gpu --disable-gpu-compositing";
+
+/// Lets WebView2 drop caches while the window is in the background.
+fn memory_level(view: &WebView, low: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL, ICoreWebView2_19,
+    };
+    use windows::core::Interface;
+    use wry::WebViewExtWindows;
+    let level = if low { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW } else { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL };
+    unsafe {
+        if let Ok(core) = view.controller().CoreWebView2()
+            && let Ok(core) = core.cast::<ICoreWebView2_19>()
+        {
+            let _ = core.SetMemoryUsageTargetLevel(level);
+        }
+    }
+}
+
+/// Downloads Sunshine and Moonlight in the background on first launch, so
+/// the first session starts the game instead of a download.
+fn prefetch_engines(data: PathBuf) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(4));
+        for engine in [&crate::media::MOONLIGHT, &crate::media::SUNSHINE] {
+            if !engine.path(&data).is_file() {
+                let _ = engine.ensure(&data, || Ok(()));
+            }
+        }
+    });
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -49,8 +87,9 @@ enum Action {
     Ready,
     HostStart,
     HostStop,
-    Allow,
-    Deny,
+    Allow { id: u32 },
+    Deny { id: u32 },
+    Kick { id: u32 },
     Copy,
     GuestStart { code: String, options: Form },
     GuestStop,
@@ -112,7 +151,7 @@ impl Invitation {
     }
 }
 
-/// The friend a running host session was created for.
+/// A friend the running lobby was sent to.
 #[derive(Clone, Serialize)]
 struct HostFor {
     name: String,
@@ -131,7 +170,6 @@ enum Phase {
     Idle,
     Working,
     Invite,
-    Approval,
     Live,
     Stopping,
 }
@@ -147,6 +185,8 @@ struct Pane {
     code_error: bool,
     video_error: bool,
     facts: Vec<(&'static str, String)>,
+    /// The host's lobby.
+    players: Vec<Player>,
     /// Round trip in milliseconds while connected.
     latency: Option<f64>,
     #[serde(skip)]
@@ -167,6 +207,7 @@ impl Pane {
     fn begin(&mut self, session: Session, message: &str) {
         self.set(Phase::Working, message);
         self.facts.clear();
+        self.players.clear();
         self.latency = None;
         self.session = Some(session);
     }
@@ -188,13 +229,24 @@ impl Pane {
         }
     }
 
-    fn decide(&mut self, accept: bool) {
-        if self.phase == Phase::Approval
-            && let Some(session) = &self.session
+    fn decide(&mut self, id: u32, accept: bool) {
+        if let Some(session) = &self.session
+            && let Some(player) = self.players.iter_mut().find(|p| p.id == id && p.state == PlayerState::Waiting)
         {
-            session.decide(accept);
-            self.set(Phase::Working, if accept { "Запускаем…" } else { "Отклоняем…" });
+            session.decide(id, accept);
+            player.state = PlayerState::Starting;
         }
+    }
+
+    fn kick(&mut self, id: u32) {
+        if let Some(session) = &self.session {
+            session.kick(id);
+            self.players.retain(|p| p.id != id);
+        }
+    }
+
+    fn waiting(&self) -> usize {
+        self.players.iter().filter(|p| p.state == PlayerState::Waiting).count()
     }
 
     /// Applies queued session events. Returns (changed, finished).
@@ -215,22 +267,22 @@ impl Pane {
                     None => self.facts.push((key, value.clone())),
                 },
                 Event::Invite(code) => {
-                    self.set(Phase::Invite, "Отправьте код другу.");
+                    self.set(Phase::Invite, "Отправьте код друзьям.");
                     self.code = code.clone();
                 }
-                Event::Approval(peer) => {
-                    self.set(Phase::Approval, "");
-                    self.peer = peer.clone();
-                }
+                Event::Players(players) => self.players = players.clone(),
                 Event::Latency(rtt) => self.latency = Some(rtt.as_secs_f64() * 1000.0),
-                Event::Streaming => self.set(
-                    Phase::Live,
-                    if host { "Добавьте второго игрока в игре." } else { "Окно игры открыто." },
-                ),
+                Event::Streaming if host => {
+                    // The lobby stays open: the code still lets more friends in.
+                    self.phase = Phase::Live;
+                    self.message = "Добавьте игроков в игре.".into();
+                }
+                Event::Streaming => self.set(Phase::Live, "Окно игры открыто."),
                 Event::Finished { message, failed } => {
                     self.set(Phase::Idle, message.clone());
                     self.error = *failed;
                     self.latency = None;
+                    self.players.clear();
                     finished = true;
                 }
             }
@@ -261,7 +313,7 @@ struct App {
     me: MeView,
     friends: Vec<FriendView>,
     invitations: Vec<Invitation>,
-    host_for: Option<HostFor>,
+    host_for: Vec<HostFor>,
     looking_up: bool,
     #[serde(skip)]
     identity: Me,
@@ -283,6 +335,8 @@ struct App {
     updater: Option<Updater>,
     #[serde(skip)]
     quit: bool,
+    #[serde(skip)]
+    launched: Instant,
     /// The user stopped hosting while the driver/firewall check was running.
     #[serde(skip)]
     setup_cancelled: bool,
@@ -291,10 +345,9 @@ struct App {
 }
 
 impl App {
-    fn new(data: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
+    fn new(data: PathBuf, wake: Arc<dyn Fn() + Send + Sync>, updater: Option<Updater>) -> Result<Self> {
         let identity = Me::load_or_create(&data)?;
         let book = Book::load(&data);
-        let updater = Updater::start(wake.clone());
         let mut app = Self {
             host: Pane::default(),
             guest: Pane::default(),
@@ -304,7 +357,7 @@ impl App {
             me: MeView { name: String::new(), tag: String::new(), chosen: false },
             friends: Vec::new(),
             invitations: Vec::new(),
-            host_for: None,
+            host_for: Vec::new(),
             looking_up: false,
             mail_history: MailHistory::load(&data),
             sending_requests: HashSet::new(),
@@ -316,6 +369,7 @@ impl App {
             attention: false,
             updater,
             quit: false,
+            launched: Instant::now(),
             setup_cancelled: false,
             data,
         };
@@ -497,15 +551,13 @@ impl App {
                 }
             }
             Message::InviteDecline { at } => {
-                if let Some(target) = &self.host_for
-                    && target.key == from
-                    && target.sent_at == Some(at)
-                    && !target.joined
+                if let Some(index) = self
+                    .host_for
+                    .iter()
+                    .position(|t| t.key == from && t.sent_at == Some(at) && !t.joined)
                 {
-                    let name = target.name.clone();
-                    self.host_for = None;
-                    self.host.stop();
-                    toast(view, &format!("{name} отказался."))?;
+                    let target = self.host_for.remove(index);
+                    toast(view, &format!("{} отказался.", target.name))?;
                 }
             }
             Message::InviteCancel { at } if is_friend || self.sending_requests.contains(&from) => {
@@ -527,7 +579,7 @@ impl App {
         match action {
             Action::Ready | Action::Wake => {}
             Action::HostStart if self.session_idle() => {
-                self.host_for = None;
+                self.host_for.clear();
                 self.begin_hosting();
             }
             Action::HostStop => {
@@ -538,9 +590,10 @@ impl App {
                 }
                 self.host.stop();
             }
-            Action::Allow => self.host.decide(true),
-            Action::Deny => self.host.decide(false),
-            Action::Copy if self.host.phase == Phase::Invite => copy(view, &self.host.code, "Код скопирован")?,
+            Action::Allow { id } => self.host.decide(id, true),
+            Action::Deny { id } => self.host.decide(id, false),
+            Action::Kick { id } => self.host.kick(id),
+            Action::Copy if !self.host.code.is_empty() => copy(view, &self.host.code, "Код скопирован")?,
             Action::GuestStart { code, options } if self.session_idle() => match Invite::decode(&code) {
                 Ok(invite) => match Preferences::parse(&options) {
                     Ok(preferences) => self.start_guest(invite, preferences),
@@ -643,12 +696,17 @@ impl App {
             }
             Action::CopyHandle if self.identity.chosen => copy(view, &self.identity.handle(), "Ник скопирован")?,
             Action::CopyCode if self.identity.chosen => copy(view, &self.identity.code(), "Код друга скопирован")?,
-            Action::InviteFriend { id } if self.identity.chosen && self.session_idle() => {
+            Action::InviteFriend { id } if self.identity.chosen => {
                 if let Some((friend, key)) = self.friend(&id).filter(|(f, _)| f.status == Status::Friend) {
-                    self.host_for = Some(HostFor {
-                        name: friend.handle(), key, sent_at: None, joined: false,
-                    });
-                    self.begin_hosting();
+                    let lobby_open = self.host.session.is_some() || self.setup.session.is_some();
+                    if self.session_idle() {
+                        self.host_for.clear();
+                        self.host_for.push(HostFor { name: friend.handle(), key, sent_at: None, joined: false });
+                        self.begin_hosting();
+                    } else if lobby_open && !self.host_for.iter().any(|t| t.key == key) {
+                        // More friends into the running lobby.
+                        self.host_for.push(HostFor { name: friend.handle(), key, sent_at: None, joined: false });
+                    }
                 }
             }
             Action::AcceptInvite { id, options } if self.session_idle() => {
@@ -685,9 +743,13 @@ impl App {
     }
 
     fn poll(&mut self, view: &WebView) {
-        let awaiting_approval = self.host.phase == Phase::Approval;
+        let waiting = self.host.waiting();
         let (host, host_done) = self.host.poll(true);
-        self.attention |= !awaiting_approval && self.host.phase == Phase::Approval;
+        // Someone new knocked: get the host's attention.
+        if self.host.waiting() > waiting {
+            self.attention = true;
+            crate::audio::play_chime();
+        }
         let (guest, _) = self.guest.poll(false);
         let (setup, setup_done) = self.setup.poll(false);
         let mut changed = host || guest || setup;
@@ -697,14 +759,22 @@ impl App {
                 self.update = status;
                 changed = true;
             }
+            // Found at launch and nothing started yet: switch to it straight away.
+            if matches!(self.update, update::Status::Ready(_))
+                && self.launched.elapsed() < AUTO_RESTART
+                && self.session_idle()
+                && updater.relaunch().is_ok()
+            {
+                self.quit = true;
+            }
         }
         if setup_done {
             if std::mem::take(&mut self.setup_cancelled) {
-                self.host_for = None;
+                self.host_for.clear();
                 self.setup.set(Phase::Idle, "");
                 self.host.set(Phase::Idle, "");
             } else if self.setup.error {
-                self.host_for = None;
+                self.host_for.clear();
                 self.host.fail(self.setup.message.clone());
             } else {
                 self.start_host();
@@ -712,24 +782,27 @@ impl App {
         }
 
         // Friend invite: hand the session code to the friend once it exists.
-        let mut invite_to_send = None;
-        if let Some(target) = &mut self.host_for {
-            if target.sent_at.is_none() && self.host.phase == Phase::Invite && !self.host.code.is_empty() {
+        let mut invites_to_send = Vec::new();
+        let lobby_ready = matches!(self.host.phase, Phase::Invite | Phase::Live) && !self.host.code.is_empty();
+        for target in &mut self.host_for {
+            if target.sent_at.is_none() && lobby_ready {
                 let at = friends::now();
                 target.sent_at = Some(at);
-                invite_to_send = Some((target.key, at));
+                invites_to_send.push((target.key, at));
             }
-            target.joined |= self.host.phase == Phase::Live;
+            let nick = target.name.split('#').next().unwrap_or_default();
+            target.joined |= self.host.players.iter().any(|p| p.name == nick);
         }
-        if let Some((key, at)) = invite_to_send {
+        for (key, at) in invites_to_send {
             let message = Message::Invite { name: self.identity.name.clone(), code: self.host.code.clone(), at };
             self.send(key, &message, move |result| Job::InviteSent { key, at, result });
-            self.host.message = "Отправляем приглашение…".into();
             changed = true;
         }
-        if host_done && let Some(target) = self.host_for.take() {
-            if let (Some(at), false) = (target.sent_at, target.joined) {
-                self.tell(&target.key, &Message::InviteCancel { at });
+        if host_done {
+            for target in std::mem::take(&mut self.host_for) {
+                if let (Some(at), false) = (target.sent_at, target.joined) {
+                    self.tell(&target.key, &Message::InviteCancel { at });
+                }
             }
             changed = true;
         }
@@ -795,14 +868,13 @@ impl App {
                     }
                 }
                 Job::InviteSent { key, at, result } => {
-                    if self.host_for.as_ref().is_some_and(|target| target.key == key && target.sent_at == Some(at)) {
-                        if self.host.phase == Phase::Invite {
-                            match result {
-                                Ok(()) => self.host.message = "Приглашение отправлено.".into(),
-                                Err(error) => {
-                                    self.host_for = None;
-                                    self.host.message = format!("{error} Отправьте другу код сессии.");
-                                }
+                    if let Some(index) = self.host_for.iter().position(|t| t.key == key && t.sent_at == Some(at)) {
+                        let name = self.host_for[index].name.clone();
+                        match result {
+                            Ok(()) => { let _ = toast(view, &format!("Приглашение для {name} отправлено.")); }
+                            Err(error) => {
+                                self.host_for.remove(index);
+                                let _ = toast(view, &format!("{error} Отправьте {name} код сессии."));
                             }
                         }
                     } else if result.is_ok() {
@@ -839,10 +911,10 @@ impl App {
         for session in sessions.into_iter().flatten() {
             session.cancel();
         }
-        if let Some(target) = &self.host_for
-            && let (Some(at), false) = (target.sent_at, target.joined)
-        {
-            friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
+        for target in &self.host_for {
+            if let (Some(at), false) = (target.sent_at, target.joined) {
+                friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
+            }
         }
         self.inbox = None;
         let by = Instant::now() + Duration::from_secs(2);
@@ -918,7 +990,14 @@ pub fn run() -> Result<()> {
         window.set_outer_position(PhysicalPosition::new(origin.x + x as i32, origin.y + y as i32));
     }
     let proxy = event_loop.create_proxy();
+    let waker = event_loop.create_proxy();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = waker.send_event(Action::Wake);
+    });
+    // The update check runs while the window and WebView2 start.
+    let updater = Updater::start(wake.clone());
     let view = WebViewBuilder::new_with_web_context(&mut context)
+        .with_additional_browser_args(BROWSER_ARGS)
         .with_background_color((11, 11, 11, 255))
         .with_theme(wry::Theme::Dark)
         .with_https_scheme(true)
@@ -939,13 +1018,8 @@ pub fn run() -> Result<()> {
         .with_url(VIEW)
         .build(&window)
         .context("Не удалось открыть окно. Нужен Microsoft Edge WebView2 Runtime.")?;
-    let waker = event_loop.create_proxy();
-    let mut app = App::new(
-        data,
-        Arc::new(move || {
-            let _ = waker.send_event(Action::Wake);
-        }),
-    )?;
+    prefetch_engines(data.clone());
+    let mut app = App::new(data, wake, updater)?;
     window.set_visible(true);
     let mut next_announce = Instant::now() + DIRECTORY_REFRESH;
 
@@ -964,6 +1038,12 @@ pub fn run() -> Result<()> {
             }
             WindowEvent::MainEventsCleared => {
                 app.poll(&view);
+                if app.quit {
+                    window.set_visible(false);
+                    app.shutdown();
+                    *control = ControlFlow::Exit;
+                    return;
+                }
                 if std::mem::take(&mut app.attention) {
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
@@ -974,6 +1054,9 @@ pub fn run() -> Result<()> {
                     }
                     next_announce = now + DIRECTORY_REFRESH;
                 }
+            }
+            WindowEvent::WindowEvent { event: NativeEvent::Focused(focused), .. } => {
+                memory_level(&view, !focused);
             }
             WindowEvent::WindowEvent { event: NativeEvent::CloseRequested, .. } => {
                 window.set_visible(false);

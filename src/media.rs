@@ -15,6 +15,7 @@ use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::{
+    tunnel::MAX_GUESTS,
     platform::{Process, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
@@ -194,6 +195,7 @@ pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
          mouse = disabled\n\
          native_pen_touch = disabled\n\
          stream_audio = enabled\n\
+         channels = {MAX_GUESTS}\n\
          install_steam_audio_drivers = disabled\n\
          dd_configuration_option = verify_only\n\
          dd_resolution_option = disabled\n\
@@ -295,7 +297,8 @@ impl HostStream {
         Ok(())
     }
 
-    pub fn events(&mut self) -> Result<(bool, bool)> {
+    /// How many clients connected and disconnected since the last call.
+    pub fn events(&mut self) -> Result<(usize, usize)> {
         self.check_running()?;
         let mut file = File::open(&self.output)?;
         file.seek(SeekFrom::Start(self.offset))?;
@@ -308,11 +311,11 @@ impl HostStream {
             if self.tail.len() > 32 * 1024 {
                 self.tail.clear();
             }
-            return Ok((false, false));
+            return Ok((0, 0));
         };
         let lines = &self.tail[..end];
-        let connected = lines.contains("CLIENT CONNECTED");
-        let disconnected = lines.contains("CLIENT DISCONNECTED");
+        let connected = lines.matches("CLIENT CONNECTED").count();
+        let disconnected = lines.matches("CLIENT DISCONNECTED").count();
         self.tail.drain(..=end);
         Ok((connected, disconnected))
     }
@@ -525,7 +528,7 @@ impl GuestStream {
         own_audio: bool,
         host: Uuid,
         certificate: &str,
-        identity: &Identity,
+        client: &crate::protocol::ClientKey,
         mode: Mode,
         preferences: Preferences,
     ) -> Result<Self> {
@@ -545,8 +548,8 @@ impl GuestStream {
              [hosts]\nsize=1\n1\\hostname={DESKTOP}\n1\\uuid={host}\n1\\manualaddress={address}\n\
              1\\manualport={MEDIA_PORT}\n1\\srvcert={}\n1\\nvidiasw=false\n",
                 &uid[..16],
-                qt_bytes(&identity.cert_pem),
-                qt_bytes(&identity.key_pem),
+                qt_bytes(&client.certificate),
+                qt_bytes(&client.key),
                 qt_bytes(certificate)
             ),
         )?;

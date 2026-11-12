@@ -45,16 +45,12 @@
         <!-- Live sessions -->
         <div id="host-live" class="session" hidden>
           <h1 id="host-title" tabindex="-1"></h1>
-          <p id="host-ping" class="ping" aria-live="off" hidden></p>
           <p id="host-message" class="muted" role="status"></p>
           <div id="invitation" class="code-row" hidden>
             <span id="code-box" class="code"></span>
             <button type="button" class="btn primary" data-action="copy" aria-label="Скопировать код"><svg aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button>
           </div>
-          <div id="approval" class="pair" hidden>
-            <button type="button" class="btn block" data-action="deny">Отклонить</button>
-            <button type="button" class="btn primary block" data-action="allow">Разрешить</button>
-          </div>
+          <div id="players" class="group players" aria-label="Игроки" hidden></div>
           <details id="host-details" hidden><summary>Подробности</summary><dl id="host-facts" class="facts"></dl></details>
           <button type="button" id="host-stop" class="btn block" data-action="host_stop">Завершить сессию</button>
         </div>
@@ -87,7 +83,7 @@
 
         <div id="update-banner" class="notice" hidden>
           <b id="update-title"></b>
-          <button type="button" class="btn small" data-action="restart">Перезапустить</button>
+          <button type="button" id="update-restart" class="btn small" data-action="restart">Перезапустить</button>
         </div>
       </section>
     </main>
