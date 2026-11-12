@@ -257,7 +257,19 @@ pub enum Request {
     Ping,
     Leave,
     /// What the guest's path needs, measured while the host decides.
-    Measured { fec: u8 },
+    Measured {
+        fec: u8,
+        #[serde(default)]
+        bandwidth: Option<StreamBandwidth>,
+    },
+    /// Actual request to Moonlight, sent only after a host advertises a budget.
+    Bitrate { kbps: u32 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct StreamBandwidth {
+    pub path_kbps: Option<u32>,
+    pub manual_kbps: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -274,6 +286,8 @@ pub enum Reply {
         own_audio: bool,
         #[serde(default)]
         audio_opus: bool,
+        #[serde(default)]
+        auto_bitrate_kbps: Option<u32>,
         /// The client identity Sunshine already trusts.
         #[serde(default)]
         client: Option<ClientKey>,
@@ -378,7 +392,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn legacy_audio_messages_default_to_pcm() {
+    fn legacy_messages_keep_pcm_and_local_bitrate_selection() {
         let token = [0u8; 16];
         let join = serde_json::json!({
             "type": "join", "token": token, "name": "Guest", "certificate": "",
@@ -388,10 +402,15 @@ mod tests {
             "type": "ready", "host": Uuid::nil(), "certificate": "", "own_audio": true,
             "mode": Mode { width: 1920, height: 1080, fps: 60 }
         });
+        let measured = serde_json::json!({ "type": "measured", "fec": 20 });
         assert!(matches!(serde_json::from_value(join).unwrap(), Request::Join { audio_opus: false, .. }));
         assert!(matches!(
             serde_json::from_value(ready).unwrap(),
-            Reply::Ready { own_audio: true, audio_opus: false, .. }
+            Reply::Ready { own_audio: true, audio_opus: false, auto_bitrate_kbps: None, .. }
+        ));
+        assert!(matches!(
+            serde_json::from_value(measured).unwrap(),
+            Request::Measured { fec: 20, bandwidth: None }
         ));
     }
 

@@ -11,6 +11,10 @@
 //! its own candidates (encrypted with the invite token) through ntfy.sh and
 //! both sides fire punch packets at each other while QUIC retries its handshake.
 
+#[cfg(test)]
+#[path = "network_qa.rs"]
+mod network_qa;
+
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
@@ -879,12 +883,28 @@ fn is_self(ip: IpAddr) -> bool {
     }
 }
 
-/// How the host sees its guest: by where the guest's packets come from.
-pub fn describe_peer(addr: SocketAddr) -> &'static str {
-    match addr.ip() {
-        ip if is_self(ip) => "Этот ПК",
-        IpAddr::V4(ip) if ip.is_private() || shared_address(ip) => "Локальная сеть",
-        _ => "Интернет",
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerNetwork {
+    ThisPc,
+    Lan,
+    Internet,
+}
+
+impl PeerNetwork {
+    pub fn from_address(addr: SocketAddr) -> Self {
+        match addr.ip() {
+            ip if is_self(ip) => Self::ThisPc,
+            IpAddr::V4(ip) if ip.is_private() => Self::Lan,
+            _ => Self::Internet,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ThisPc => "Этот ПК",
+            Self::Lan => "Локальная сеть",
+            Self::Internet => "Интернет",
+        }
     }
 }
 
@@ -1002,6 +1022,37 @@ impl HostTunnel {
         self.probes.streaming.store(true, Ordering::Release);
     }
 
+    pub fn resume_probes(&self) {
+        self.probes.streaming.store(false, Ordering::Release);
+    }
+
+    pub fn manage_guest(&self, control_port: u16) {
+        for link in self.links.lock().unwrap().iter() {
+            let mut ports = link.ports.lock().unwrap();
+            if ports.control.contains(&control_port) {
+                ports.managed = true;
+            }
+        }
+    }
+
+    pub fn retain_guests(&self, live_ports: &[u16]) {
+        for link in self.links.lock().unwrap().iter() {
+            let mut ports = link.ports.lock().unwrap();
+            if ports.managed && !ports.closing && !ports.control.iter().any(|port| live_ports.contains(port)) {
+                ports.closing = true;
+                let conn = link.conn.clone();
+                // Give the final control reply one short opportunity to arrive.
+                // Closing does not depend on cooperation from the guest.
+                let close = async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    conn.close(VarInt::from_u32(0), b"removed");
+                };
+                if let Some(runtime) = &self.runtime { runtime.spawn(close); }
+                else { tokio::spawn(close); }
+            }
+        }
+    }
+
     /// The guest whose control connection reached the session from `control_port`,
     /// while its tunnel is up.
     pub fn link(&self, control_port: u16) -> Option<GuestLink> {
@@ -1032,6 +1083,8 @@ pub struct GuestLink {
 struct LinkPorts {
     control: Vec<u16>,
     audio: Option<SocketAddr>,
+    managed: bool,
+    closing: bool,
 }
 
 struct Link {
@@ -1433,12 +1486,19 @@ mod tests {
                 let (median, p99, _) = percentiles(round_trips);
                 eprintln!("local QUIC RTT with seven guests: median {median:.0} µs, p99 {p99:.0} µs");
 
-                first.close(VarInt::from_u32(0), b"bye");
+                host.manage_guest(first_port);
+                host.manage_guest(second_port);
+                host.retain_guests(&[second_port]);
                 assert_eq!(first_tcp.read(&mut [0; 1]).await.unwrap(), 0);
                 assert!(host.link(first_port).is_none());
                 assert_eq!(host.link(second_port).unwrap().audio, Some(second_route));
                 audio.send_to(b"still here", second_route).await.unwrap();
                 assert_eq!(&receive_audio(&second).await[..], b"still here");
+                let (replacement, _, _, _, replacement_port) = join().await;
+                assert!(host.link(replacement_port).is_some());
+                replacement.close(VarInt::from_u32(0), b"bye");
+                host.resume_probes();
+                assert!(offered(probe(&second, 120).await).await > 0);
                 second.close(VarInt::from_u32(0), b"bye");
             }).await.expect("loopback audio routing timed out");
         });

@@ -382,14 +382,42 @@ pub struct Preferences {
 }
 
 pub const MAX_BITRATE_KBPS: u32 = 500_000;
+pub const MIN_AUTO_BITRATE_KBPS: u32 = 500;
 /// Ceiling: 1.5× Moonlight's reference. Past it the picture barely improves
 /// while every frame grows and takes longer on the wire; FPS and latency win.
 const QUALITY_SCALE: f64 = 1.5;
-/// Share of the measured path the video may take. With single-frame VBV a
-/// frame is at most bitrate/fps, so at 35 % of the path it crosses the link in
-/// about a third of a frame interval, and the router never builds a queue.
+/// Keep headroom for frame bursts, audio and other traffic.
 pub const PATH_SHARE: f64 = 0.35;
-const UNMEASURED_BITRATE_KBPS: u32 = 15_000;
+pub const UNMEASURED_BITRATE_KBPS: u32 = 15_000;
+
+fn path_bitrate_kbps(path_kbps: u32) -> u32 {
+    ((path_kbps as f64 * PATH_SHARE) as u32).clamp(MIN_AUTO_BITRATE_KBPS, MAX_BITRATE_KBPS)
+}
+
+pub fn stream_wire_kbps(bitrate: u32, audio_kbps: u32) -> u32 {
+    // Sunshine includes FEC in Moonlight's requested rate. Allow 10% for
+    // QUIC/IP/RTP and 650 kbps for its stereo audio/control at low video rates,
+    // where Sunshine caps the audio deduction. DuoLink audio is additional.
+    bitrate.saturating_add(bitrate.div_ceil(10)).saturating_add(650).saturating_add(audio_kbps)
+}
+
+pub fn lobby_wire_budget(capacity: Option<u32>) -> u32 {
+    capacity.map_or(UNMEASURED_BITRATE_KBPS, |kbps| (u64::from(kbps) * 60 / 100) as u32)
+}
+
+/// Zero means no room: never round an exhausted budget up to a playable rate.
+pub fn lobby_bitrate_limit(capacity: Option<u32>, reserved: u32, audio_kbps: u32) -> u32 {
+    let remaining = lobby_wire_budget(capacity).saturating_sub(reserved);
+    let minimum = stream_wire_kbps(MIN_AUTO_BITRATE_KBPS, audio_kbps);
+    if remaining < minimum {
+        return 0;
+    }
+    let share = if reserved == 0 && capacity.is_some() { remaining } else { (remaining / 2).max(minimum) };
+    let bitrate = (u64::from(share.saturating_sub(audio_kbps + 650)) * 100 / 110) as u32;
+    let ceiling = if reserved == 0 { capacity.map_or(UNMEASURED_BITRATE_KBPS, path_bitrate_kbps) }
+        else { UNMEASURED_BITRATE_KBPS };
+    bitrate.min(ceiling)
+}
 
 impl Preferences {
     pub fn parse(form: &Form) -> Result<Self> {
@@ -455,23 +483,25 @@ impl Preferences {
             return bitrate;
         }
         let kbps = reference_bitrate(mode, self.yuv444) as f64 * QUALITY_SCALE;
-        (kbps.round() as u32).clamp(500, MAX_BITRATE_KBPS)
+        (kbps.round() as u32).clamp(MIN_AUTO_BITRATE_KBPS, MAX_BITRATE_KBPS)
     }
 
-    /// The automatic bitrate: the quality ceiling, unless the measured path
-    /// cannot carry a frame in half a frame interval. Returns (kbps, capped).
-    pub fn auto_bitrate(self, mode: Mode, path_mbps: Option<f64>) -> (u32, bool) {
+    /// Choose the automatic rate within the measured path and lobby budgets.
+    pub fn auto_bitrate(
+        self,
+        mode: Mode,
+        path_kbps: Option<u32>,
+        lobby_limit: Option<u32>,
+    ) -> (u32, bool) {
         let ceiling = self.bitrate_for(mode);
         if self.bitrate.is_some() {
             return (ceiling, false);
         }
-        match path_mbps {
-            Some(mbps) => {
-                let budget = ((mbps * PATH_SHARE * 1000.0) as u32).max(500);
-                if budget < ceiling { (budget, true) } else { (ceiling, false) }
-            }
-            None => (ceiling.min(UNMEASURED_BITRATE_KBPS), false),
-        }
+        let path_limit = path_kbps.map_or(UNMEASURED_BITRATE_KBPS, path_bitrate_kbps);
+        let lobby_limit = lobby_limit
+            .map_or(MAX_BITRATE_KBPS, |limit| limit.clamp(MIN_AUTO_BITRATE_KBPS, MAX_BITRATE_KBPS));
+        let bitrate = ceiling.min(path_limit).min(lobby_limit);
+        (bitrate, bitrate < ceiling && (path_kbps.is_some() || bitrate < path_limit))
     }
 }
 
@@ -700,12 +730,52 @@ mod tests {
         let fhd = m(1920, 1080, 60);
         assert_eq!(prefs.bitrate_for(fhd), 30_000);
         assert_eq!(prefs.bitrate_for(m(7680, 4320, 240)), MAX_BITRATE_KBPS);
-        assert_eq!(prefs.auto_bitrate(fhd, None), (15_000, false));
-        assert_eq!(prefs.auto_bitrate(fhd, Some(300.0)), (30_000, false));
-        assert_eq!(prefs.auto_bitrate(fhd, Some(40.0)), (14_000, true));
-        assert_eq!(prefs.auto_bitrate(fhd, Some(2.0)), (700, true));
+        assert_eq!(prefs.auto_bitrate(fhd, None, None), (15_000, false));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(300_000), None), (30_000, false));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(40_000), None), (14_000, true));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(2_000), None), (700, true));
+        assert_eq!(prefs.auto_bitrate(fhd, None, Some(1_042)), (1_042, true));
+        assert_eq!(prefs.auto_bitrate(fhd, Some(2_000), Some(1_042)), (700, true));
         let manual = Preferences { bitrate: Some(80_000), ..Preferences::default() };
-        assert_eq!(manual.auto_bitrate(fhd, Some(40.0)), (80_000, false));
+        assert_eq!(manual.auto_bitrate(fhd, Some(40_000), Some(1_042)), (80_000, false));
+    }
+
+    #[test]
+    fn late_guests_share_the_available_upload() {
+        let capacity = Some(12_000);
+        let audio = 200;
+        let first = lobby_bitrate_limit(capacity, 0, audio);
+        assert_eq!(first, 4_200);
+        let reserved = stream_wire_kbps(first, audio);
+        let second = lobby_bitrate_limit(capacity, reserved, audio);
+        assert_eq!(second, 500);
+        let reserved = reserved + stream_wire_kbps(second, audio);
+        assert_eq!(lobby_bitrate_limit(capacity, reserved, audio), 0);
+        assert!(lobby_bitrate_limit(capacity, stream_wire_kbps(second, audio), audio) > second);
+        assert_eq!(lobby_bitrate_limit(None, 0, audio), 6_045);
+        assert_eq!(lobby_bitrate_limit(capacity, u32::MAX, audio), 0);
+    }
+
+    #[test]
+    fn exhausted_upload_must_not_admit_another_stream() {
+        let limit = lobby_bitrate_limit(Some(12_000), 7_200, 200);
+        assert_eq!(limit, 0, "a full uplink must refuse a new stream, not add 500 kbps");
+    }
+
+    #[test]
+    fn reservations_never_exceed_shared_budget() {
+        for capacity in [None, Some(500), Some(2_000), Some(12_000), Some(100_000), Some(300_000)] {
+            for audio in [0, 200, 1_700] {
+                let mut reserved = 0;
+                for _ in 0..50 {
+                    let rate = lobby_bitrate_limit(capacity, reserved, audio);
+                    if rate == 0 { break; }
+                    assert!(rate >= MIN_AUTO_BITRATE_KBPS);
+                    reserved += stream_wire_kbps(rate, audio);
+                    assert!(reserved <= lobby_wire_budget(capacity));
+                }
+            }
+        }
     }
 
     #[test]
