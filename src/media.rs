@@ -516,6 +516,7 @@ pub fn reference_bitrate(mode: Mode, yuv444: bool) -> u32 {
 pub struct GuestStream {
     pub process: Process,
     _directory: TempDir,
+    _branding: crate::platform::Branding,
 }
 
 impl GuestStream {
@@ -572,9 +573,11 @@ impl GuestStream {
         }
         let process = Process::spawn(&mut command)?;
         process.boost();
+        let branding = crate::platform::Branding::start(process.id());
         Ok(Self {
             process,
             _directory: directory,
+            _branding: branding,
         })
     }
 }

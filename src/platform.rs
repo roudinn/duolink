@@ -235,6 +235,10 @@ impl Process {
         prioritize(self.child.as_raw_handle(), HIGH_PRIORITY_CLASS);
     }
 
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn status(&mut self) -> Result<Option<ExitStatus>> {
         Ok(self.child.try_wait()?)
     }
@@ -391,5 +395,89 @@ impl Drop for WifiQuiet {
         unsafe {
             windows_sys::Win32::NetworkManagement::WiFi::WlanCloseHandle(self.handle, std::ptr::null())
         };
+    }
+}
+
+/// Shows the stream window as DuoLink: our title and icon on Moonlight's
+/// windows (title bar, taskbar, Alt+Tab). Moonlight itself is unchanged.
+pub struct Branding {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Branding {
+    pub fn start(pid: u32) -> Self {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !flag.load(Ordering::Relaxed) {
+                brand_windows(pid);
+                // Windows appear while the stream opens; later only fullscreen toggles.
+                let pause = if started.elapsed().as_secs() < 30 { 100 } else { 1000 };
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            }
+        });
+        Self { stop }
+    }
+}
+
+impl Drop for Branding {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn brand_windows(pid: u32) {
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId, ICON_BIG, ICON_SMALL,
+            IMAGE_ICON, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON, SendMessageW,
+            SetWindowTextW, WM_SETICON,
+        },
+    };
+    struct Icons {
+        big: isize,
+        small: isize,
+    }
+    static ICONS: std::sync::OnceLock<Icons> = std::sync::OnceLock::new();
+    let icons = ICONS.get_or_init(|| unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        let load = |metric| {
+            let size = GetSystemMetrics(metric);
+            LoadImageW(module, 1 as _, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) as isize
+        };
+        Icons { big: load(SM_CXICON), small: load(SM_CXSMICON) }
+    });
+    const TITLE: &str = "DuoLink";
+
+    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> i32 {
+        unsafe {
+            let (pid, icons) = &*(data as *const (u32, &Icons));
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(window, &mut owner);
+            if owner != *pid || IsWindowVisible(window) == 0 {
+                return 1;
+            }
+            let mut buffer = [0u16; 64];
+            let length = GetWindowTextW(window, buffer.as_mut_ptr(), buffer.len() as i32).max(0) as usize;
+            if String::from_utf16_lossy(&buffer[..length]) != TITLE {
+                let title: Vec<u16> = TITLE.encode_utf16().chain(Some(0)).collect();
+                SetWindowTextW(window, title.as_ptr());
+                if icons.big != 0 {
+                    SendMessageW(window, WM_SETICON, ICON_BIG as usize, icons.big);
+                }
+                if icons.small != 0 {
+                    SendMessageW(window, WM_SETICON, ICON_SMALL as usize, icons.small);
+                }
+            }
+            1
+        }
+    }
+    let data = (pid, icons);
+    unsafe {
+        EnumWindows(Some(visit), &data as *const _ as LPARAM);
     }
 }
