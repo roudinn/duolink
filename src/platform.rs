@@ -33,7 +33,7 @@ use windows_sys::{
         },
         UI::{
             Shell::ShellExecuteW,
-            WindowsAndMessaging::SW_SHOWNORMAL,
+            WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS, SW_SHOWNORMAL},
         },
     },
     core::GUID,
@@ -69,13 +69,9 @@ pub fn display_mode() -> Result<Mode> {
     })
 }
 
-/// The highest refresh rate the primary display offers at its current
-/// resolution. A monitor left at 60 Hz that can do 165 Hz caps the capture
-/// rate, so the stream asks for the maximum and Sunshine switches the display
-/// for the session (and back afterwards).
-pub fn display_max_refresh() -> Option<u32> {
-    let current = display_mode().ok()?;
-    let mut best = current.fps;
+/// The highest matching refresh rate at the primary display's current resolution.
+pub fn display_max_refresh(current: Mode, accepts: impl Fn(u32) -> bool) -> Option<u32> {
+    let mut best = accepts(current.fps).then_some(current.fps);
     let mut index = 0;
     loop {
         let mut mode: DEVMODEW = unsafe { zeroed() };
@@ -86,12 +82,24 @@ pub fn display_max_refresh() -> Option<u32> {
         if mode.dmPelsWidth & !1 == current.width
             && mode.dmPelsHeight & !1 == current.height
             && mode.dmDisplayFrequency > 1
+            && accepts(mode.dmDisplayFrequency)
         {
-            best = best.max(mode.dmDisplayFrequency);
+            best = best.max(Some(mode.dmDisplayFrequency));
         }
         index += 1;
     }
-    Some(best)
+    best
+}
+
+/// Moonlight's exclusive mode looks for a refresh rate divisible by the stream
+/// FPS. On a single display we know which desktop mode it starts on.
+pub fn display_refresh_would_drop(desktop: Mode, stream_fps: u32) -> bool {
+    stream_fps > 0
+        && desktop.fps > stream_fps
+        && !desktop.fps.is_multiple_of(stream_fps)
+        && unsafe { GetSystemMetrics(SM_CMONITORS) == 1 }
+        && display_max_refresh(desktop, |hz| hz.is_multiple_of(stream_fps))
+            .is_some_and(|matching| matching < desktop.fps)
 }
 
 pub fn vigem_present() -> bool {

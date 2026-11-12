@@ -15,7 +15,7 @@ use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::{
-    platform::{Process, run_tool, system_tool},
+    platform::{Process, display_refresh_would_drop, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
 
@@ -145,11 +145,8 @@ fn create_log(data: &Path, name: &str) -> Result<(File, PathBuf)> {
 
 /// The one encoder setup: the fastest preset of every vendor. Sunshine always
 /// uses single-frame VBV, low-delay rate control and no lookahead, so no frame
-/// waits for another. Quality comes from bitrate, which costs no encode time.
-/// Two-pass stays at quarter resolution: without it NVENC overshoots the frame
-/// budget, and the resulting packet loss costs far more than it saves.
+/// waits for another.
 const ENCODER: &str = "nvenc_preset = 1\n\
-     nvenc_twopass = quarter_res\n\
      nvenc_split_encode = enabled\n\
      nvenc_realtime_hags = enabled\n\
      nvenc_latency_over_power = enabled\n\
@@ -174,7 +171,13 @@ pub fn fec_for_loss(loss: f64) -> u8 {
     }
 }
 
-pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
+fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -> String {
+    let refresh = match refresh_hz {
+        Some(hz) => format!("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = {hz}\n"),
+        None => "dd_refresh_rate_option = disabled\n".into(),
+    };
+    // A second pass tightens the per-frame bitrate on links that already lose packets.
+    let nvenc_twopass = if fec > DEFAULT_FEC { "quarter_res" } else { "disabled" };
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -197,7 +200,7 @@ pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
          install_steam_audio_drivers = disabled\n\
          dd_configuration_option = verify_only\n\
          dd_resolution_option = disabled\n\
-         dd_refresh_rate_option = auto\n\
+         {refresh}\
          dd_hdr_option = disabled\n\
          dd_config_revert_on_disconnect = enabled\n\
          max_bitrate = 0\n\
@@ -206,6 +209,7 @@ pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
          av1_mode = 0\n\
          packetsize = {PACKET_SIZE}\n\
          fec_percentage = {fec}\n\
+         nvenc_twopass = {nvenc_twopass}\n\
          {ENCODER}\
          file_apps = {rel}/apps.json\n\
          file_state = {rel}/state.json\n\
@@ -235,6 +239,7 @@ impl HostStream {
         peer: &str,
         peer_cert: &str,
         fec: u8,
+        refresh_hz: Option<u32>,
     ) -> Result<Self> {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
@@ -261,7 +266,7 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            host_config(&rel, address, fec),
+            host_config(&rel, address, fec, refresh_hz),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
@@ -530,6 +535,7 @@ impl GuestStream {
         certificate: &str,
         client: &crate::protocol::ClientKey,
         mode: Mode,
+        desktop: Option<Mode>,
         preferences: Preferences,
     ) -> Result<Self> {
         let sessions = data.join("clients");
@@ -553,11 +559,14 @@ impl GuestStream {
                 qt_bytes(certificate)
             ),
         )?;
+        let keep_desktop = !same_machine
+            && !preferences.windowed
+            && desktop.is_some_and(|desktop| display_refresh_would_drop(desktop, mode.fps));
         let (log, _) = create_log(data, "guest")?;
         let mut command = Command::new(exe);
         command
             .current_dir(directory.path())
-            .args(guest_args(same_machine, mode, preferences))
+            .args(guest_args(same_machine, mode, keep_desktop, preferences))
             .arg(host.to_string())
             .arg(DESKTOP)
             .stdin(Stdio::null())
@@ -581,13 +590,17 @@ impl GuestStream {
     }
 }
 
-pub fn guest_args(same_machine: bool, mode: Mode, preferences: Preferences) -> Vec<String> {
+fn guest_args(
+    same_machine: bool,
+    mode: Mode,
+    keep_desktop: bool,
+    preferences: Preferences,
+) -> Vec<String> {
     let display = if same_machine {
         "windowed"
-    } else if preferences.windowed {
+    } else if preferences.windowed || keep_desktop {
         "borderless"
     } else {
-        // Exclusive fullscreen bypasses DWM composition: the shortest present path on Windows.
         "fullscreen"
     };
     let toggle = |on: bool, name: &str| format!("--{}{name}", if on { "" } else { "no-" });
@@ -711,22 +724,37 @@ mod tests {
         assert_eq!(fec_for_loss(0.02), 30);
         assert_eq!(fec_for_loss(0.05), 40);
         assert_eq!(fec_for_loss(0.2), 50);
-        assert!(host_config("x", Ipv4Addr::LOCALHOST, 90).contains("fec_percentage = 60"));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, 90, None);
+        assert!(config.contains("fec_percentage = 60"));
+        assert!(config.contains("nvenc_twopass = quarter_res"));
     }
 
     #[test]
     fn engines_get_low_latency_flags() {
         let mode = Mode { width: 2560, height: 1440, fps: 165 };
-        let args = guest_args(false, mode, Preferences::default());
+        let args = guest_args(false, mode, false, Preferences::default());
         let has = |flag: &str| args.iter().any(|arg| arg == flag);
         for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "--multi-controller", "1024"] {
             assert!(has(flag), "missing {flag}");
         }
-        assert!(guest_args(true, mode, Preferences::default()).iter().any(|arg| arg == "windowed"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC);
+        assert!(guest_args(true, mode, false, Preferences::default()).iter().any(|arg| arg == "windowed"));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
+        assert!(config.contains("nvenc_twopass = disabled"));
         assert!(config.contains("nvenc_split_encode = enabled"));
         assert!(config.contains("amd_usage = ultralowlatency"));
         assert!(config.contains("packetsize = 1024"));
         assert!(config.contains("bind_address = 127.0.0.1"));
+    }
+
+    #[test]
+    fn monitor_refresh_is_independent_of_stream_fps() {
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, Some(165));
+        assert!(config.contains("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = 165\n"));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
+        assert!(config.contains("dd_refresh_rate_option = disabled\n"));
+
+        let stream = Mode { width: 1920, height: 1080, fps: 60 };
+        let args = guest_args(false, stream, true, Preferences::default());
+        assert!(args.iter().any(|arg| arg == "borderless"));
     }
 }

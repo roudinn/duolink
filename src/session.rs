@@ -288,12 +288,15 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let host_id = Uuid::new_v4();
     let mut mode = display_mode()?;
     let current_hz = mode.fps;
-    mode.fps = display_max_refresh().unwrap_or(current_hz);
+    mode.fps = display_max_refresh(mode, |_| true).unwrap_or(current_hz);
+    let refresh_hz = (mode.fps > current_hz).then_some(mode.fps);
     let mut fec = DEFAULT_FEC;
     // Sunshine starts while the code travels to the friends: by the time
     // someone joins, it is already listening.
     let start_engine = |fec: u8| {
-        HostStream::start(&engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec)
+        HostStream::start(
+            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz,
+        )
     };
     let mut stream = start_engine(fec)?;
     let mut engine_by = Instant::now() + START_TIMEOUT;
@@ -757,7 +760,8 @@ fn guest(
                 audio_opus,
                 client: Some(client),
             }) if stream.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
-                let mode = preferences.mode(mode, display_mode().ok());
+                let desktop = display_mode().ok();
+                let mode = preferences.mode(mode, desktop);
                 ensure!(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Хост прислал неверные данные."
@@ -787,6 +791,7 @@ fn guest(
                     &certificate,
                     &client,
                     mode,
+                    desktop,
                     preferences,
                 )?);
                 if own_audio {
@@ -985,6 +990,7 @@ mod tests {
         );
         let data = data_dir().unwrap();
         let address = Ipv4Addr::LOCALHOST;
+        let initial_refresh = display_mode().unwrap().fps;
         let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(200), |event| match event {
             Event::Invite(code) => Some(code),
@@ -1007,10 +1013,12 @@ mod tests {
         assert!(result.contains("отклонил"), "{result}");
         assert!(host.events.try_recv().is_err());
         let invite = Invite::decode(&code).unwrap();
+        let fps = std::env::var("DUOLINK_TEST_FPS").unwrap_or_else(|_| "144".into());
+        let expected_mode = format!("mode=1920x1080x{fps}");
         let prefs = Preferences::parse(&crate::media::Form {
             width: "1920".into(),
             height: "1080".into(),
-            fps: "144".into(),
+            fps,
             bitrate: "30".into(),
             stats: true,
             ..Default::default()
@@ -1034,7 +1042,7 @@ mod tests {
                 && log.contains("Decoded frame with POC 0/0")
             {
                 assert!(
-                    log.contains("mode=1920x1080x144"),
+                    log.contains(&expected_mode),
                     "the requested stream mode was not forwarded"
                 );
                 break;
@@ -1045,6 +1053,10 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(250));
         }
+        assert!(
+            display_mode().unwrap().fps >= initial_refresh,
+            "the guest's FPS reduced the host display refresh rate"
+        );
         // DUOLINK_TEST_HOLD=<seconds> keeps the stream open for a manual look;
         // closing Moonlight (Ctrl+Alt+Shift+Q) ends it early.
         if let Some(hold) = std::env::var("DUOLINK_TEST_HOLD").ok().and_then(|s| s.parse().ok()) {
