@@ -251,6 +251,8 @@ pub enum Request {
         /// A disconnected physical controller releases its virtual controller.
         #[serde(default)]
         controller_hotplug: bool,
+        #[serde(default)]
+        audio_opus: bool,
     },
     Ping,
     Leave,
@@ -270,6 +272,8 @@ pub enum Reply {
         /// Game audio comes from DuoLink without voice chat; Moonlight stays silent.
         #[serde(default)]
         own_audio: bool,
+        #[serde(default)]
+        audio_opus: bool,
         /// The client identity Sunshine already trusts.
         #[serde(default)]
         client: Option<ClientKey>,
@@ -372,6 +376,24 @@ pub fn valid_pem(certificate: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn legacy_audio_messages_default_to_pcm() {
+        let token = [0u8; 16];
+        let join = serde_json::json!({
+            "type": "join", "token": token, "name": "Guest", "certificate": "",
+            "lobby": true, "controller_hotplug": true
+        });
+        let ready = serde_json::json!({
+            "type": "ready", "host": Uuid::nil(), "certificate": "", "own_audio": true,
+            "mode": Mode { width: 1920, height: 1080, fps: 60 }
+        });
+        assert!(matches!(serde_json::from_value(join).unwrap(), Request::Join { audio_opus: false, .. }));
+        assert!(matches!(
+            serde_json::from_value(ready).unwrap(),
+            Reply::Ready { own_audio: true, audio_opus: false, .. }
+        ));
+    }
 
     #[test]
     fn invite_round_trip_and_validation() {

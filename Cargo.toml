@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.12.1"
+version = "1.12.2"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -19,6 +19,7 @@ subtle = "2.6"
 tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 local-ip-address = "0.6"
+opusic-c = "1.6.1"
 tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.57", default-features = false }
 clipboard-win = { version = "5.4", features = ["std"] }

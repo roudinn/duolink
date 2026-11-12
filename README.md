@@ -47,6 +47,8 @@ DuoLink управляет [Sunshine](https://github.com/SunshineStream/Sunshine
 - до первой трансляции DuoLink замеряет скорость и потери канала. Автобитрейт ориентируется на 35% измеренной скорости. Во время трансляции новые гости подключаются без нагрузочного замера, с автоматическим стартовым битрейтом до 15 Мбит/с;
 - на Wi-Fi на время игры отключается фоновый поиск сетей, из-за которого раз в минуту бывают подвисания.
 
+Звук без голосового чата сжимается Opus кадрами по 5 мс. Opus включается автоматически, когда и хост, и гость используют DuoLink 1.12.2 или новее. Со старыми версиями звук по-прежнему передаётся в PCM.
+
 Если на хосте включена фоновая запись Xbox Game Bar, лучше её выключить: она занимает тот же видеокодер.
 
 ## Сеть
@@ -63,7 +65,7 @@ DuoLink управляет [Sunshine](https://github.com/SunshineStream/Sunshine
 
 ## Сборка
 
-Rust (`x86_64-pc-windows-msvc`), MSVC Build Tools, Windows SDK.
+Rust (`x86_64-pc-windows-msvc`), MSVC Build Tools, Windows SDK и CMake в `PATH`.
 
 ```powershell
 cargo build --release --locked
@@ -80,5 +82,7 @@ cargo test --release -- --ignored --nocapture
 Журналы: `%LOCALAPPDATA%\DuoLink\logs`.
 
 ## Лицензии
+
+Тексты лицензий Opus и Rust-обёртки находятся в `licenses/Opus-COPYING.txt` и `licenses/Opusic-LICENSE.txt`.
 
 Шрифт [Inter](https://github.com/rsms/inter) — SIL Open Font License 1.1, текст в `licenses/Inter-OFL.txt`. DuoLink скачивает Sunshine при создании сессии, Moonlight при подключении, ViGEmBus при установке драйвера геймпада на хосте. Файлы берутся из официальных релизов на GitHub.

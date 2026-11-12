@@ -3,9 +3,8 @@
 //! Sunshine records everything the host PC plays, including the friend's own
 //! voice coming out of Discord, so the guest hears themself. DuoLink records
 //! the host instead with Windows process loopback (Windows 10 2004+), leaving
-//! out the voice-chat process tree, and sends raw 48 kHz PCM through the
-//! tunnel. 5 ms per datagram, ~1.5 Mbit/s: far below the video stream and
-//! with no codec delay.
+//! out the voice-chat process tree, and sends 5 ms stereo frames through the
+//! tunnel. Updated guests get low-delay Opus. Older guests receive PCM.
 
 use std::{
     collections::VecDeque,
@@ -20,6 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use opusic_c::{Application, Bitrate, Channels, Decoder, Encoder, ErrorCode, SampleRate};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
@@ -52,6 +52,9 @@ const RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
 /// Frames per datagram: 5 ms.
 const CHUNK: usize = 240;
+const SAMPLES: usize = CHUNK * CHANNELS;
+const PCM_BYTES: usize = SAMPLES * 2;
+const OPUS_BITRATE: u32 = 128_000;
 const HELLO: &[u8] = b"duolink-audio";
 /// Voice-chat programs whose output must not reach the guest, most likely first.
 const VOICE: [&str; 6] = [
@@ -176,10 +179,25 @@ fn loopback_client(exclude: u32) -> Result<IAudioClient> {
     Ok(unknown.context("Нет аудиоклиента.")?.cast()?)
 }
 
+fn opus_encoder() -> std::result::Result<Encoder, ErrorCode> {
+    let mut encoder = Encoder::new(Channels::Stereo, SampleRate::Hz48000, Application::LowDelay)?;
+    encoder.set_bitrate(Bitrate::Value(OPUS_BITRATE))?;
+    encoder.set_vbr(false)?;
+    encoder.set_complexity(5)?;
+    Ok(encoder)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AudioRecipient {
+    pub address: SocketAddr,
+    pub opus: bool,
+}
+
 fn capture(
     socket: &UdpSocket,
-    recipients: &Mutex<Vec<SocketAddr>>,
+    recipients: &Mutex<Vec<AudioRecipient>>,
     sequence: &mut u32,
+    encoder: &mut Encoder,
     exclude: u32,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -198,9 +216,11 @@ fn capture(
     }
     let reader: IAudioCaptureClient = unsafe { client.GetService()? };
     unsafe { client.Start()? };
-    let mut pending: Vec<i16> = Vec::with_capacity(CHUNK * CHANNELS * 4);
+    let mut pending: Vec<i16> = Vec::with_capacity(SAMPLES * 4);
     let mut targets = Vec::new();
-    let mut datagram = Vec::with_capacity(4 + CHUNK * CHANNELS * 2);
+    let mut pcm = [0; 4 + PCM_BYTES];
+    let mut opus = [0; 4 + PCM_BYTES];
+    let mut input = [0u16; SAMPLES];
     let mut recheck = Instant::now() + Duration::from_secs(3);
     while !stop.load(Ordering::Relaxed) {
         // Voice chat started or restarted: capture again without it.
@@ -236,16 +256,35 @@ fn capture(
             }
             unsafe { reader.ReleaseBuffer(count)? };
         }
-        while pending.len() >= CHUNK * CHANNELS {
-            datagram.clear();
-            datagram.extend_from_slice(&sequence.to_be_bytes());
-            for sample in pending.drain(..CHUNK * CHANNELS) {
-                datagram.extend_from_slice(&sample.to_le_bytes());
+        let send_opus = targets.iter().any(|target| target.opus);
+        let send_pcm = targets.iter().any(|target| !target.opus);
+        while pending.len() >= SAMPLES {
+            let stamp = sequence.to_be_bytes();
+            let samples = &pending[..SAMPLES];
+            if send_pcm {
+                pcm[..4].copy_from_slice(&stamp);
+                for (bytes, sample) in pcm[4..].chunks_exact_mut(2).zip(samples) {
+                    bytes.copy_from_slice(&sample.to_le_bytes());
+                }
             }
+            let opus_len = if send_opus {
+                opus[..4].copy_from_slice(&stamp);
+                for (dest, &sample) in input.iter_mut().zip(samples) {
+                    *dest = sample as u16;
+                }
+                encoder.encode_to_slice(&input, &mut opus[4..]).ok()
+            } else {
+                None
+            };
             *sequence = sequence.wrapping_add(1);
             for target in &targets {
-                let _ = socket.send_to(&datagram, target);
+                if !target.opus {
+                    let _ = socket.send_to(&pcm, target.address);
+                } else if let Some(size) = opus_len {
+                    let _ = socket.send_to(&opus[..4 + size], target.address);
+                }
             }
+            pending.drain(..SAMPLES);
         }
     }
     unsafe {
@@ -257,7 +296,7 @@ fn capture(
 /// Host side: records game audio once and sends it to the active streams.
 pub struct HostAudio {
     stop: Arc<AtomicBool>,
-    recipients: Arc<Mutex<Vec<SocketAddr>>>,
+    recipients: Arc<Mutex<Vec<AudioRecipient>>>,
     task: Option<thread::JoinHandle<()>>,
 }
 
@@ -267,6 +306,7 @@ impl HostAudio {
         let socket = UdpSocket::bind((address, AUDIO_PORT))
             .with_context(|| format!("UDP-порт {AUDIO_PORT} недоступен."))?;
         socket.set_nonblocking(true)?;
+        let mut encoder = opus_encoder().map_err(|error| anyhow::anyhow!("Opus encoder: {error:?}"))?;
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
         loopback_client(unsafe { GetCurrentProcessId() }).context("Захват звука без голосового чата недоступен.")?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -285,7 +325,7 @@ impl HostAudio {
                     continue;
                 }
                 let exclude = voice_app().map_or(unsafe { GetCurrentProcessId() }, |(pid, _)| pid);
-                if capture(&socket, &targets, &mut sequence, exclude, &flag).is_err() {
+                if capture(&socket, &targets, &mut sequence, &mut encoder, exclude, &flag).is_err() {
                     thread::park_timeout(Duration::from_millis(500));
                 }
             }
@@ -293,7 +333,7 @@ impl HostAudio {
         Ok(Self { stop, recipients, task: Some(task) })
     }
 
-    pub fn set_recipients(&self, recipients: &[SocketAddr]) {
+    pub fn set_recipients(&self, recipients: &[AudioRecipient]) {
         let mut current = self.recipients.lock().unwrap();
         if current.as_slice() == recipients {
             return;
@@ -321,26 +361,24 @@ impl Drop for HostAudio {
 /// Samples waiting to be played. Kept short: late audio is dropped, not queued.
 struct Jitter {
     samples: VecDeque<i16>,
-    last: Option<u32>,
 }
 
 const TARGET: usize = 480 * CHANNELS; // 10 ms
 const CEILING: usize = 1920 * CHANNELS; // 40 ms
 
 impl Jitter {
-    fn push(&mut self, sequence: u32, pcm: &[u8]) {
-        if let Some(last) = self.last
-            && sequence.wrapping_sub(last) > u32::MAX / 2
-        {
-            return; // older than what already played
-        }
-        self.last = Some(sequence);
-        self.samples.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+    fn push(&mut self, samples: impl IntoIterator<Item = i16>) {
+        self.samples.extend(samples);
         if self.samples.len() > CEILING {
             let extra = self.samples.len() - TARGET;
             self.samples.drain(..extra - extra % CHANNELS);
         }
     }
+}
+
+fn newer_packet(sequence: u32, last: u32) -> bool {
+    let distance = sequence.wrapping_sub(last);
+    distance != 0 && distance <= u32::MAX / 2
 }
 
 fn play(queue: &Mutex<Jitter>, stop: &AtomicBool) -> Result<()> {
@@ -408,20 +446,26 @@ pub struct GuestAudio {
 
 impl GuestAudio {
     /// `silent`: receive only (host and guest on one PC would loop the sound).
-    pub fn start(host: SocketAddr, silent: bool) -> Result<Self> {
+    pub fn start(host: SocketAddr, silent: bool, opus: bool) -> Result<Self> {
         let socket = UdpSocket::bind((host.ip(), 0)).context("Не удалось открыть порт для звука.")?;
         #[cfg(test)]
         let address = socket.local_addr()?;
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let received = Arc::new(AtomicU64::new(0));
-        let queue = Arc::new(Mutex::new(Jitter { samples: VecDeque::new(), last: None }));
+        let mut decoder = opus
+            .then(|| Decoder::new(Channels::Stereo, SampleRate::Hz48000))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("Opus decoder: {error:?}"))?;
+        let queue = Arc::new(Mutex::new(Jitter { samples: VecDeque::new() }));
         let mut tasks = Vec::new();
         {
             let (stop, received, queue) = (stop.clone(), received.clone(), queue.clone());
             tasks.push(thread::Builder::new().name("duolink-audio-in".into()).spawn(move || {
                 prioritize_thread();
                 let mut buffer = [0u8; 2048];
+                let mut decoded = [0u16; SAMPLES];
+                let mut last = None;
                 let mut hello = Instant::now();
                 let _ = socket.send_to(HELLO, host);
                 while !stop.load(Ordering::Relaxed) {
@@ -430,14 +474,34 @@ impl GuestAudio {
                         hello = Instant::now();
                     }
                     let Ok((count, _)) = socket.recv_from(&mut buffer) else { continue };
-                    if count < 4 + CHANNELS * 2 {
+                    if count <= 4 {
                         continue;
                     }
-                    received.fetch_add(1, Ordering::Relaxed);
-                    if !silent {
-                        let sequence = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-                        queue.lock().unwrap().push(sequence, &buffer[4..count]);
+                    let sequence = u32::from_be_bytes(buffer[..4].try_into().unwrap());
+                    if last.is_some_and(|last| !newer_packet(sequence, last)) {
+                        continue;
                     }
+                    let payload = &buffer[4..count];
+                    if let Some(decoder) = &mut decoder {
+                        if decoder.get_nb_samples(payload) != Ok(CHUNK)
+                            || decoder.decode_to_slice(payload, &mut decoded, false) != Ok(CHUNK)
+                        {
+                            continue;
+                        }
+                        if !silent {
+                            queue.lock().unwrap().push(decoded.iter().map(|&sample| sample as i16));
+                        }
+                    } else {
+                        if payload.len() != PCM_BYTES {
+                            continue;
+                        }
+                        if !silent {
+                            queue.lock().unwrap().push(payload.chunks_exact(2)
+                                .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])));
+                        }
+                    }
+                    last = Some(sequence);
+                    received.fetch_add(1, Ordering::Relaxed);
                 }
             })?);
         }
@@ -481,15 +545,48 @@ mod tests {
 
     #[test]
     fn jitter_drops_old_and_late_audio() {
-        let mut jitter = Jitter { samples: VecDeque::new(), last: None };
-        let chunk = vec![1u8; CHUNK * CHANNELS * 2];
-        jitter.push(10, &chunk);
-        jitter.push(9, &chunk);
-        assert_eq!(jitter.samples.len(), CHUNK * CHANNELS);
-        for sequence in 11..40 {
-            jitter.push(sequence, &chunk);
+        assert!(newer_packet(0, u32::MAX));
+        assert!(!newer_packet(9, 10));
+        assert!(!newer_packet(10, 10));
+        let mut jitter = Jitter { samples: VecDeque::new() };
+        for _ in 0..40 {
+            jitter.push([1i16; SAMPLES]);
         }
         assert!(jitter.samples.len() <= CEILING);
+    }
+
+    #[test]
+    fn opus_uses_short_frames_and_less_bandwidth() {
+        const FRAMES: usize = 400;
+        let mut encoder = opus_encoder().unwrap();
+        let mut decoder = Decoder::new(Channels::Stereo, SampleRate::Hz48000).unwrap();
+        let lookahead = encoder.get_look_ahead().unwrap();
+        assert_eq!(lookahead, 120);
+        let mut packet = [0u8; PCM_BYTES];
+        let mut output = [0u16; SAMPLES];
+        let mut total_bytes = 0;
+        let mut elapsed = Vec::with_capacity(FRAMES);
+        for frame in 0..FRAMES {
+            let input: [u16; SAMPLES] = std::array::from_fn(|sample| {
+                let t = (frame * CHUNK + sample / CHANNELS) as f32 / RATE as f32;
+                let frequency = if sample % CHANNELS == 0 { 440.0 } else { 660.0 };
+                ((std::f32::consts::TAU * frequency * t).sin() * 12000.0) as i16 as u16
+            });
+            let start = Instant::now();
+            let bytes = encoder.encode_to_slice(&input, &mut packet).unwrap();
+            assert_eq!(decoder.get_nb_samples(&packet[..bytes]), Ok(CHUNK));
+            assert_eq!(decoder.decode_to_slice(&packet[..bytes], &mut output, false), Ok(CHUNK));
+            elapsed.push(start.elapsed());
+            total_bytes += 4 + bytes;
+        }
+        assert!(output.iter().any(|&sample| sample != 0));
+        assert_eq!(total_bytes, FRAMES * (4 + 80));
+        elapsed.sort_unstable();
+        let pcm_bytes = FRAMES * (4 + PCM_BYTES);
+        eprintln!(
+            "2 s stereo: Opus {total_bytes} bytes, PCM {pcm_bytes} bytes; lookahead {lookahead} samples; encode + decode p99 {:.1} us",
+            elapsed[FRAMES * 99 / 100 - 1].as_secs_f64() * 1e6,
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use rustls::{ClientConnection, ServerConnection, StreamOwned, pki_types::ServerN
 use uuid::Uuid;
 
 use crate::{
-    audio::{AUDIO_PORT, GuestAudio, HostAudio, voice_app},
+    audio::{AUDIO_PORT, AudioRecipient, GuestAudio, HostAudio, voice_app},
     media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
     platform::{
         KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
@@ -243,6 +243,7 @@ struct Guest {
     /// Local port of the control socket: identifies the guest's tunnel link.
     port: u16,
     fec: Option<u8>,
+    audio_opus: bool,
     state: PlayerState,
     /// Ready has gone out; Sunshine's next "client connected" is this guest.
     sent_ready: bool,
@@ -350,7 +351,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut guests: Vec<Guest> = Vec::new();
     let mut next_id = 1u32;
     let mut shown: Vec<Player> = Vec::new();
-    let mut audio_recipients = Vec::new();
+    let mut audio_recipients: Vec<AudioRecipient> = Vec::new();
     let mut next_players = Instant::now();
     let mut playing_before = false;
     let mut drops_shown = dropped();
@@ -401,7 +402,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             };
             let mut knock = knocks.swap_remove(index);
             match request {
-                Some(Request::Join { token, name, lobby, controller_hotplug, fec: wanted, .. }) if invite.authorizes(&token) => {
+                Some(Request::Join { token, name, lobby, controller_hotplug, fec: wanted, audio_opus, .. }) if invite.authorizes(&token) => {
                     if !lobby || !controller_hotplug {
                         close(&mut knock.wire, "Обновите DuoLink: у хоста новая версия.");
                     } else {
@@ -415,6 +416,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             name: clean_name(&name),
                             port: knock.port,
                             fec: wanted,
+                            audio_opus,
                             state: PlayerState::Waiting,
                             sent_ready: false,
                             since: Instant::now(),
@@ -498,6 +500,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     certificate: identity.cert_pem.clone(),
                     mode,
                     own_audio: audio.is_some(),
+                    audio_opus: audio.is_some() && guests[at].audio_opus,
                     client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
                 };
                 if let Some(guest) = reply_to_guest(&mut guests, at, &reply) {
@@ -551,9 +554,9 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                 let link = tunnel.link(guest.port);
                 if guest.sent_ready
                     && let Some(address) = link.and_then(|link| link.audio)
-                    && !audio_recipients.contains(&address)
+                    && !audio_recipients.iter().any(|target| target.address == address)
                 {
-                    audio_recipients.push(address);
+                    audio_recipients.push(AudioRecipient { address, opus: guest.audio_opus });
                 }
                 players.push(Player {
                     id: guest.id,
@@ -656,6 +659,7 @@ fn guest(
         fec: None,
         lobby: true,
         controller_hotplug: true,
+        audio_opus: true,
     })
     .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");
@@ -750,6 +754,7 @@ fn guest(
                 certificate,
                 mode,
                 own_audio,
+                audio_opus,
                 client: Some(client),
             }) if stream.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let mode = preferences.mode(mode, display_mode().ok());
@@ -788,6 +793,7 @@ fn guest(
                     _guest_audio = Some(GuestAudio::start(
                         SocketAddr::from((loopback, AUDIO_PORT)),
                         tunnel.same_machine,
+                        audio_opus,
                     )?);
                 }
                 by = Instant::now() + START_TIMEOUT + SILENCE;
@@ -830,6 +836,7 @@ mod tests {
                 name: format!("Guest {id}"),
                 port: from.port(),
                 fec: Some(DEFAULT_FEC),
+                audio_opus: false,
                 state: PlayerState::Starting,
                 sent_ready: false,
                 since: now,
@@ -941,24 +948,26 @@ mod tests {
         let _audio = SilentAudio::start();
         let host = HostAudio::start(Ipv4Addr::LOCALHOST).unwrap();
         let target = SocketAddr::from((Ipv4Addr::LOCALHOST, AUDIO_PORT));
-        let first = GuestAudio::start(target, true).unwrap();
-        let second = GuestAudio::start(target, true).unwrap();
+        let first = GuestAudio::start(target, true, true).unwrap();
+        let second = GuestAudio::start(target, true, false).unwrap();
+        let opus = AudioRecipient { address: first.address, opus: true };
+        let pcm = AudioRecipient { address: second.address, opus: false };
         let packets = |guest: &GuestAudio| guest.received.load(Ordering::Relaxed);
 
-        host.set_recipients(&[first.address]);
+        host.set_recipients(&[opus]);
         thread::sleep(Duration::from_secs(2));
         let first_before = packets(&first);
         assert!(first_before > 150, "audio capture: {first_before}");
         assert_eq!(packets(&second), 0, "unapproved receiver got audio");
 
-        host.set_recipients(&[first.address, second.address]);
+        host.set_recipients(&[opus, pcm]);
         thread::sleep(Duration::from_secs(2));
         let first_delta = packets(&first) - first_before;
         let second_delta = packets(&second);
-        eprintln!("audio packets during 2 s: first={first_delta}, second={second_delta}");
+        eprintln!("audio packets during 2 s: Opus={first_delta}, PCM={second_delta}");
         assert!(first_delta > 150 && second_delta > 150);
 
-        host.set_recipients(&[second.address]);
+        host.set_recipients(&[pcm]);
         thread::sleep(Duration::from_millis(150));
         let (first_before, second_before) = (packets(&first), packets(&second));
         thread::sleep(Duration::from_secs(1));
