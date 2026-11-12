@@ -68,6 +68,43 @@ fn memory_level(view: &WebView, low: bool) {
     }
 }
 
+/// The tray icon: click opens the window, the right-click menu opens or exits.
+fn tray(proxy: tao::event_loop::EventLoopProxy<Action>) -> Result<tray_icon::TrayIcon> {
+    use tray_icon::{
+        MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    };
+    let open = MenuItem::new("Открыть DuoLink", true, None);
+    let quit = MenuItem::new("Выйти", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit])?;
+    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+    let clicks = proxy.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
+        | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = event
+        {
+            let _ = clicks.send_event(Action::Show);
+        }
+    }));
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let action = if event.id == quit_id {
+            Action::Quit
+        } else if event.id == open_id {
+            Action::Show
+        } else {
+            return;
+        };
+        let _ = proxy.send_event(action);
+    }));
+    Ok(TrayIconBuilder::new()
+        .with_icon(tray_icon::Icon::from_resource(1, None)?)
+        .with_tooltip("DuoLink")
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()?)
+}
+
 /// Downloads Sunshine and Moonlight in the background on first launch, so
 /// the first session starts the game instead of a download.
 fn prefetch_engines(data: PathBuf) {
@@ -111,6 +148,12 @@ enum Action {
     /// Sent by background threads to wake the event loop.
     #[serde(skip_deserializing)]
     Wake,
+    /// Tray click, tray menu or a second launch: bring the window back.
+    #[serde(skip_deserializing)]
+    Show,
+    /// Tray menu: really exit.
+    #[serde(skip_deserializing)]
+    Quit,
 }
 
 #[derive(Serialize)]
@@ -577,7 +620,8 @@ impl App {
 
     fn action(&mut self, action: Action, view: &WebView) -> Result<()> {
         match action {
-            Action::Ready | Action::Wake => {}
+            Action::Ready | Action::Wake | Action::Show => {}
+            Action::Quit => self.quit = true,
             Action::HostStart if self.session_idle() => {
                 self.host_for.clear();
                 self.begin_hosting();
@@ -1019,12 +1063,23 @@ pub fn run() -> Result<()> {
         .build(&window)
         .context("Не удалось открыть окно. Нужен Microsoft Edge WebView2 Runtime.")?;
     prefetch_engines(data.clone());
+    // Closing the window keeps DuoLink in the tray, so invites still arrive.
+    let _tray = tray(event_loop.create_proxy())?;
+    let shower = event_loop.create_proxy();
+    crate::platform::on_show_request(move || {
+        let _ = shower.send_event(Action::Show);
+    });
     let mut app = App::new(data, wake, updater)?;
     window.set_visible(true);
     let mut next_announce = Instant::now() + DIRECTORY_REFRESH;
 
     event_loop.run(move |event, _, control| {
         match event {
+            WindowEvent::UserEvent(Action::Show) => {
+                window.set_visible(true);
+                window.set_minimized(false);
+                window.set_focus();
+            }
             WindowEvent::UserEvent(action) => {
                 if let Err(error) = app.action(action, &view) {
                     let _ = toast(&view, &error.to_string());
@@ -1045,6 +1100,10 @@ pub fn run() -> Result<()> {
                     return;
                 }
                 if std::mem::take(&mut app.attention) {
+                    // An invite or a knock while in the tray: show the window.
+                    if !window.is_visible() {
+                        window.set_visible(true);
+                    }
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
                 let now = Instant::now();
@@ -1059,10 +1118,9 @@ pub fn run() -> Result<()> {
                 memory_level(&view, !focused);
             }
             WindowEvent::WindowEvent { event: NativeEvent::CloseRequested, .. } => {
+                // The cross hides; "Выйти" in the tray menu exits.
                 window.set_visible(false);
-                app.shutdown();
-                *control = ControlFlow::Exit;
-                return;
+                memory_level(&view, true);
             }
             _ => {}
         }

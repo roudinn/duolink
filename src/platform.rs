@@ -481,3 +481,52 @@ fn brand_windows(pid: u32) {
         EnumWindows(Some(visit), &data as *const _ as LPARAM);
     }
 }
+
+
+const INSTANCE: &str = r"Local\DuoLink.App.v1";
+const SHOW: &str = r"Local\DuoLink.Show.v1";
+
+/// One DuoLink per user. A second launch (shortcut, Start menu) brings the
+/// running window forward instead. After an update the new copy waits for
+/// the old one to finish exiting.
+pub fn single_instance(after_update: bool) -> Option<ProcessLock> {
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    let by = std::time::Instant::now() + std::time::Duration::from_secs(if after_update { 8 } else { 0 });
+    loop {
+        if let Ok(Some(lock)) = ProcessLock::try_acquire(INSTANCE) {
+            return Some(lock);
+        }
+        if std::time::Instant::now() >= by {
+            let name: Vec<u16> = SHOW.encode_utf16().chain(Some(0)).collect();
+            unsafe {
+                let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+                if !event.is_null() {
+                    SetEvent(event);
+                    CloseHandle(event);
+                }
+            }
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Calls `show` whenever another launch asks this instance to come forward.
+pub fn on_show_request(show: impl Fn() + Send + 'static) {
+    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    let name: Vec<u16> = SHOW.encode_utf16().chain(Some(0)).collect();
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if event.is_null() {
+        return;
+    }
+    let event = Handle(event);
+    std::thread::spawn(move || {
+        let event = event;
+        loop {
+            if unsafe { WaitForSingleObject(event.0, INFINITE) } != 0 {
+                return;
+            }
+            show();
+        }
+    });
+}

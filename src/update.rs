@@ -337,6 +337,7 @@ impl Updater {
     /// Starts the freshly installed exe. The caller then exits.
     pub fn relaunch(&self) -> Result<()> {
         Command::new(&self.exe)
+            .arg("--after-update")
             .current_dir(self.exe.parent().context("Нет папки программы.")?)
             .spawn()
             .context("Не удалось запустить новую версию.")?;

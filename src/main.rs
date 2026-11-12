@@ -32,6 +32,10 @@ fn main() {
         // Installation is a convenience: run portable if it fails.
         Err(_) => {}
     }
+    let after_update = std::env::args().any(|arg| arg == "--after-update");
+    let Some(_instance) = platform::single_instance(after_update) else {
+        return;
+    };
     update::cleanup();
     platform::prioritize_self();
     if let Err(error) = gui::run() {

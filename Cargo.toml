@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.10.2"
+version = "1.11.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -33,6 +33,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 bytes = "1"
 socket2 = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+tray-icon = { version = "0.21", default-features = false }
 
 [build-dependencies]
 embed-resource = "3"
