@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.11.1"
+version = "1.11.2"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -22,7 +22,7 @@ local-ip-address = "0.6"
 tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.57", default-features = false }
 clipboard-win = { version = "5.4", features = ["std"] }
-windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WiFi", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WiFi", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_XboxController", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Variant"] }
 windows-core = "0.62"
 webview2-com = "0.39"

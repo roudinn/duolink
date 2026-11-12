@@ -77,6 +77,7 @@ const EN = Object.freeze({
   "Игроки": "Players",
   "Хост отключил вас.": "The host removed you.",
   "Лобби заполнено.": "The lobby is full.",
+  "На ПК хоста нет свободных слотов для геймпадов.": "The host PC has no free controller slots.",
   "Обновите DuoLink: у хоста новая версия.": "Update DuoLink: the host has a newer version.",
   "Хост завершил сессию.": "The host ended the session.",
   "Геймпады": "Gamepads",
