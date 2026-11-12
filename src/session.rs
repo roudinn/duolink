@@ -255,6 +255,15 @@ struct Knock {
     by: Instant,
 }
 
+/// A broken control socket only removes its own guest.
+fn reply_to_guest<'a>(guests: &'a mut Vec<Guest>, at: usize, reply: &Reply) -> Option<&'a mut Guest> {
+    if guests[at].wire.send(reply).is_err() {
+        guests.remove(at);
+        return None;
+    }
+    Some(&mut guests[at])
+}
+
 fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<String> {
     let address = Ipv4Addr::LOCALHOST;
     let _lock = ProcessLock::try_acquire(r"Local\DuoLink.Host.v1")
@@ -340,6 +349,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut guests: Vec<Guest> = Vec::new();
     let mut next_id = 1u32;
     let mut shown: Vec<Player> = Vec::new();
+    let mut audio_recipients = Vec::with_capacity(MAX_GUESTS);
     let mut next_players = Instant::now();
     let mut playing_before = false;
     let mut drops_shown = dropped();
@@ -361,12 +371,19 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         loop {
             match listener.accept() {
                 Ok((socket, from)) => {
-                    configure_socket(&socket)?;
-                    socket.set_read_timeout(Some(Duration::from_millis(2)))?;
+                    if configure_socket(&socket)
+                        .and_then(|()| socket.set_read_timeout(Some(Duration::from_millis(2))))
+                        .is_err()
+                    {
+                        continue;
+                    }
                     let wire = Wire::new(StreamOwned::new(ServerConnection::new(tls.clone())?, socket));
                     knocks.push(Knock { wire, port: from.port(), by: Instant::now() + Duration::from_secs(4) });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if matches!(
+                    error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -389,7 +406,9 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     } else if guests.len() >= MAX_GUESTS {
                         close(&mut knock.wire, "Лобби заполнено.");
                     } else {
-                        knock.wire.send(&Reply::Pending)?;
+                        if knock.wire.send(&Reply::Pending).is_err() {
+                            continue;
+                        }
                         joined_once = true;
                         guests.push(Guest {
                             id: next_id,
@@ -414,10 +433,10 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                 Command::Decide(id, approve) => {
                     if let Some(at) = guests.iter().position(|g| g.id == id && g.state == PlayerState::Waiting) {
                         if approve {
-                            let guest = &mut guests[at];
-                            guest.state = PlayerState::Starting;
-                            guest.since = Instant::now();
-                            let _ = guest.wire.send(&Reply::Preparing);
+                            if let Some(guest) = reply_to_guest(&mut guests, at, &Reply::Preparing) {
+                                guest.state = PlayerState::Starting;
+                                guest.since = Instant::now();
+                            }
                         } else {
                             let mut guest = guests.remove(at);
                             close(&mut guest.wire, "Хост отклонил подключение.");
@@ -438,13 +457,10 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             next_log = Instant::now() + Duration::from_millis(50);
             let (connected, _) = stream.events()?;
             for _ in 0..connected {
-                if let Some(guest) = guests
-                    .iter_mut()
-                    .filter(|g| g.state == PlayerState::Starting && g.sent_ready)
-                    .min_by_key(|g| g.since)
+                if let Some(at) = guests.iter().position(|g| g.state == PlayerState::Starting && g.sent_ready)
+                    && let Some(guest) = reply_to_guest(&mut guests, at, &Reply::Connected)
                 {
                     guest.state = PlayerState::Playing;
-                    let _ = guest.wire.send(&Reply::Connected);
                 }
             }
         } else if !engine_ready && Instant::now() >= next_log {
@@ -467,21 +483,23 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             let busy = guests.iter().any(|g| g.state == PlayerState::Playing);
             if !busy && guests[at].fec > fec {
                 fec = guests[at].fec;
-                drop(std::mem::replace(&mut stream, start_engine(fec)?));
+                drop(stream);
+                stream = start_engine(fec)?;
                 engine_ready = false;
                 engine_by = Instant::now() + START_TIMEOUT;
             } else {
                 wifi.get_or_insert_with(|| quiet_wifi(worker));
-                let guest = &mut guests[at];
-                guest.wire.send(&Reply::Ready {
+                let reply = Reply::Ready {
                     host: host_id,
                     certificate: identity.cert_pem.clone(),
                     mode,
                     own_audio: audio.is_some(),
                     client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
-                })?;
-                guest.sent_ready = true;
-                guest.since = Instant::now();
+                };
+                if let Some(guest) = reply_to_guest(&mut guests, at, &reply) {
+                    guest.sent_ready = true;
+                    guest.since = Instant::now();
+                }
             }
         }
 
@@ -521,19 +539,27 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         // The window: who is here, and how far away, ten times a second.
         if Instant::now() >= next_players {
             next_players = Instant::now() + LATENCY_EVERY;
-            let players: Vec<Player> = guests
-                .iter()
-                .map(|g| {
-                    let link = tunnel.link(g.port);
-                    Player {
-                        id: g.id,
-                        name: g.name.clone(),
-                        state: g.state,
-                        latency: link.map(|(_, rtt)| rtt.as_secs_f64() * 1000.0),
-                        place: link.map_or("", |(addr, _)| describe_peer(addr)),
-                    }
-                })
-                .collect();
+            let mut players = Vec::with_capacity(guests.len());
+            audio_recipients.clear();
+            for guest in &guests {
+                let link = tunnel.link(guest.port);
+                if guest.sent_ready
+                    && let Some(address) = link.and_then(|link| link.audio)
+                    && !audio_recipients.contains(&address)
+                {
+                    audio_recipients.push(address);
+                }
+                players.push(Player {
+                    id: guest.id,
+                    name: guest.name.clone(),
+                    state: guest.state,
+                    latency: link.map(|link| link.rtt.as_secs_f64() * 1000.0),
+                    place: link.map_or("", |link| describe_peer(link.address)),
+                });
+            }
+            if let Some(audio) = &audio {
+                audio.set_recipients(&audio_recipients);
+            }
             if players != shown {
                 shown = players.clone();
                 worker.emit(Event::Players(players));
@@ -773,6 +799,52 @@ mod tests {
     use super::*;
     use crate::platform::data_dir;
 
+    #[test]
+    fn a_failed_reply_only_removes_its_guest() {
+        let identity = Identity::generate("DuoLink Test").unwrap();
+        let config = identity.server_config().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let make_guest = |id, broken| {
+            let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (socket, from) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if broken {
+                socket.shutdown(std::net::Shutdown::Both).unwrap();
+            }
+            let wire = Wire::new(StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), socket));
+            let now = Instant::now();
+            (Guest {
+                id,
+                wire,
+                name: format!("Guest {id}"),
+                port: from.port(),
+                fec: DEFAULT_FEC,
+                state: PlayerState::Starting,
+                sent_ready: false,
+                since: now,
+                last_ping: now,
+            }, peer)
+        };
+        let (broken, _broken_peer) = make_guest(1, true);
+        let (healthy, peer) = make_guest(2, false);
+        let mut guests = vec![broken, healthy];
+        assert!(reply_to_guest(&mut guests, 0, &Reply::Preparing).is_none());
+        assert_eq!(guests.len(), 1);
+
+        let invite = Invite { token: new_token(), fingerprint: identity.fingerprint(), candidates: Vec::new() };
+        let listener = thread::spawn(move || {
+            let connection = ClientConnection::new(
+                client_config(&invite),
+                ServerName::from(std::net::IpAddr::from(Ipv4Addr::LOCALHOST)),
+            ).unwrap();
+            let mut wire = Wire::new(StreamOwned::new(connection, peer));
+            (0..3).find_map(|_| wire.poll::<Reply>().unwrap())
+        });
+        assert_eq!(reply_to_guest(&mut guests, 0, &Reply::Pong).unwrap().id, 2);
+        assert!(matches!(listener.join().unwrap(), Some(Reply::Pong)));
+    }
+
     fn until(
         session: &Session,
         timeout: Duration,
@@ -857,15 +929,31 @@ mod tests {
     #[ignore = "needs an audio device"]
     fn live_audio_without_voice_chat() {
         let _audio = SilentAudio::start();
-        let host = crate::audio::HostAudio::start(Ipv4Addr::LOCALHOST).unwrap();
-        let guest = GuestAudio::start(SocketAddr::from((Ipv4Addr::LOCALHOST, AUDIO_PORT)), true).unwrap();
-        thread::sleep(Duration::from_secs(3));
-        let packets = guest.received.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!("audio packets in 3 s: {packets}; voice app: {:?}", voice_app());
-        // 5 ms packets: ~600 in 3 s once the hello has gone through.
-        assert!(packets > 300, "{packets}");
-        drop(guest);
-        drop(host);
+        let host = HostAudio::start(Ipv4Addr::LOCALHOST).unwrap();
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, AUDIO_PORT));
+        let first = GuestAudio::start(target, true).unwrap();
+        let second = GuestAudio::start(target, true).unwrap();
+        let packets = |guest: &GuestAudio| guest.received.load(Ordering::Relaxed);
+
+        host.set_recipients(&[first.address]);
+        thread::sleep(Duration::from_secs(2));
+        let first_before = packets(&first);
+        assert!(first_before > 150, "audio capture: {first_before}");
+        assert_eq!(packets(&second), 0, "unapproved receiver got audio");
+
+        host.set_recipients(&[first.address, second.address]);
+        thread::sleep(Duration::from_secs(2));
+        let first_delta = packets(&first) - first_before;
+        let second_delta = packets(&second);
+        eprintln!("audio packets during 2 s: first={first_delta}, second={second_delta}");
+        assert!(first_delta > 150 && second_delta > 150);
+
+        host.set_recipients(&[second.address]);
+        thread::sleep(Duration::from_millis(150));
+        let (first_before, second_before) = (packets(&first), packets(&second));
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(packets(&first), first_before, "removed receiver still got audio");
+        assert!(packets(&second) - second_before > 100, "remaining receiver lost audio");
     }
 
     #[test]

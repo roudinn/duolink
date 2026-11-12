@@ -167,47 +167,68 @@ function renderPlay(next) {
   show("home", !sessionBusy(next));
 }
 
-// The lobby: who asked to join, who is opening the game, who plays and their ping.
+const playerRows = new Map();
+
+function playerRow(player) {
+  const row = document.createElement("div");
+  row.className = "friend";
+  const face = document.createElement("span");
+  face.className = "avatar";
+  face.setAttribute("aria-hidden", "true");
+  avatar(face, player.name);
+  const who = document.createElement("div");
+  who.className = "who";
+  const name = document.createElement("b");
+  name.textContent = player.name;
+  const note = document.createElement("small");
+  who.append(name, note);
+  row.append(face, who);
+  const id = String(player.id);
+  if (player.state === "waiting") {
+    row.append(button("Отклонить", "deny", id), button("Разрешить", "allow", id, true));
+  } else {
+    const kick = document.createElement("button");
+    kick.type = "button";
+    kick.className = "round x";
+    kick.dataset.action = "kick";
+    kick.dataset.id = id;
+    kick.title = tr("Отключить");
+    kick.setAttribute("aria-label", `${tr("Отключить")} ${player.name}`);
+    kick.innerHTML = '<svg aria-hidden="true"><use href="#i-close"/></svg>';
+    row.append(kick);
+  }
+  return { row, note };
+}
+
 function renderPlayers(players) {
   const root = $("players");
-  show("players", players.length > 0);
-  const key = JSON.stringify([language.value, players]);
-  if (root.dataset.key === key) return;
-  root.dataset.key = key;
-  replaceRows(root, players.map((player) => {
-    const row = document.createElement("div");
-    row.className = "friend";
-    const face = document.createElement("span");
-    face.className = "avatar";
-    face.setAttribute("aria-hidden", "true");
-    avatar(face, player.name);
-    const who = document.createElement("div");
-    who.className = "who";
-    const name = document.createElement("b");
-    name.textContent = player.name;
-    const note = document.createElement("small");
+  root.toggleAttribute("hidden", players.length === 0);
+  const present = new Set(players.map((player) => player.id));
+  for (const [id, entry] of playerRows) {
+    if (!present.has(id)) {
+      entry.row.remove();
+      playerRows.delete(id);
+    }
+  }
+  for (const [index, player] of players.entries()) {
+    // RTT updates must keep the same controls under the pointer and keyboard focus.
+    const key = JSON.stringify([language.value, player.name, player.state === "waiting"]);
+    let entry = playerRows.get(player.id);
+    if (entry?.key !== key) {
+      const next = { ...playerRow(player), key };
+      entry?.row.replaceWith(next.row);
+      playerRows.set(player.id, next);
+      entry = next;
+    }
+    if (root.children[index] !== entry.row) {
+      root.insertBefore(entry.row, root.children[index] ?? null);
+    }
     const ping = typeof player.latency === "number"
       ? `${player.latency < 10 ? player.latency.toFixed(1) : Math.round(player.latency)} ${tr("мс")}` : "";
-    note.textContent = player.state === "waiting" ? tr("Хочет играть")
+    const label = player.state === "waiting" ? tr("Хочет играть")
       : player.state === "starting" ? tr("Открывает игру…") : ping;
-    who.append(name, note);
-    row.append(face, who);
-    const id = String(player.id);
-    if (player.state === "waiting") {
-      row.append(button("Отклонить", "deny", id), button("Разрешить", "allow", id, true));
-    } else {
-      const kick = document.createElement("button");
-      kick.type = "button";
-      kick.className = "round x";
-      kick.dataset.action = "kick";
-      kick.dataset.id = id;
-      kick.title = tr("Отключить");
-      kick.setAttribute("aria-label", `${tr("Отключить")} ${player.name}`);
-      kick.innerHTML = '<svg aria-hidden="true"><use href="#i-close"/></svg>';
-      row.append(kick);
-    }
-    return row;
-  }));
+    if (entry.note.textContent !== label) entry.note.textContent = label;
+  }
 }
 
 /* ---------------- friends ---------------- */

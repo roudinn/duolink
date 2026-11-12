@@ -176,7 +176,13 @@ fn loopback_client(exclude: u32) -> Result<IAudioClient> {
     Ok(unknown.context("Нет аудиоклиента.")?.cast()?)
 }
 
-fn capture(socket: &UdpSocket, guest: SocketAddr, exclude: u32, stop: &AtomicBool) -> Result<()> {
+fn capture(
+    socket: &UdpSocket,
+    recipients: &Mutex<Vec<SocketAddr>>,
+    sequence: &mut u32,
+    exclude: u32,
+    stop: &AtomicBool,
+) -> Result<()> {
     let client = loopback_client(exclude)?;
     let ready = Event::new()?;
     unsafe {
@@ -193,7 +199,7 @@ fn capture(socket: &UdpSocket, guest: SocketAddr, exclude: u32, stop: &AtomicBoo
     let reader: IAudioCaptureClient = unsafe { client.GetService()? };
     unsafe { client.Start()? };
     let mut pending: Vec<i16> = Vec::with_capacity(CHUNK * CHANNELS * 4);
-    let mut sequence = 0u32;
+    let mut targets = Vec::new();
     let mut datagram = Vec::with_capacity(4 + CHUNK * CHANNELS * 2);
     let mut recheck = Instant::now() + Duration::from_secs(3);
     while !stop.load(Ordering::Relaxed) {
@@ -209,6 +215,10 @@ fn capture(socket: &UdpSocket, guest: SocketAddr, exclude: u32, stop: &AtomicBoo
             }
         }
         ready.wait(20);
+        targets.clone_from(&recipients.lock().unwrap());
+        if targets.is_empty() {
+            break;
+        }
         loop {
             let frames = unsafe { reader.GetNextPacketSize()? };
             if frames == 0 {
@@ -232,8 +242,10 @@ fn capture(socket: &UdpSocket, guest: SocketAddr, exclude: u32, stop: &AtomicBoo
             for sample in pending.drain(..CHUNK * CHANNELS) {
                 datagram.extend_from_slice(&sample.to_le_bytes());
             }
-            sequence = sequence.wrapping_add(1);
-            let _ = socket.send_to(&datagram, guest);
+            *sequence = sequence.wrapping_add(1);
+            for target in &targets {
+                let _ = socket.send_to(&datagram, target);
+            }
         }
     }
     unsafe {
@@ -242,9 +254,10 @@ fn capture(socket: &UdpSocket, guest: SocketAddr, exclude: u32, stop: &AtomicBoo
     Ok(())
 }
 
-/// Host side: records game audio and sends it to the guest.
+/// Host side: records game audio once and sends it to the active streams.
 pub struct HostAudio {
     stop: Arc<AtomicBool>,
+    recipients: Arc<Mutex<Vec<SocketAddr>>>,
     task: Option<thread::JoinHandle<()>>,
 }
 
@@ -253,33 +266,45 @@ impl HostAudio {
     pub fn start(address: Ipv4Addr) -> Result<Self> {
         let socket = UdpSocket::bind((address, AUDIO_PORT))
             .with_context(|| format!("UDP-порт {AUDIO_PORT} недоступен."))?;
-        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+        socket.set_nonblocking(true)?;
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
         loopback_client(unsafe { GetCurrentProcessId() }).context("Захват звука без голосового чата недоступен.")?;
         let stop = Arc::new(AtomicBool::new(false));
+        let recipients = Arc::new(Mutex::new(Vec::new()));
         let flag = stop.clone();
+        let targets = recipients.clone();
         let task = thread::Builder::new().name("duolink-audio".into()).spawn(move || {
             prioritize_thread();
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            let mut buffer = [0u8; 64];
-            let mut guest = None;
+            let mut sequence = 0;
             while !flag.load(Ordering::Relaxed) {
-                // The guest says hello through the tunnel; its source is where audio goes.
-                if let Ok((count, from)) = socket.recv_from(&mut buffer)
-                    && &buffer[..count] == HELLO
-                {
-                    guest = Some(from);
+                if targets.lock().unwrap().is_empty() {
+                    thread::park();
+                    continue;
                 }
-                let Some(target) = guest else { continue };
                 let exclude = voice_app().map_or(unsafe { GetCurrentProcessId() }, |(pid, _)| pid);
-                if capture(&socket, target, exclude, &flag).is_err() {
-                    thread::sleep(Duration::from_millis(500));
+                if capture(&socket, &targets, &mut sequence, exclude, &flag).is_err() {
+                    thread::park_timeout(Duration::from_millis(500));
                 }
             }
         })?;
-        Ok(Self { stop, task: Some(task) })
+        Ok(Self { stop, recipients, task: Some(task) })
+    }
+
+    pub fn set_recipients(&self, recipients: &[SocketAddr]) {
+        let mut current = self.recipients.lock().unwrap();
+        if current.as_slice() == recipients {
+            return;
+        }
+        let wake = current.is_empty() && !recipients.is_empty();
+        current.clear();
+        current.extend_from_slice(recipients);
+        drop(current);
+        if wake && let Some(task) = &self.task {
+            task.thread().unpark();
+        }
     }
 }
 
@@ -287,6 +312,7 @@ impl Drop for HostAudio {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(task) = self.task.take() {
+            task.thread().unpark();
             let _ = task.join();
         }
     }
@@ -373,6 +399,8 @@ fn play(queue: &Mutex<Jitter>, stop: &AtomicBool) -> Result<()> {
 /// Guest side: receives the host's audio and plays it on the default device.
 pub struct GuestAudio {
     stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub address: SocketAddr,
     #[cfg_attr(not(test), allow(dead_code))]
     pub received: Arc<AtomicU64>,
     tasks: Vec<thread::JoinHandle<()>>,
@@ -382,6 +410,8 @@ impl GuestAudio {
     /// `silent`: receive only (host and guest on one PC would loop the sound).
     pub fn start(host: SocketAddr, silent: bool) -> Result<Self> {
         let socket = UdpSocket::bind((host.ip(), 0)).context("Не удалось открыть порт для звука.")?;
+        #[cfg(test)]
+        let address = socket.local_addr()?;
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let received = Arc::new(AtomicU64::new(0));
@@ -426,7 +456,13 @@ impl GuestAudio {
                 }
             })?);
         }
-        Ok(Self { stop, received, tasks })
+        Ok(Self {
+            stop,
+            #[cfg(test)]
+            address,
+            received,
+            tasks,
+        })
     }
 }
 

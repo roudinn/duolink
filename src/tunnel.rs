@@ -597,8 +597,9 @@ fn reset(error: &std::io::Error) -> bool {
 }
 
 /// Host side: Sunshine's ports reached through 127.0.0.1.
-async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Vec<u16>>>) {
-    tokio::spawn(ping_loop(conn.clone(), pinger.clone()));
+async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<LinkPorts>>) {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(ping_loop(conn.clone(), pinger.clone()));
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
         let Ok(socket) = UdpSocket::bind((HOST_LOOPBACK, 0)).await else { return };
@@ -606,10 +607,13 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Ve
         if socket.connect((HOST_LOOPBACK, port)).await.is_err() {
             return;
         }
+        if port == crate::audio::AUDIO_PORT {
+            ports.lock().unwrap().audio = socket.local_addr().ok();
+        }
         let socket = Arc::new(socket);
         sockets.insert(port, socket.clone());
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 match socket.recv(&mut buffer).await {
@@ -620,9 +624,9 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Ve
             }
         });
     }
-    let datagrams = {
+    {
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Ok(datagram) = conn.read_datagram().await {
                 if datagram.len() < 2 {
                     continue;
@@ -631,15 +635,20 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Ve
                 if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
                     continue;
                 }
+                // The guest's audio hello registers its local playback socket.
+                // The host selects recipients using the approved control sockets.
+                if port == crate::audio::AUDIO_PORT {
+                    continue;
+                }
                 if let Some(socket) = sockets.get(&port) {
                     let _ = socket.send(&datagram[2..]).await;
                 }
             }
-        })
-    };
+        });
+    }
     while let Ok((send, mut recv)) = conn.accept_bi().await {
         let conn = conn.clone();
-        let control = control.clone();
+        let ports = ports.clone();
         tokio::spawn(async move {
             let mut header = [0u8; 2];
             if recv.read_exact(&mut header).await.is_err() {
@@ -655,16 +664,24 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, control: Arc<Mutex<Ve
             }
             if let Ok(tcp) = TcpStream::connect((HOST_LOOPBACK, port)).await {
                 // The session sees this socket's port and so knows which guest it is.
-                if port == CONTROL_PORT
-                    && let Ok(local) = tcp.local_addr()
-                {
-                    control.lock().unwrap().push(local.port());
+                let control = if port == CONTROL_PORT {
+                    tcp.local_addr().ok().map(|local| local.port())
+                } else {
+                    None
+                };
+                if let Some(control) = control {
+                    ports.lock().unwrap().control.push(control);
                 }
-                pipe(tcp, send, recv).await;
+                tokio::select! {
+                    _ = pipe(tcp, send, recv) => {}
+                    _ = conn.closed() => {}
+                }
+                if let Some(control) = control {
+                    ports.lock().unwrap().control.retain(|&port| port != control);
+                }
             }
         });
     }
-    datagrams.abort();
 }
 
 /// Guest side: the same ports mirrored on 127.0.0.2.
@@ -967,12 +984,16 @@ impl HostTunnel {
     }
 
     /// The guest whose control connection reached the session from `control_port`,
-    /// while its tunnel is up: where it is and the current round trip.
-    pub fn link(&self, control_port: u16) -> Option<(SocketAddr, Duration)> {
+    /// while its tunnel is up.
+    pub fn link(&self, control_port: u16) -> Option<GuestLink> {
         let links = self.links.lock().unwrap();
-        let link = links.iter().find(|l| l.control.lock().unwrap().contains(&control_port))?;
-        link.conn.close_reason().is_none().then(|| {
-            (link.conn.remote_address(), link.pinger.rtt().unwrap_or_else(|| link.conn.rtt()))
+        links.iter().filter(|link| link.conn.close_reason().is_none()).find_map(|link| {
+            let ports = link.ports.lock().unwrap();
+            ports.control.contains(&control_port).then(|| GuestLink {
+                address: link.conn.remote_address(),
+                rtt: link.pinger.rtt().unwrap_or_else(|| link.conn.rtt()),
+                audio: ports.audio,
+            })
         })
     }
 
@@ -981,11 +1002,23 @@ impl HostTunnel {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct GuestLink {
+    pub address: SocketAddr,
+    pub rtt: Duration,
+    pub audio: Option<SocketAddr>,
+}
+
+#[derive(Default)]
+struct LinkPorts {
+    control: Vec<u16>,
+    audio: Option<SocketAddr>,
+}
+
 struct Link {
     conn: Connection,
     pinger: Arc<Pinger>,
-    /// Local ports of the session's control sockets opened through this link.
-    control: Arc<Mutex<Vec<u16>>>,
+    ports: Arc<Mutex<LinkPorts>>,
 }
 
 impl Drop for HostTunnel {
@@ -1034,18 +1067,18 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>
                 return;
             }
             let pinger = Pinger::new();
-            let control = Arc::new(Mutex::new(Vec::new()));
+            let ports = Arc::new(Mutex::new(LinkPorts::default()));
             {
                 let mut links = links.lock().unwrap();
                 if full(&mut links) {
                     conn.close(VarInt::from_u32(4), b"busy");
                     return;
                 }
-                links.push(Link { conn: conn.clone(), pinger: pinger.clone(), control: control.clone() });
+                links.push(Link { conn: conn.clone(), pinger: pinger.clone(), ports: ports.clone() });
             }
             let _ = send.write_all(&[1]).await;
             let _ = send.finish();
-            serve_host(conn, pinger, control).await;
+            serve_host(conn, pinger, ports).await;
         });
     }
 }
@@ -1281,6 +1314,79 @@ fn failure_hint(reflexive: &Reflexive) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "binds the host control and audio ports on loopback"]
+    fn audio_routes_are_independent_for_each_guest() {
+        use crate::{audio::AUDIO_PORT, protocol::new_token};
+        use tokio::io::AsyncReadExt;
+
+        let identity = Identity::generate("DuoLink Test").unwrap();
+        let token = new_token();
+        runtime().unwrap().block_on(async {
+            let localhost = SocketAddr::from((HOST_LOOPBACK, 0));
+            let control = TcpListener::bind((HOST_LOOPBACK, CONTROL_PORT)).await.unwrap();
+            let audio = UdpSocket::bind((HOST_LOOPBACK, AUDIO_PORT)).await.unwrap();
+            let endpoint = Endpoint::server(server_config(&identity).unwrap(), localhost).unwrap();
+            let address = endpoint.local_addr().unwrap();
+            let client = Endpoint::client(localhost).unwrap();
+            let config = client_config(identity.fingerprint()).unwrap();
+            let links = Arc::new(Mutex::new(Vec::new()));
+            tokio::spawn(accept(endpoint.clone(), token, links.clone()));
+            let host = HostTunnel {
+                runtime: None,
+                endpoint,
+                candidates: Vec::new(),
+                reflexive: Reflexive::default(),
+                forwarded: false,
+                links,
+                alive: Arc::new(AtomicBool::new(true)),
+                _mapping: None,
+                _signal: None,
+            };
+            let join = async || {
+                let guest = client.connect_with(config.clone(), address, "duolink").unwrap().await.unwrap();
+                authenticate(&guest, token).await.unwrap();
+                let (mut send, recv) = guest.open_bi().await.unwrap();
+                send.write_all(&CONTROL_PORT.to_be_bytes()).await.unwrap();
+                send.write_all(b"hi").await.unwrap();
+                let (mut tcp, from) = control.accept().await.unwrap();
+                let mut marker = [0; 2];
+                tcp.read_exact(&mut marker).await.unwrap();
+                assert_eq!(&marker, b"hi");
+                (guest, send, recv, tcp, from.port())
+            };
+            let receive_audio = async |guest: &Connection| {
+                loop {
+                    let datagram = guest.read_datagram().await.unwrap();
+                    if datagram.starts_with(&AUDIO_PORT.to_be_bytes()) {
+                        return datagram.slice(2..);
+                    }
+                }
+            };
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (first, _first_send, _first_recv, mut first_tcp, first_port) = join().await;
+                let (second, _second_send, _second_recv, _second_tcp, second_port) = join().await;
+                let first_route = host.link(first_port).unwrap().audio.unwrap();
+                let second_route = host.link(second_port).unwrap().audio.unwrap();
+                assert_ne!(first_route, second_route);
+
+                audio.send_to(b"first", first_route).await.unwrap();
+                audio.send_to(b"second", second_route).await.unwrap();
+                assert_eq!(&receive_audio(&first).await[..], b"first");
+                assert_eq!(&receive_audio(&second).await[..], b"second");
+
+                first.close(VarInt::from_u32(0), b"bye");
+                assert_eq!(first_tcp.read(&mut [0; 1]).await.unwrap(), 0);
+                assert!(host.link(first_port).is_none());
+                assert_eq!(host.link(second_port).unwrap().audio, Some(second_route));
+                audio.send_to(b"still here", second_route).await.unwrap();
+                assert_eq!(&receive_audio(&second).await[..], b"still here");
+                second.close(VarInt::from_u32(0), b"bye");
+            }).await.expect("loopback audio routing timed out");
+        });
+    }
 
     #[test]
     fn stun_xor_mapped_address_parses() {
