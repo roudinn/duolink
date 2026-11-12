@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use windows_sys::{
     Win32::{
         Devices::DeviceAndDriverInstallation::CM_Get_Device_Interface_List_SizeW,
-        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_DEVICE_NOT_CONNECTED, GetLastError, HANDLE},
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
         Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW},
         System::{
             JobObjects::{
@@ -32,7 +32,6 @@ use windows_sys::{
             },
         },
         UI::{
-            Input::XboxController::{XINPUT_STATE, XInputGetState, XUSER_MAX_COUNT},
             Shell::ShellExecuteW,
             WindowsAndMessaging::SW_SHOWNORMAL,
         },
@@ -103,16 +102,6 @@ pub fn vigem_present() -> bool {
         CM_Get_Device_Interface_List_SizeW(&mut length, &guid, std::ptr::null(), 0) == 0
             && length > 1
     }
-}
-
-pub fn free_xinput_slots() -> usize {
-    (0..XUSER_MAX_COUNT)
-        .filter(|&index| {
-            let mut state = XINPUT_STATE::default();
-            let status = unsafe { XInputGetState(index, &mut state) };
-            status == ERROR_DEVICE_NOT_CONNECTED
-        })
-        .count()
 }
 
 pub fn open(target: &OsStr) -> Result<()> {

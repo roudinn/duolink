@@ -20,13 +20,13 @@ use crate::{
     media::{DEFAULT_FEC, GuestStream, HostStream, MOONLIGHT, PATH_SHARE, Preferences, SUNSHINE, fec_for_loss},
     platform::{
         KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
-        free_xinput_slots, vigem_present,
+        vigem_present,
     },
     protocol::{
         CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Reply, Request, Wire, client_config,
         new_token, valid_pem,
     },
-    tunnel::{GuestTunnel, HostTunnel, MAX_GUESTS, PROBE_MBPS, describe_peer, dropped},
+    tunnel::{GuestTunnel, HostTunnel, PROBE_MBPS, describe_peer, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -34,7 +34,6 @@ const SILENCE: Duration = Duration::from_secs(6);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(90);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const NO_CONTROLLER_SLOT: &str = "На ПК хоста нет свободных слотов для геймпадов.";
 
 #[derive(Debug)]
 pub enum Event {
@@ -288,10 +287,6 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut mode = display_mode()?;
     let current_hz = mode.fps;
     mode.fps = display_max_refresh().unwrap_or(current_hz);
-    // Count before Sunshine can create any virtual pads. Each pending guest
-    // reserves one slot, even before their controller starts sending input.
-    let guest_limit = free_xinput_slots().min(MAX_GUESTS);
-    ensure!(guest_limit > 0, NO_CONTROLLER_SLOT);
     let mut fec = DEFAULT_FEC;
     // Sunshine starts while the code travels to the friends: by the time
     // someone joins, it is already listening.
@@ -354,7 +349,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut guests: Vec<Guest> = Vec::new();
     let mut next_id = 1u32;
     let mut shown: Vec<Player> = Vec::new();
-    let mut audio_recipients = Vec::with_capacity(MAX_GUESTS);
+    let mut audio_recipients = Vec::new();
     let mut next_players = Instant::now();
     let mut playing_before = false;
     let mut drops_shown = dropped();
@@ -405,11 +400,9 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             };
             let mut knock = knocks.swap_remove(index);
             match request {
-                Some(Request::Join { token, name, lobby, fec: wanted, .. }) if invite.authorizes(&token) => {
-                    if !lobby {
+                Some(Request::Join { token, name, lobby, controller_hotplug, fec: wanted, .. }) if invite.authorizes(&token) => {
+                    if !lobby || !controller_hotplug {
                         close(&mut knock.wire, "Обновите DuoLink: у хоста новая версия.");
-                    } else if guests.len() >= guest_limit {
-                        close(&mut knock.wire, "Лобби заполнено.");
                     } else {
                         if knock.wire.send(&Reply::Pending).is_err() {
                             continue;
@@ -483,11 +476,6 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             && !opening
             && let Some(at) = guests.iter().position(|g| g.state == PlayerState::Starting)
         {
-            if free_xinput_slots() == 0 {
-                let mut guest = guests.remove(at);
-                close(&mut guest.wire, NO_CONTROLLER_SLOT);
-                continue;
-            }
             // The first guest on a lossy path: restart Sunshine with more
             // redundancy while nobody is watching yet.
             let busy = guests.iter().any(|g| g.state == PlayerState::Playing);
@@ -659,6 +647,7 @@ fn guest(
         certificate: String::new(),
         fec: None,
         lobby: true,
+        controller_hotplug: true,
     })
     .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");

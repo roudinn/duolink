@@ -54,8 +54,6 @@ pub const TUNNEL_PORT: u16 = 48170;
 /// Where the guest mirrors the host's ports, so a host on the same PC (127.0.0.1) never collides.
 /// A second guest on the same PC (tests) takes the next address.
 pub const GUEST_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-/// Guests in one lobby at once; Sunshine runs one encoder per guest.
-pub const MAX_GUESTS: usize = 4;
 const HOST_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA_PORT + 21];
 pub const UDP_PORTS: [u16; 4] = [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
@@ -1037,17 +1035,7 @@ impl Drop for HostTunnel {
 }
 
 async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>>) {
-    // Connections that died must not hold a seat; a few spare seats let a
-    // reconnecting guest in before its old link times out.
-    let full = |links: &mut Vec<Link>| {
-        links.retain(|l| l.conn.close_reason().is_none());
-        links.len() >= MAX_GUESTS + 2
-    };
     while let Some(incoming) = endpoint.accept().await {
-        if full(&mut links.lock().unwrap()) {
-            incoming.refuse();
-            continue;
-        }
         let links = links.clone();
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
@@ -1068,17 +1056,12 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>
             }
             let pinger = Pinger::new();
             let ports = Arc::new(Mutex::new(LinkPorts::default()));
-            {
-                let mut links = links.lock().unwrap();
-                if full(&mut links) {
-                    conn.close(VarInt::from_u32(4), b"busy");
-                    return;
-                }
-                links.push(Link { conn: conn.clone(), pinger: pinger.clone(), ports: ports.clone() });
-            }
+            let id = conn.stable_id();
+            links.lock().unwrap().push(Link { conn: conn.clone(), pinger: pinger.clone(), ports: ports.clone() });
             let _ = send.write_all(&[1]).await;
             let _ = send.finish();
             serve_host(conn, pinger, ports).await;
+            links.lock().unwrap().retain(|link| link.conn.stable_id() != id);
         });
     }
 }
@@ -1317,7 +1300,7 @@ mod tests {
 
     #[test]
     #[ignore = "binds the host control and audio ports on loopback"]
-    fn audio_routes_are_independent_for_each_guest() {
+    fn seven_guests_keep_independent_tunnels() {
         use crate::{audio::AUDIO_PORT, protocol::new_token};
         use tokio::io::AsyncReadExt;
 
@@ -1368,6 +1351,10 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let (first, _first_send, _first_recv, mut first_tcp, first_port) = join().await;
                 let (second, _second_send, _second_recv, _second_tcp, second_port) = join().await;
+                let mut others = Vec::new();
+                for _ in 0..5 {
+                    others.push(join().await);
+                }
                 let first_route = host.link(first_port).unwrap().audio.unwrap();
                 let second_route = host.link(second_port).unwrap().audio.unwrap();
                 assert_ne!(first_route, second_route);

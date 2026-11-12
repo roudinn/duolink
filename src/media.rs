@@ -15,7 +15,6 @@ use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::{
-    tunnel::MAX_GUESTS,
     platform::{Process, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
@@ -195,7 +194,6 @@ pub fn host_config(rel: &str, address: Ipv4Addr, fec: u8) -> String {
          mouse = disabled\n\
          native_pen_touch = disabled\n\
          stream_audio = enabled\n\
-         channels = {MAX_GUESTS}\n\
          install_steam_audio_drivers = disabled\n\
          dd_configuration_option = verify_only\n\
          dd_resolution_option = disabled\n\
@@ -612,7 +610,9 @@ pub fn guest_args(same_machine: bool, mode: Mode, preferences: Preferences) -> V
         "--no-frame-pacing",
         "--audio-on-host",
         "--no-mute-on-focus-loss",
-        "--no-multi-controller",
+        // In single-controller mode Moonlight keeps one virtual pad connected
+        // even when there is no physical pad. Use actual attach/detach events.
+        "--multi-controller",
         "--background-gamepad",
         "--keep-awake",
         "--no-game-optimization",
@@ -718,7 +718,7 @@ mod tests {
         let mode = Mode { width: 2560, height: 1440, fps: 165 };
         let args = guest_args(false, mode, Preferences::default());
         let has = |flag: &str| args.iter().any(|arg| arg == flag);
-        for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "1024"] {
+        for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "--multi-controller", "1024"] {
             assert!(has(flag), "missing {flag}");
         }
         assert!(guest_args(true, mode, Preferences::default()).iter().any(|arg| arg == "windowed"));

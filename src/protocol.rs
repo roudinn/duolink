@@ -248,6 +248,9 @@ pub enum Request {
         /// The guest takes the client key from Ready (lobby hosts, 1.10+).
         #[serde(default)]
         lobby: bool,
+        /// A disconnected physical controller releases its virtual controller.
+        #[serde(default)]
+        controller_hotplug: bool,
     },
     Ping,
     Leave,
