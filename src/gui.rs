@@ -44,12 +44,12 @@ const WINDOWS_VIEW: &str = "https://duolink.localhost/index.html";
 const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
 /// An update found this soon after launch installs and restarts on its own.
 const AUTO_RESTART: Duration = Duration::from_secs(120);
-/// WebView2 without what a local two-screen UI never uses: less memory, no
-/// background traffic, and no GPU process competing with the game's encoder.
+/// WebView2 without what a local two-screen UI never uses: less memory and no
+/// background traffic. The GPU stays on: software drawing made scrolling choppy.
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,\
 OptimizationHints,AutofillServerCommunication,MediaRouter,SpareRendererForSitePerProcess \
 --disable-background-networking --disable-component-update --disable-default-apps --disable-sync \
---no-first-run --renderer-process-limit=1 --disable-gpu --disable-gpu-compositing";
+--no-first-run --renderer-process-limit=1";
 
 /// Lets WebView2 drop caches while the window is in the background.
 fn memory_level(view: &WebView, low: bool) {
