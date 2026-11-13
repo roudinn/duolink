@@ -7,7 +7,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
-    sync::mpsc::{self, RecvTimeoutError, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -44,30 +44,9 @@ impl Presence {
             .name("duolink-presence".into())
             .spawn(move || {
                 let started = unix_now();
-                let mut wanted = Status::Idle;
-                let mut shown: Option<Status> = None;
-                let mut pipe: Option<File> = None;
-                loop {
-                    match rx.recv_timeout(Duration::from_secs(10)) {
-                        Ok(status) => wanted = status,
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                    if shown.as_ref() == Some(&wanted) {
-                        continue;
-                    }
-                    // Discord may start later or restart: connect again on the next pass.
-                    if pipe.is_none() {
-                        pipe = connect();
-                    }
-                    let Some(file) = pipe.as_mut() else { continue };
-                    if send(file, &activity(&wanted, started)).is_ok() {
-                        shown = Some(wanted.clone());
-                    } else {
-                        pipe = None;
-                        shown = None;
-                    }
-                }
+                run(rx, Duration::from_secs(10), connect, |file, status| {
+                    send(file, &activity(status, started)).is_ok()
+                });
             })
             .ok()?;
         Some(Self { tx })
@@ -75,6 +54,44 @@ impl Presence {
 
     pub fn set(&self, status: Status) {
         let _ = self.tx.send(status);
+    }
+}
+
+fn run<T>(
+    rx: Receiver<Status>,
+    retry: Duration,
+    mut connect: impl FnMut() -> Option<T>,
+    mut publish: impl FnMut(&mut T, &Status) -> bool,
+) {
+    let mut wanted = Status::Off;
+    let mut shown = None;
+    let mut pipe = None;
+    loop {
+        match rx.recv_timeout(retry) {
+            Ok(status) => wanted = rx.try_iter().last().unwrap_or(status),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if wanted == Status::Off {
+            if let Some(mut pipe) = pipe.take() {
+                publish(&mut pipe, &Status::Off);
+            }
+            shown = None;
+            continue;
+        }
+        if shown.as_ref() == Some(&wanted) {
+            continue;
+        }
+        if pipe.is_none() {
+            pipe = connect();
+        }
+        let Some(file) = pipe.as_mut() else { continue };
+        if publish(file, &wanted) {
+            shown = Some(wanted.clone());
+        } else {
+            pipe = None;
+            shown = None;
+        }
     }
 }
 
@@ -156,6 +173,37 @@ fn send(file: &mut File, message: &Value) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_waits_for_enable_and_clears_on_disable() {
+        let (command, rx) = mpsc::channel();
+        let (observed, events) = mpsc::channel();
+        let task = thread::spawn(move || {
+            run(rx, Duration::from_millis(10), || {
+                observed.send(None).unwrap();
+                Some(())
+            }, |_, status| {
+                observed.send(Some(status.clone())).unwrap();
+                true
+            });
+        });
+        let no_activity = || {
+            assert_eq!(events.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
+        };
+        let next = || events.recv_timeout(Duration::from_secs(1)).unwrap();
+        no_activity();
+        command.send(Status::Idle).unwrap();
+        assert_eq!(next(), None);
+        assert_eq!(next(), Some(Status::Idle));
+        command.send(Status::Off).unwrap();
+        assert_eq!(next(), Some(Status::Off));
+        no_activity();
+        command.send(Status::Playing).unwrap();
+        assert_eq!(next(), None);
+        assert_eq!(next(), Some(Status::Playing));
+        drop(command);
+        task.join().unwrap();
+    }
 
     #[test]
     #[ignore = "needs the Discord desktop app running"]

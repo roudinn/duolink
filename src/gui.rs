@@ -401,13 +401,14 @@ impl App {
     fn new(data: PathBuf, wake: Arc<dyn Fn() + Send + Sync>, updater: Option<Updater>) -> Result<Self> {
         let identity = Me::load_or_create(&data)?;
         let book = Book::load(&data);
+        let presence = Presence::start();
         let mut app = Self {
             host: Pane::default(),
             guest: Pane::default(),
             setup: Pane::default(),
             version: env!("CARGO_PKG_VERSION"),
             update: update::Status::Idle,
-            discord: Presence::start().map(|_| discord_pref(&data)),
+            discord: presence.as_ref().map(|_| discord_pref(&data)),
             autostart: crate::platform::autostart_enabled(),
             me: MeView { name: String::new(), tag: String::new(), chosen: false },
             friends: Vec::new(),
@@ -424,7 +425,7 @@ impl App {
             attention: false,
             updater,
             quit: false,
-            presence: Presence::start(),
+            presence,
             shown_presence: None,
             launched: Instant::now(),
             setup_cancelled: false,
@@ -637,10 +638,12 @@ impl App {
             Action::Ready | Action::Wake | Action::Show => {}
             Action::SetDiscord { on } if self.discord.is_some() => {
                 self.discord = Some(on);
-                save_discord_pref(&self.data, on);
                 self.shown_presence = None;
                 if !on && let Some(presence) = &self.presence {
                     presence.set(PresenceStatus::Off);
+                }
+                if save_discord_pref(&self.data, on).is_err() {
+                    toast(view, "Не удалось сохранить настройку Discord.")?;
                 }
             }
             Action::SetAutostart { on } => match crate::platform::set_autostart(on) {
@@ -1061,8 +1064,11 @@ fn discord_pref(data: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn save_discord_pref(data: &Path, on: bool) {
-    let _ = fs::write(data.join("prefs.json"), serde_json::json!({ "discord": on }).to_string());
+fn save_discord_pref(data: &Path, on: bool) -> Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(data)?;
+    serde_json::to_writer(&mut file, &serde_json::json!({ "discord": on }))?;
+    file.persist(data.join("prefs.json"))?;
+    Ok(())
 }
 
 pub fn run(hidden: bool) -> Result<()> {

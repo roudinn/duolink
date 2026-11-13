@@ -283,6 +283,39 @@ pub fn run_tool(command: &mut Command, check: impl Fn() -> Result<()>) -> Result
     }
 }
 
+/// Request a normal exit so Moonlight closes its GameStream connection.
+pub fn close_windows(pid: u32) -> bool {
+    use windows_sys::{
+        Win32::{
+            Foundation::{HWND, LPARAM},
+            UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE},
+        },
+        core::BOOL,
+    };
+
+    struct Request {
+        pid: u32,
+        posted: bool,
+    }
+
+    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> BOOL {
+        let request = unsafe { &mut *(data as *mut Request) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        if pid == request.pid
+            && unsafe { IsWindowVisible(window) } != 0
+            && unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0
+        {
+            request.posted = true;
+        }
+        1
+    }
+
+    let mut request = Request { pid, posted: false };
+    unsafe { EnumWindows(Some(visit), (&mut request as *mut Request) as LPARAM) };
+    request.posted
+}
+
 /// Keeps the display and system awake while the calling thread holds it.
 /// Desktop Duplication stops delivering frames once the host display sleeps.
 pub struct KeepAwake;

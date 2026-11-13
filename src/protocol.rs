@@ -253,6 +253,8 @@ pub enum Request {
         controller_hotplug: bool,
         #[serde(default)]
         audio_opus: bool,
+        #[serde(default)]
+        bitrate_restart: bool,
     },
     Ping,
     Leave,
@@ -264,6 +266,8 @@ pub enum Request {
     },
     /// Actual request to Moonlight, sent only after a host advertises a budget.
     Bitrate { kbps: u32 },
+    /// The old Moonlight process has exited and the replacement can start.
+    RestartReady { closed_cleanly: bool },
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -293,6 +297,9 @@ pub enum Reply {
         client: Option<ClientKey>,
     },
     Connected,
+    /// Reopen this automatic stream at a lower rate while keeping its lobby slot.
+    LowerBitrate { kbps: u32 },
+    RestartStream,
     Pong,
     Closed {
         reason: String,
@@ -403,7 +410,10 @@ mod tests {
             "mode": Mode { width: 1920, height: 1080, fps: 60 }
         });
         let measured = serde_json::json!({ "type": "measured", "fec": 20 });
-        assert!(matches!(serde_json::from_value(join).unwrap(), Request::Join { audio_opus: false, .. }));
+        assert!(matches!(
+            serde_json::from_value(join).unwrap(),
+            Request::Join { audio_opus: false, bitrate_restart: false, .. }
+        ));
         assert!(matches!(
             serde_json::from_value(ready).unwrap(),
             Reply::Ready { own_audio: true, audio_opus: false, auto_bitrate_kbps: None, .. }

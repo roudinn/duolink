@@ -507,11 +507,12 @@ const PONG_PORT: u16 = 2;
 pub struct Pinger {
     origin: Instant,
     rtt_us: AtomicU64,
+    last_pong_us: AtomicU64,
 }
 
 impl Pinger {
     fn new() -> Arc<Self> {
-        Arc::new(Self { origin: Instant::now(), rtt_us: AtomicU64::new(0) })
+        Arc::new(Self { origin: Instant::now(), rtt_us: AtomicU64::new(0), last_pong_us: AtomicU64::new(0) })
     }
 
     fn stamp(&self) -> [u8; 8] {
@@ -525,12 +526,35 @@ impl Pinger {
         let previous = self.rtt_us.load(Ordering::Relaxed);
         let smoothed = if previous == 0 { sample } else { (previous * 3 + sample) / 4 };
         self.rtt_us.store(smoothed, Ordering::Relaxed);
+        self.last_pong_us.store(now, Ordering::Relaxed);
     }
 
     pub fn rtt(&self) -> Option<Duration> {
         match self.rtt_us.load(Ordering::Relaxed) {
             0 => None,
             us => Some(Duration::from_micros(us)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UploadSample {
+    pub sent: u64,
+    pub lost: u64,
+    pub bytes: u64,
+    pub rtt: Option<Duration>,
+}
+
+impl UploadSample {
+    fn read(conn: &Connection, pinger: &Pinger) -> Self {
+        let stats = conn.stats();
+        let now = pinger.origin.elapsed().as_micros() as u64;
+        let last = pinger.last_pong_us.load(Ordering::Relaxed);
+        Self {
+            sent: stats.path.sent_packets,
+            lost: stats.path.lost_packets,
+            bytes: stats.udp_tx.bytes,
+            rtt: pinger.rtt().filter(|_| now.saturating_sub(last) < 1_000_000),
         }
     }
 }
@@ -1064,6 +1088,14 @@ impl HostTunnel {
                 rtt: link.pinger.rtt().unwrap_or_else(|| link.conn.rtt()),
                 audio: ports.audio,
             })
+        })
+    }
+
+    pub fn upload(&self, control_port: u16) -> Option<UploadSample> {
+        self.links.lock().unwrap().iter().find_map(|link| {
+            let matches = link.ports.lock().unwrap().control.contains(&control_port);
+            (matches && link.conn.close_reason().is_none())
+                .then(|| UploadSample::read(&link.conn, &link.pinger))
         })
     }
 

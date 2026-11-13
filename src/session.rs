@@ -18,17 +18,18 @@ use uuid::Uuid;
 
 use crate::{
     audio::{AUDIO_PORT, AudioRecipient, GuestAudio, HostAudio, voice_app},
+    bitrate::{Backoff, SAMPLE_INTERVAL},
     media::{
         DEFAULT_FEC, GuestStream, HostStream, MAX_BITRATE_KBPS, MIN_AUTO_BITRATE_KBPS, MOONLIGHT,
         PATH_SHARE, Preferences, SUNSHINE, UNMEASURED_BITRATE_KBPS, fec_for_loss, lobby_bitrate_limit, lobby_wire_budget,
         stream_wire_kbps,
     },
     platform::{
-        KeepAwake, ProcessLock, WifiQuiet, background_recording, display_max_refresh, display_mode,
-        vigem_present,
+        KeepAwake, ProcessLock, WifiQuiet, background_recording, close_windows, display_max_refresh,
+        display_mode, vigem_present,
     },
     protocol::{
-        CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Reply, Request, StreamBandwidth, Wire,
+        CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Mode, Reply, Request, StreamBandwidth, Wire,
         client_config, new_token, valid_pem,
     },
     tunnel::{GuestTunnel, HostTunnel, PROBE_MBPS, PeerNetwork, dropped},
@@ -40,6 +41,8 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(90);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(9);
+const MEDIA_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_DISCONNECT_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub enum Event {
@@ -239,6 +242,8 @@ pub enum PlayerState {
 pub enum Command {
     Decide(u32, bool),
     Kick(u32),
+    #[cfg(test)]
+    Backoff(u32),
 }
 
 struct Guest {
@@ -252,11 +257,31 @@ struct Guest {
     network: PeerNetwork,
     bandwidth: Option<StreamBandwidth>,
     bitrate_kbps: u32,
+    bitrate_restart: bool,
+    backoff: Option<Backoff>,
+    pending_bitrate: Option<u32>,
+    restart: Option<StreamRestart>,
     state: PlayerState,
     /// Ready has gone out; Sunshine's next "client connected" is this guest.
     sent_ready: bool,
     since: Instant,
     last_ping: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum StreamRestart {
+    Closing { bitrate: u32, by: Instant, disconnected: u64 },
+    Waiting { bitrate: u32, after: Instant, disconnected: u64 },
+    Opening { by: Instant },
+}
+
+impl StreamRestart {
+    fn expired(self, now: Instant) -> bool {
+        match self {
+            Self::Closing { by, .. } | Self::Opening { by } => now >= by,
+            Self::Waiting { .. } => false,
+        }
+    }
 }
 
 impl Guest {
@@ -267,6 +292,10 @@ impl Guest {
             (true, true) => 256,
             (true, false) => 1_700,
         }
+    }
+
+    fn opening_stream(&self) -> bool {
+        (self.state == PlayerState::Starting && self.sent_ready) || self.restart.is_some()
     }
 }
 
@@ -283,6 +312,21 @@ fn reply_to_guest<'a>(guests: &'a mut Vec<Guest>, at: usize, reply: &Reply) -> O
         return None;
     }
     Some(&mut guests[at])
+}
+
+fn start_backoff(guests: &mut Vec<Guest>, at: usize, kbps: u32, disconnected: u64) {
+    if guests[at].restart.is_some() || !(MIN_AUTO_BITRATE_KBPS..guests[at].bitrate_kbps).contains(&kbps) {
+        guests[at].pending_bitrate = None;
+        return;
+    }
+    if let Some(guest) = reply_to_guest(guests, at, &Reply::LowerBitrate { kbps }) {
+        guest.pending_bitrate = None;
+        guest.restart = Some(StreamRestart::Closing {
+            bitrate: kbps,
+            by: Instant::now() + START_TIMEOUT,
+            disconnected,
+        });
+    }
 }
 
 fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<String> {
@@ -380,6 +424,8 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut drops_shown = dropped();
     let mut next_drops = Instant::now();
     let mut next_log = Instant::now();
+    let mut next_bandwidth = Instant::now();
+    let mut disconnected = 0u64;
 
     let close = |wire: &mut HostWire, reason: &str| {
         let _ = wire.send(&Reply::Closed { reason: reason.into() });
@@ -425,7 +471,9 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             };
             let mut knock = knocks.swap_remove(index);
             match request {
-                Some(Request::Join { token, name, lobby, controller_hotplug, fec: wanted, audio_opus, .. }) if invite.authorizes(&token) => {
+                Some(Request::Join {
+                    token, name, lobby, controller_hotplug, fec: wanted, audio_opus, bitrate_restart, ..
+                }) if invite.authorizes(&token) => {
                     if !lobby || !controller_hotplug {
                         close(&mut knock.wire, "Обновите DuoLink: у хоста новая версия.");
                     } else {
@@ -446,6 +494,10 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             }),
                             bandwidth: None,
                             bitrate_kbps: 0,
+                            bitrate_restart,
+                            backoff: None,
+                            pending_bitrate: None,
+                            restart: None,
                             state: PlayerState::Waiting,
                             sent_ready: false,
                             since: Instant::now(),
@@ -479,18 +531,42 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                         close(&mut guest.wire, "Хост отключил вас.");
                     }
                 }
+                #[cfg(test)]
+                Command::Backoff(id) => {
+                    assert!(!guests.iter().any(Guest::opening_stream));
+                    let at = guests.iter().position(|g| g.id == id).unwrap();
+                    let guest = &guests[at];
+                    assert_eq!(guest.state, PlayerState::Playing);
+                    assert!(guest.bitrate_restart && guest.bandwidth.unwrap().manual_kbps.is_none());
+                    let kbps = guest.bitrate_kbps.min(10_000) / 2;
+                    assert!(kbps >= MIN_AUTO_BITRATE_KBPS);
+                    start_backoff(&mut guests, at, kbps, disconnected);
+                }
             }
         }
 
         // Sunshine: up, still running, and who just connected.
         if engine_ready && Instant::now() >= next_log {
             next_log = Instant::now() + Duration::from_millis(50);
-            let (connected, _) = stream.events()?;
+            let (connected, departures) = stream.events()?;
+            disconnected = disconnected.saturating_add(departures as u64);
             for _ in 0..connected {
-                if let Some(at) = guests.iter().position(|g| g.state == PlayerState::Starting && g.sent_ready)
+                if let Some(at) = guests.iter().position(|g| {
+                    (g.state == PlayerState::Starting && g.sent_ready)
+                        || matches!(g.restart, Some(StreamRestart::Opening { .. }))
+                })
                     && let Some(guest) = reply_to_guest(&mut guests, at, &Reply::Connected)
                 {
                     guest.state = PlayerState::Playing;
+                    let resumed = guest.restart.take().is_some();
+                    if let Some(backoff) = &mut guest.backoff {
+                        let now = Instant::now();
+                        if resumed {
+                            backoff.resumed(now);
+                        } else {
+                            backoff.reset(now);
+                        }
+                    }
                 }
             }
         } else if !engine_ready && Instant::now() >= next_log {
@@ -506,10 +582,42 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             }
         }
 
-        // One stream opens at a time, so Sunshine's "connected" maps to one guest.
-        let opening = guests.iter().any(|g| g.state == PlayerState::Starting && g.sent_ready);
+        // Reopens and new streams share one queue: Sunshine's "connected" has no guest ID.
+        let now = Instant::now();
+        if now >= next_bandwidth {
+            next_bandwidth = now + SAMPLE_INTERVAL;
+            for guest in &mut guests {
+                if guest.state == PlayerState::Playing
+                    && guest.restart.is_none()
+                    && guest.pending_bitrate.is_none()
+                    && let Some(backoff) = &mut guest.backoff
+                    && let Some(sample) = tunnel.upload(guest.port)
+                    && let Some(kbps) = backoff.sample(now, sample, guest.bitrate_kbps)
+                {
+                    guest.pending_bitrate = Some(kbps);
+                }
+            }
+        }
+        if !guests.iter().any(Guest::opening_stream)
+            && let Some((at, kbps)) = guests.iter().enumerate()
+                .find_map(|(at, guest)| guest.pending_bitrate.map(|kbps| (at, kbps)))
+        {
+            start_backoff(&mut guests, at, kbps, disconnected);
+        }
+        if let Some(at) = guests.iter().position(|g| {
+            matches!(g.restart, Some(StreamRestart::Waiting { after, disconnected: before, .. })
+                if now >= after || disconnected > before)
+        }) {
+            let guest = &guests[at];
+            if let Some(StreamRestart::Waiting { bitrate, .. }) = guest.restart
+                && let Some(guest) = reply_to_guest(&mut guests, at, &Reply::RestartStream)
+            {
+                guest.bitrate_kbps = bitrate;
+                guest.restart = Some(StreamRestart::Opening { by: now + START_TIMEOUT });
+            }
+        }
         if engine_ready
-            && !opening
+            && !guests.iter().any(Guest::opening_stream)
             && let Some(at) = guests.iter().position(|g| {
                 g.state == PlayerState::Starting
                     && (g.fec.is_some() || g.since.elapsed() >= MEASURE_TIMEOUT)
@@ -617,8 +725,35 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                         true
                     }
                     Ok(Some(Request::Bitrate { kbps })) if guest.sent_ready && guest.bandwidth.is_some() => {
-                        if (MIN_AUTO_BITRATE_KBPS..=guest.bitrate_kbps).contains(&kbps) {
+                        let valid_rate = (MIN_AUTO_BITRATE_KBPS..=guest.bitrate_kbps).contains(&kbps);
+                        if valid_rate {
                             guest.bitrate_kbps = kbps;
+                        }
+                        if valid_rate && guest.bitrate_restart
+                            && guest.network != PeerNetwork::ThisPc
+                            && guest.bandwidth.is_some_and(|report| report.manual_kbps.is_none())
+                            && guest.backoff.is_none()
+                        {
+                            guest.backoff = Some(Backoff::new(Instant::now(), tunnel.upload(guest.port).and_then(|sample| sample.rtt)));
+                        }
+                        guest.last_ping = Instant::now();
+                        true
+                    }
+                    Ok(Some(Request::RestartReady { closed_cleanly }))
+                        if matches!(guest.restart, Some(StreamRestart::Closing { .. })) =>
+                    {
+                        if let Some(StreamRestart::Closing { bitrate, disconnected: before, .. }) = guest.restart {
+                            let drain = if closed_cleanly || disconnected > before {
+                                MEDIA_DISCONNECT_GRACE
+                            } else {
+                                // Sunshine's configured timeout for a lost stream.
+                                Duration::from_millis(5_200)
+                            };
+                            guest.restart = Some(StreamRestart::Waiting {
+                                bitrate,
+                                after: Instant::now() + drain,
+                                disconnected,
+                            });
                         }
                         guest.last_ping = Instant::now();
                         true
@@ -628,6 +763,9 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                 };
             if let Some((_, reason)) = expired {
                 close(&mut guest.wire, reason);
+                guests.remove(index);
+            } else if guest.restart.is_some_and(|restart| restart.expired(Instant::now())) {
+                close(&mut guest.wire, "Не удалось возобновить трансляцию.");
                 guests.remove(index);
             } else if !alive {
                 guests.remove(index);
@@ -720,6 +858,35 @@ fn explain_moonlight_log(log: &str) -> &'static str {
     }
 }
 
+struct GuestLaunch {
+    host: Uuid,
+    certificate: String,
+    client: ClientKey,
+    mode: Mode,
+    desktop: Option<Mode>,
+    own_audio: bool,
+}
+
+impl GuestLaunch {
+    fn start(
+        &self,
+        engine: &std::path::Path,
+        data: &std::path::Path,
+        tunnel: &GuestTunnel,
+        preferences: Preferences,
+    ) -> Result<GuestStream> {
+        GuestStream::start(
+            engine, data, tunnel.loopback, tunnel.same_machine, self.own_audio, self.host,
+            &self.certificate, &self.client, self.mode, self.desktop, preferences,
+        )
+    }
+}
+
+fn show_bitrate(worker: &Worker, bitrate: u32, capped: bool) {
+    let rate = format!("{:.1} Мбит/с", bitrate as f64 / 1_000.0);
+    worker.fact("Битрейт", if capped { format!("{rate} · по каналу") } else { rate });
+}
+
 pub(crate) fn clean_name(name: &str) -> String {
     let result: String = name
         .trim()
@@ -741,6 +908,7 @@ fn guest(
     mut preferences: Preferences,
     nickname: String,
 ) -> Result<String> {
+    let automatic = preferences.bitrate.is_none();
     if !MOONLIGHT.path(&data).is_file() {
         worker.status("Скачиваем Moonlight…");
     }
@@ -778,6 +946,7 @@ fn guest(
         lobby: true,
         controller_hotplug: true,
         audio_opus: true,
+        bitrate_restart: true,
     })
     .context("Не удалось связаться с хостом.")?;
     worker.status("Меряем канал…");
@@ -821,6 +990,9 @@ fn guest(
     let mut next_ping = Instant::now();
     let mut by = Instant::now() + DECISION_TIMEOUT + SILENCE;
     let mut stream = None::<GuestStream>;
+    let mut launch = None::<GuestLaunch>;
+    let mut restart_by = None;
+    let mut waiting_restart = false;
     // Held for the session; dropping it stops playback.
     let mut _guest_audio = None::<GuestAudio>;
     let mut streaming = false;
@@ -829,14 +1001,20 @@ fn guest(
             let _ = wire.send(&Request::Leave);
             return Ok("Сессия завершена.".into());
         }
-        if let Some(stream) = stream.as_mut()
-            && let Some(status) = stream.process.status()?
-        {
-            let _ = wire.send(&Request::Leave);
-            if status.success() && streaming {
-                return Ok("Поток закрыт.".into());
+        if let Some(current) = stream.as_mut() {
+            let exited = current.process.status()?;
+            if restart_by.is_some_and(|deadline| exited.is_some() || Instant::now() >= deadline) {
+                stream = None;
+                restart_by = None;
+                waiting_restart = true;
+                wire.send(&Request::RestartReady { closed_cleanly: exited.is_some_and(|status| status.success()) })?;
+            } else if let Some(status) = exited {
+                let _ = wire.send(&Request::Leave);
+                if status.success() && streaming {
+                    return Ok("Поток закрыт.".into());
+                }
+                bail!("{}", moonlight_failure(&data));
             }
-            bail!("{}", moonlight_failure(&data));
         }
         if !tunnel.alive() || last_pong.elapsed() > SILENCE {
             // The host may have said goodbye just before the tunnel closed.
@@ -878,7 +1056,7 @@ fn guest(
                 audio_opus,
                 auto_bitrate_kbps,
                 client: Some(client),
-            }) if stream.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
+            }) if launch.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let desktop = display_mode().ok();
                 let mode = preferences.mode(mode, desktop);
                 ensure!(
@@ -891,26 +1069,12 @@ fn guest(
                 }
                 preferences.bitrate = Some(bitrate);
                 worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
-                let rate = format!("{:.1} Мбит/с", bitrate as f64 / 1_000.0);
-                worker.fact(
-                    "Битрейт",
-                    if capped { format!("{rate} · по каналу") } else { rate },
-                );
+                show_bitrate(worker, bitrate, capped);
                 worker.fact("Кодек", preferences.codec.label());
                 worker.status("Открываем игру…");
-                stream = Some(GuestStream::start(
-                    &engine,
-                    &data,
-                    loopback,
-                    tunnel.same_machine,
-                    own_audio,
-                    host,
-                    &certificate,
-                    &client,
-                    mode,
-                    desktop,
-                    preferences,
-                )?);
+                let settings = GuestLaunch { host, certificate, client, mode, desktop, own_audio };
+                stream = Some(settings.start(&engine, &data, &tunnel, preferences)?);
+                launch = Some(settings);
                 if own_audio {
                     _guest_audio = Some(GuestAudio::start(
                         SocketAddr::from((loopback, AUDIO_PORT)),
@@ -921,6 +1085,32 @@ fn guest(
                 by = Instant::now() + START_TIMEOUT + SILENCE;
             }
             Some(Reply::Ready { .. }) => bail!("Хост прислал неверные данные."),
+            Some(Reply::LowerBitrate { kbps }) => {
+                if automatic && streaming
+                    && preferences.bitrate.is_some_and(|bitrate| kbps < bitrate)
+                    && kbps >= MIN_AUTO_BITRATE_KBPS
+                    && let Some(current) = &stream
+                {
+                    preferences.bitrate = Some(kbps);
+                    streaming = false;
+                    by = Instant::now() + START_TIMEOUT + SILENCE;
+                    worker.status("Снижаем битрейт…");
+                    let grace = if close_windows(current.process.id()) { MEDIA_CLOSE_TIMEOUT } else { Duration::ZERO };
+                    restart_by = Some(Instant::now() + grace);
+                } else {
+                    bail!("Хост прислал неверные данные.");
+                }
+            }
+            Some(Reply::RestartStream) => {
+                if waiting_restart && let Some(settings) = &launch {
+                    waiting_restart = false;
+                    show_bitrate(worker, preferences.bitrate_for(settings.mode), true);
+                    stream = Some(settings.start(&engine, &data, &tunnel, preferences)?);
+                    by = Instant::now() + START_TIMEOUT + SILENCE;
+                } else {
+                    bail!("Хост прислал неверные данные.");
+                }
+            }
             Some(Reply::Connected) => {
                 streaming = true;
                 worker.emit(Event::Streaming);
@@ -971,6 +1161,10 @@ mod tests {
                 network: PeerNetwork::ThisPc,
                 bandwidth: None,
                 bitrate_kbps: 0,
+                bitrate_restart: false,
+                backoff: None,
+                pending_bitrate: None,
+                restart: None,
                 state: PlayerState::Starting,
                 sent_ready: false,
                 since: now,
@@ -1153,7 +1347,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let guest = Session::guest(data.clone(), invite, prefs, "Тест".into());
+        let restart_test = std::env::var_os("DUOLINK_TEST_BITRATE_RESTART").is_some();
+        let first_prefs = if restart_test { Preferences { bitrate: None, ..prefs } } else { prefs };
+        let guest = Session::guest(data.clone(), invite, first_prefs, "Тест".into());
         let first = waiting(&host);
         host.decide(first, true);
         for session in [&host, &guest] {
@@ -1212,6 +1408,49 @@ mod tests {
         thread::sleep(Duration::from_secs(2));
         let host_log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
         assert!(host_log.matches("CLIENT CONNECTED").count() >= 2, "second stream did not connect");
+        if restart_test {
+            let now = Instant::now();
+            host.commands.send(Command::Backoff(first)).unwrap();
+            let mut restarted_kbps = None;
+            until(&guest, Duration::from_secs(30), |event| match event {
+                Event::Status(message) if message == "Снижаем битрейт…" => Some(message),
+                Event::Finished { message, .. } => panic!("{message}"),
+                _ => None,
+            });
+            until(&guest, Duration::from_secs(36), |event| match event {
+                Event::Fact("Битрейт", rate) => {
+                    restarted_kbps = rate.split_whitespace().next()
+                        .and_then(|mbps| mbps.parse::<f64>().ok())
+                        .map(|mbps| (mbps * 1000.0).round() as u32);
+                    None
+                }
+                Event::Streaming => Some(String::new()),
+                Event::Finished { message, .. } => panic!("{message}"),
+                _ => None,
+            });
+            let restarted_kbps = restarted_kbps.expect("no bitrate after reopening the stream");
+            assert!(restarted_kbps <= 5_000);
+            let by = Instant::now() + Duration::from_secs(12);
+            loop {
+                let log = std::fs::read_to_string(data.join("logs/guest.log")).unwrap_or_default();
+                let bitrate = log.lines().find_map(|line| {
+                    line.split_once("Video bitrate: ")?.1.split_whitespace().next()?.parse::<u32>().ok()
+                });
+                if bitrate.is_some_and(|kbps| kbps.abs_diff(restarted_kbps) <= 50)
+                    && log.contains("Received first video packet")
+                    && log.contains("Decoded frame with POC 0/0")
+                {
+                    break;
+                }
+                assert!(Instant::now() < by, "no video after changing bitrate");
+                thread::sleep(Duration::from_millis(100));
+            }
+            let log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
+            assert_eq!(log.matches("CLIENT CONNECTED").count(), 3);
+            assert_eq!(log.matches("CLIENT DISCONNECTED").count(), 1);
+            assert!(!second.finished(), "the other guest's stream closed");
+            eprintln!("automatic bitrate restart: video after {:.2}s", now.elapsed().as_secs_f64());
+        }
 
         // Optional GPU integration: spectators are not limited by four XInput slots.
         let mut spectators = Vec::new();
