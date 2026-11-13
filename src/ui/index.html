@@ -158,12 +158,16 @@
         <label class="row"><span class="row-text"><span class="label">YUV 4:4:4</span><small>Цвет мелких деталей</small></span><input id="yuv444" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">HDR</span><input id="hdr" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">Окно без рамки</span><input id="windowed" type="checkbox" role="switch"></label>
+        <label class="row"><span class="label">Плавный вывод</span><input id="smooth" type="checkbox" role="switch"></label>
+        <label class="row"><span class="label">Разрешить декодирование на CPU</span><input id="software_decode" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">Статистика трансляции</span><input id="stats" type="checkbox" role="switch"></label>
       </div>
 
       <p class="section">Система</p>
       <div class="group">
         <div class="row"><span class="label">Планирование GPU</span><button type="button" class="btn small" data-action="graphics" aria-label="Открыть настройки графики Windows">Открыть</button></div>
+        <div id="network-row" class="row" hidden><span class="label">UDP</span><small id="network-note"></small></div>
+        <div class="row"><span class="row-text"><span class="label">Virtual HID Broker</span><small>Нужна лицензия</small></span><button type="button" id="virtual-hid" class="btn small" data-action="virtual_hid">Настроить</button></div>
         <div class="row"><span class="row-text"><span class="label">Обновления</span><small id="update-note"></small></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
         <label id="discord-row" class="row" hidden><span class="row-text"><span class="label">Статус в Discord</span><small>Только число игроков, без имён</small></span><input id="discord" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">Запускать с Windows</span><input id="autostart" type="checkbox" role="switch"></label>

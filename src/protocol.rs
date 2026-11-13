@@ -292,6 +292,8 @@ pub enum Reply {
         audio_opus: bool,
         #[serde(default)]
         auto_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        video_packet_size: Option<usize>,
         /// The client identity Sunshine already trusts.
         #[serde(default)]
         client: Option<ClientKey>,

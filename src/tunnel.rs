@@ -1,4 +1,4 @@
-//! Peer-to-peer transport that works without accounts, VPNs or servers of our own.
+//! Peer-to-peer media and input. The signaling server only exchanges addresses.
 //!
 //! The host's Sunshine listens on 127.0.0.1 only. One QUIC connection between
 //! the two DuoLink processes carries everything: Sunshine's TCP ports as QUIC
@@ -8,7 +8,7 @@
 //! The guest compares the media RTT of the invite's LAN addresses, a
 //! UPnP-forwarded port and a STUN-reflexive public address.
 //! For the last one both NATs must be opened at once, so the guest publishes
-//! its own candidates (encrypted with the invite token) through ntfy.sh and
+//! its own candidates (encrypted with the invite token) through the VPS and
 //! both sides fire punch packets at each other while QUIC retries its handshake.
 
 #[cfg(test)]
@@ -17,10 +17,7 @@ mod network_qa;
 
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket as StdUdpSocket},
-    os::windows::process::CommandExt,
-    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -33,7 +30,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use quinn::{
-    ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
+    ClientConfig, Connection, Endpoint, EndpointConfig, MtuDiscoveryConfig, ServerConfig, TokioRuntime,
     TransportConfig, VarInt,
     congestion::{Controller, ControllerFactory},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -47,10 +44,10 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     runtime::Runtime,
 };
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-
 use crate::{
-    platform::{prioritize_thread, system_tool},
+    datagram::{DatagramSender, LOCAL_PACKET, PacketPool},
+    infra::{self, Subscription},
+    platform::prioritize_thread,
     protocol::{CONTROL_PORT, Candidate, Identity, MEDIA_PORT, PathKind, Pin},
 };
 
@@ -60,17 +57,18 @@ pub const TUNNEL_PORT: u16 = 48170;
 pub const GUEST_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 const HOST_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA_PORT + 21];
-pub const UDP_PORTS: [u16; 4] = [MEDIA_PORT + 9, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
+const VIDEO_PORT: u16 = MEDIA_PORT + 9;
+pub const UDP_PORTS: [u16; 4] = [VIDEO_PORT, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
 const ALPN: &[u8] = b"duolink/2";
 const STUN_SERVERS: [&str; 3] = [
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "stun1.l.google.com:19302",
 ];
-pub(crate) const SIGNAL_SERVER: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const ROUTE_WINDOW: Duration = Duration::from_millis(500);
 const ROUTE_PINGS: usize = 3;
+const MAX_QUIC_UDP_PAYLOAD: u16 = 1232;
 /// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
 const PROBE_PORT: u16 = 0;
 /// The capacity probe sends at this rate; reaching most of it means the
@@ -79,14 +77,21 @@ pub const PROBE_MBPS: u32 = 300;
 
 /// Datagrams the tunnel could not send (too large or no connection).
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static LOCAL_VIDEO_SENT: AtomicU64 = AtomicU64::new(0);
 
 pub fn dropped() -> u64 {
     DROPPED.load(Ordering::Relaxed)
 }
 
+pub(crate) fn record_drop() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
 fn forward(conn: &Connection, port: u16, payload: &[u8]) {
     if conn.send_datagram(tag(port, payload)).is_err() {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
+        record_drop();
     }
 }
 
@@ -138,48 +143,96 @@ fn stun_servers() -> Vec<SocketAddr> {
         .collect()
 }
 
-fn stun_query(socket: &StdUdpSocket, server: SocketAddr) -> Option<SocketAddrV4> {
-    let mut txid = [0u8; 12];
-    OsRng.fill_bytes(&mut txid);
-    let mut buffer = [0u8; 512];
-    for _ in 0..2 {
-        socket.send_to(&stun_request(&txid), server).ok()?;
-        let deadline = Instant::now() + Duration::from_millis(700);
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            socket.set_read_timeout(Some(left.max(Duration::from_millis(1)))).ok()?;
-            match socket.recv_from(&mut buffer) {
-                Ok((count, from)) if from == server => {
-                    if let Some(addr) = parse_stun(&buffer[..count], &txid) {
-                        return Some(addr);
-                    }
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-                Err(_) => break,
-            }
-        }
-    }
-    None
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Mapping {
+    #[default]
+    Unknown,
+    Public,
+    SamePort,
+    ChangesWithDestination,
 }
 
-/// The socket's public address, and whether the NAT maps it differently per
-/// destination (symmetric NAT, where hole punching cannot work).
+impl Mapping {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Не удалось определить",
+            Self::Public => "Публичный IPv4",
+            Self::SamePort => "Внешний порт совпал",
+            Self::ChangesWithDestination => "Внешний порт меняется",
+        }
+    }
+}
+
+/// What the STUN servers observed from this socket.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reflexive {
     pub addr: Option<SocketAddrV4>,
-    pub symmetric: bool,
+    server: Option<SocketAddr>,
+    pub mapping: Mapping,
+}
+
+fn stun_batch(socket: &StdUdpSocket, servers: &[SocketAddr], wait: Duration) -> Vec<(SocketAddr, SocketAddrV4)> {
+    let mut requests: Vec<_> = servers.iter().map(|&server| {
+        let mut transaction = [0; 12];
+        OsRng.fill_bytes(&mut transaction);
+        (server, transaction, None)
+    }).collect();
+    let mut buffer = [0; 512];
+    for _ in 0..2 {
+        for (server, transaction, answer) in &requests {
+            if answer.is_none() {
+                let _ = socket.send_to(&stun_request(transaction), server);
+            }
+        }
+        let deadline = Instant::now() + wait;
+        while requests.iter().any(|request| request.2.is_none())
+            && let Some(left) = deadline.checked_duration_since(Instant::now())
+        {
+            if socket.set_read_timeout(Some(left.max(Duration::from_millis(1)))).is_err() {
+                break;
+            }
+            match socket.recv_from(&mut buffer) {
+                Ok((count, from)) => {
+                    if let Some((_, transaction, answer)) = requests.iter_mut().find(|request| request.0 == from) {
+                        *answer = parse_stun(&buffer[..count], transaction).or(*answer);
+                    }
+                }
+                Err(error) if reset(&error) => {}
+                Err(_) => break,
+            }
+        }
+        if requests.iter().all(|request| request.2.is_some()) {
+            break;
+        }
+    }
+    requests.into_iter().filter_map(|(server, _, answer)| Some((server, answer?))).collect()
 }
 
 fn discover(socket: &StdUdpSocket) -> Reflexive {
-    let answers: Vec<SocketAddrV4> = stun_servers()
-        .into_iter()
-        .filter_map(|server| stun_query(socket, server))
-        .take(2)
-        .collect();
-    Reflexive {
-        addr: answers.first().copied(),
-        symmetric: answers.windows(2).any(|pair| pair[0] != pair[1]),
+    let mut answers = stun_batch(socket, &infra::STUN.map(SocketAddr::V4), Duration::from_millis(300));
+    if answers.len() < 2 || answers[0].1 == answers[1].1 {
+        // Two ports on one IP can't reveal address-dependent mapping. Use a
+        // second STUN origin if available, and retain the VPS mapping for peers.
+        answers.extend(stun_batch(socket, &stun_servers(), Duration::from_millis(350)));
     }
+    let Some(&(server, addr)) = answers.first() else { return Reflexive::default() };
+    let mapping = if answers.iter().any(|(_, other)| *other != addr) {
+        Mapping::ChangesWithDestination
+    } else if socket.local_addr().is_ok_and(|local| local.port() == addr.port())
+        && local_addresses().contains(addr.ip())
+    {
+        Mapping::Public
+    } else if answers.len() > 1 {
+        Mapping::SamePort
+    } else {
+        Mapping::Unknown
+    };
+    Reflexive { addr: Some(addr), server: Some(server), mapping }
+}
+
+pub(crate) fn diagnose_network() -> Mapping {
+    StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_or(Mapping::Unknown, |socket| discover(&socket).mapping)
 }
 
 /* ------------------------------------------------------------------ UPnP */
@@ -248,18 +301,20 @@ fn derive(token: &[u8; 16], label: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn topic(token: &[u8; 16]) -> String {
-    let digest = derive(token, b"duolink/topic");
+fn topic(token: &[u8; 16], network: bool) -> String {
+    let digest = derive(token, if network { b"duolink/network/topic" } else { b"duolink/topic" });
     let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    format!("duolink-{hex}")
+    let prefix = if network { "duolink-n-" } else { "duolink-" };
+    format!("{prefix}{hex}")
 }
 
-fn cipher(token: &[u8; 16]) -> LessSafeKey {
-    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &derive(token, b"duolink/key")).unwrap())
+fn cipher(token: &[u8; 16], network: bool) -> LessSafeKey {
+    let label: &[u8] = if network { b"duolink/network/key" } else { b"duolink/key" };
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &derive(token, label)).unwrap())
 }
 
 fn seal(token: &[u8; 16], addrs: &[SocketAddrV4]) -> String {
-    let mut plain: Vec<u8> = addrs
+    let plain: Vec<u8> = addrs
         .iter()
         .flat_map(|addr| {
             let mut bytes = addr.ip().octets().to_vec();
@@ -267,9 +322,13 @@ fn seal(token: &[u8; 16], addrs: &[SocketAddrV4]) -> String {
             bytes
         })
         .collect();
+    seal_message(token, false, plain)
+}
+
+fn seal_message(token: &[u8; 16], network: bool, mut plain: Vec<u8>) -> String {
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
-    cipher(token)
+    cipher(token, network)
         .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut plain)
         .unwrap();
     let mut message = nonce.to_vec();
@@ -278,14 +337,7 @@ fn seal(token: &[u8; 16], addrs: &[SocketAddrV4]) -> String {
 }
 
 fn unseal(token: &[u8; 16], text: &str) -> Option<Vec<SocketAddrV4>> {
-    let mut bytes = URL_SAFE_NO_PAD.decode(text.trim()).ok()?;
-    if bytes.len() < 12 + 16 {
-        return None;
-    }
-    let nonce = Nonce::try_assume_unique_for_key(&bytes[..12]).ok()?;
-    let plain = cipher(token)
-        .open_in_place(nonce, Aad::empty(), &mut bytes[12..])
-        .ok()?;
+    let plain = open_message(token, false, text)?;
     if plain.len() % 6 != 0 || plain.len() > 6 * 16 {
         return None;
     }
@@ -297,77 +349,62 @@ fn unseal(token: &[u8; 16], text: &str) -> Option<Vec<SocketAddrV4>> {
     )
 }
 
-pub(crate) fn curl() -> Result<Command> {
-    let mut command = Command::new(system_tool("curl.exe")?);
-    command
-        .args(["-q", "--silent", "--proto", "=https", "--connect-timeout", "8"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stderr(Stdio::null());
-    Ok(command)
-}
-
-/// Sends the guest's addresses to the host. Fire and forget.
-fn publish(token: [u8; 16], addrs: Vec<SocketAddrV4>) {
-    thread::spawn(move || {
-        let Ok(mut command) = curl() else { return };
-        let Ok(mut child) = command
-            .args(["--max-time", "10", "--data-binary", "@-"])
-            .arg(format!("{SIGNAL_SERVER}/{}", topic(&token)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-        else {
-            return;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(seal(&token, &addrs).as_bytes());
-        }
-        let _ = child.wait();
-    });
-}
-
-/// Host side: listens for guests' addresses for as long as it lives.
-struct Subscription(Child);
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+fn open_message(token: &[u8; 16], network: bool, text: &str) -> Option<Vec<u8>> {
+    let mut bytes = URL_SAFE_NO_PAD.decode(text.trim()).ok()?;
+    if bytes.len() < 12 + 16 {
+        return None;
     }
+    let nonce = Nonce::try_assume_unique_for_key(&bytes[..12]).ok()?;
+    let plain = cipher(token, network)
+        .open_in_place(nonce, Aad::empty(), &mut bytes[12..])
+        .ok()?;
+    Some(plain.to_vec())
 }
 
-fn subscribe(token: [u8; 16], on_guest: impl Fn(Vec<SocketAddrV4>) + Send + 'static) -> Option<Subscription> {
-    let mut child = curl()
-        .ok()?
-        .args(["--no-buffer", "--max-time", "1200"])
-        .arg(format!("{SIGNAL_SERVER}/{}/json", topic(&token)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+fn publish(topic: String, body: String) {
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if event["event"] == "message"
-                && let Some(addrs) = event["message"].as_str().and_then(|m| unseal(&token, m))
-            {
-                on_guest(addrs);
+        for _ in 0..2 {
+            if infra::post(&topic, &body, "4").is_ok_and(|status| (200..300).contains(&status)) {
+                break;
             }
         }
     });
-    Some(Subscription(child))
+}
+
+#[derive(Clone, Copy)]
+struct HostNetwork {
+    mapping: Mapping,
+    forwarded: bool,
+}
+
+impl HostNetwork {
+    fn publish(self, token: [u8; 16]) {
+        let body = seal_message(&token, true, vec![self.mapping as u8, u8::from(self.forwarded)]);
+        publish(topic(&token, true), body);
+    }
+
+    fn read(token: [u8; 16]) -> Option<Self> {
+        let topic = topic(&token, true);
+        let message = infra::history(&topic, "3").ok()?.pop()?;
+        let plain = open_message(&token, true, &message.message)?;
+        let [mapping, forwarded] = plain[..] else { return None };
+        let mapping = match mapping {
+            1 => Mapping::Public,
+            2 => Mapping::SamePort,
+            3 => Mapping::ChangesWithDestination,
+            _ => Mapping::Unknown,
+        };
+        Some(Self { mapping, forwarded: forwarded == 1 })
+    }
 }
 
 /// Sends throwaway datagrams so our NAT opens a mapping towards each target.
 /// QUIC ignores them on arrival.
-fn punch(socket: &StdUdpSocket, targets: Vec<SocketAddrV4>, for_how_long: Duration) {
+fn punch(socket: &StdUdpSocket, targets: Vec<SocketAddrV4>, for_how_long: Duration, active: Arc<AtomicBool>) {
     let Ok(socket) = socket.try_clone() else { return };
     thread::spawn(move || {
         let until = Instant::now() + for_how_long;
-        while Instant::now() < until {
+        while active.load(Ordering::Relaxed) && Instant::now() < until {
             for target in &targets {
                 let _ = socket.send_to(&[0], target);
             }
@@ -410,17 +447,27 @@ impl ControllerFactory for Unthrottled {
 
 fn transport() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
+    let mut discovery = MtuDiscoveryConfig::default();
+    discovery.upper_bound(MAX_QUIC_UDP_PAYLOAD);
     config
         // Rides out a short Wi-Fi dropout; a clean disconnect is still instant.
         .max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_millis(500)))
-        .initial_mtu(1280)
-        .datagram_receive_buffer_size(Some(16 << 20))
-        // Under overload, drop stale video rather than queue it: a late frame is worse than none.
-        .datagram_send_buffer_size(2 << 20)
+        .initial_mtu(1200)
+        .mtu_discovery_config(Some(discovery))
+        .datagram_receive_buffer_size(Some(4 << 20))
+        // Keep Quinn's FIFO shallow. Media waiting for capacity is scheduled
+        // by DatagramSender, which can put audio and input ahead of video.
+        .datagram_send_buffer_size(192 << 10)
         .max_concurrent_bidi_streams(VarInt::from_u32(64))
         .congestion_controller_factory(Arc::new(Unthrottled));
     Arc::new(config)
+}
+
+fn endpoint_config() -> EndpointConfig {
+    let mut config = EndpointConfig::default();
+    config.max_udp_payload_size(MAX_QUIC_UDP_PAYLOAD).expect("valid QUIC payload limit");
+    config
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -452,9 +499,8 @@ fn client_config(fingerprint: [u8; 32]) -> Result<ClientConfig> {
 
 /// A video frame at high bitrate arrives as a burst far larger than Windows'
 /// default 64 KB socket buffer; without room for it the burst is dropped.
-const RECEIVE_BUFFER: usize = 8 << 20;
-/// Sending stays shallow: several frames of room, never seconds of backlog.
-const SEND_BUFFER: usize = 1 << 20;
+const RECEIVE_BUFFER: usize = 4 << 20;
+const SEND_BUFFER: usize = 4 << 20;
 
 fn enlarge(socket: socket2::SockRef<'_>) {
     let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
@@ -476,7 +522,7 @@ async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: qu
     let mbps = u32::from_be_bytes(request[..4].try_into().unwrap()).clamp(1, PROBE_MBPS);
     let time = Duration::from_millis(u32::from_be_bytes(request[4..].try_into().unwrap()).clamp(100, 1500) as u64);
     let size = conn.max_datagram_size().unwrap_or(1100).clamp(64, 1100);
-    let payload = vec![0u8; size - 2];
+    let payload = tag(PROBE_PORT, &[0u8; 1100][..size - 2]);
     let rate = mbps as f64 * 1e6 / 8.0;
     let start = Instant::now();
     let mut sent: u64 = 0;
@@ -486,7 +532,7 @@ async fn probe_send(conn: Connection, mut reply: quinn::SendStream, mut recv: qu
         while !probes.streaming.load(Ordering::Acquire) && start.elapsed() < time {
             let due = (start.elapsed().as_secs_f64() * rate) as u64;
             while sent < due && !probes.streaming.load(Ordering::Acquire) {
-                if conn.send_datagram(tag(PROBE_PORT, &payload)).is_err() {
+                if conn.datagram_send_buffer_space() < payload.len() + 8 * 1024 || conn.send_datagram(payload.clone()).is_err() {
                     break;
                 }
                 sent += size as u64;
@@ -510,11 +556,17 @@ pub struct Pinger {
     origin: Instant,
     rtt_us: AtomicU64,
     last_pong_us: AtomicU64,
+    idle_min_us: AtomicU64,
 }
 
 impl Pinger {
     fn new() -> Arc<Self> {
-        Arc::new(Self { origin: Instant::now(), rtt_us: AtomicU64::new(0), last_pong_us: AtomicU64::new(0) })
+        Arc::new(Self {
+            origin: Instant::now(),
+            rtt_us: AtomicU64::new(0),
+            last_pong_us: AtomicU64::new(0),
+            idle_min_us: AtomicU64::new(u64::MAX),
+        })
     }
 
     fn stamp(&self) -> [u8; 8] {
@@ -524,7 +576,11 @@ impl Pinger {
     fn record(&self, payload: &[u8]) {
         let Ok(sent) = <[u8; 8]>::try_from(payload) else { return };
         let now = self.origin.elapsed().as_micros() as u64;
-        let sample = now.saturating_sub(u64::from_be_bytes(sent)).max(1);
+        let Some(sample) = now.checked_sub(u64::from_be_bytes(sent)).filter(|age| *age < 5_000_000) else { return };
+        let sample = sample.max(1);
+        if now <= 2_000_000 {
+            self.idle_min_us.fetch_min(sample, Ordering::Relaxed);
+        }
         let previous = self.rtt_us.load(Ordering::Relaxed);
         let smoothed = if previous == 0 { sample } else { (previous * 3 + sample) / 4 };
         self.rtt_us.store(smoothed, Ordering::Relaxed);
@@ -537,6 +593,11 @@ impl Pinger {
             us => Some(Duration::from_micros(us)),
         }
     }
+
+    fn idle_min(&self) -> Option<Duration> {
+        let us = self.idle_min_us.load(Ordering::Relaxed);
+        (us != u64::MAX).then(|| Duration::from_micros(us))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -545,6 +606,7 @@ pub(crate) struct UploadSample {
     pub lost: u64,
     pub bytes: u64,
     pub rtt: Option<Duration>,
+    pub idle_rtt: Option<Duration>,
 }
 
 impl UploadSample {
@@ -557,15 +619,18 @@ impl UploadSample {
             lost: stats.path.lost_packets,
             bytes: stats.udp_tx.bytes,
             rtt: pinger.rtt().filter(|_| now.saturating_sub(last) < 1_000_000),
+            idle_rtt: pinger.idle_min(),
         }
     }
 }
 
 /// Answers and times pings; true when the datagram was one.
-fn ping_datagram(conn: &Connection, pinger: &Pinger, port: u16, payload: &[u8]) -> bool {
+fn ping_datagram(sender: &DatagramSender, pool: &mut PacketPool, pinger: &Pinger, port: u16, payload: &[u8]) -> bool {
     match port {
         PING_PORT => {
-            forward(conn, PONG_PORT, payload);
+            if payload.len() == 8 {
+                sender.enqueue(pool, PONG_PORT, payload, true);
+            }
             true
         }
         PONG_PORT => {
@@ -576,9 +641,10 @@ fn ping_datagram(conn: &Connection, pinger: &Pinger, port: u16, payload: &[u8]) 
     }
 }
 
-async fn ping_loop(conn: Connection, pinger: Arc<Pinger>) {
+async fn ping_loop(conn: Connection, pinger: Arc<Pinger>, sender: Arc<DatagramSender>) {
+    let mut pool = PacketPool::new(false);
     while conn.close_reason().is_none() {
-        forward(&conn, PING_PORT, &pinger.stamp());
+        sender.enqueue(&mut pool, PING_PORT, &pinger.stamp(), true);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -636,10 +702,17 @@ fn reset(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionReset
 }
 
+fn oversized(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE)
+}
+
 /// Host side: Sunshine's ports reached through 127.0.0.1.
 async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<LinkPorts>>, probes: Arc<ProbeGate>) {
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(ping_loop(conn.clone(), pinger.clone()));
+    let sender = DatagramSender::new(conn.clone());
+    let sending = sender.clone();
+    tasks.spawn(async move { sending.run().await });
+    tasks.spawn(ping_loop(conn.clone(), pinger.clone(), sender.clone()));
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
         let Ok(socket) = UdpSocket::bind((HOST_LOOPBACK, 0)).await else { return };
@@ -652,13 +725,15 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
         }
         let socket = Arc::new(socket);
         sockets.insert(port, socket.clone());
-        let conn = conn.clone();
+        let sender = sender.clone();
         tasks.spawn(async move {
-            let mut buffer = vec![0u8; 64 * 1024];
+            let mut buffer = [0; LOCAL_PACKET];
+            let mut pool = PacketPool::new(port == VIDEO_PORT);
             loop {
                 match socket.recv(&mut buffer).await {
-                    Ok(count) => forward(&conn, port, &buffer[..count]),
+                    Ok(count) => sender.enqueue(&mut pool, port, &buffer[..count], port != VIDEO_PORT),
                     Err(error) if reset(&error) => {}
+                    Err(error) if oversized(&error) => record_drop(),
                     Err(_) => break,
                 }
             }
@@ -667,12 +742,13 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
     {
         let conn = conn.clone();
         tasks.spawn(async move {
+            let mut pings = PacketPool::new(false);
             while let Ok(datagram) = conn.read_datagram().await {
                 if datagram.len() < 2 {
                     continue;
                 }
                 let port = u16::from_be_bytes([datagram[0], datagram[1]]);
-                if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
+                if ping_datagram(&sender, &mut pings, &pinger, port, &datagram[2..]) {
                     continue;
                 }
                 // The guest's audio hello registers its local playback socket.
@@ -733,10 +809,14 @@ async fn serve_guest(
     probe: Arc<Mutex<ProbeStats>>,
     pinger: Arc<Pinger>,
 ) {
-    tokio::spawn(ping_loop(conn.clone(), pinger.clone()));
+    let mut tasks = tokio::task::JoinSet::new();
+    let sender = DatagramSender::new(conn.clone());
+    let sending = sender.clone();
+    tasks.spawn(async move { sending.run().await });
+    tasks.spawn(ping_loop(conn.clone(), pinger.clone(), sender.clone()));
     for (port, listener) in listeners {
         let conn = conn.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let conn = conn.clone();
                 tokio::spawn(async move {
@@ -753,27 +833,31 @@ async fn serve_guest(
         let socket = Arc::new(socket);
         let client = Arc::new(Mutex::new(None::<SocketAddr>));
         routes.insert(port, (socket.clone(), client.clone()));
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; 64 * 1024];
+        let sender = sender.clone();
+        tasks.spawn(async move {
+            let mut buffer = [0; LOCAL_PACKET];
+            let mut pool = PacketPool::new(false);
             loop {
                 match socket.recv_from(&mut buffer).await {
                     Ok((count, from)) => {
                         *client.lock().unwrap() = Some(from);
-                        forward(&conn, port, &buffer[..count]);
+                        // Guest-to-host packets on the video port are keepalives.
+                        sender.enqueue(&mut pool, port, &buffer[..count], true);
                     }
                     Err(error) if reset(&error) => {}
+                    Err(error) if oversized(&error) => record_drop(),
                     Err(_) => break,
                 }
             }
         });
     }
+    let mut pings = PacketPool::new(false);
     while let Ok(datagram) = conn.read_datagram().await {
         if datagram.len() < 2 {
             continue;
         }
         let port = u16::from_be_bytes([datagram[0], datagram[1]]);
-        if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
+        if ping_datagram(&sender, &mut pings, &pinger, port, &datagram[2..]) {
             continue;
         }
         if port == PROBE_PORT {
@@ -787,7 +871,16 @@ async fn serve_guest(
         if let Some((socket, client)) = routes.get(&port) {
             let target = *client.lock().unwrap();
             if let Some(target) = target {
-                let _ = socket.send_to(&datagram[2..], target).await;
+                match socket.send_to(&datagram[2..], target).await {
+                    Ok(_) => {
+                        #[cfg(test)]
+                        if port == VIDEO_PORT {
+                            LOCAL_VIDEO_SENT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(error) if !reset(&error) => record_drop(),
+                    Err(_) => {}
+                }
             }
         }
     }
@@ -920,7 +1013,7 @@ impl PeerNetwork {
     pub fn from_address(addr: SocketAddr) -> Self {
         match addr.ip() {
             ip if is_self(ip) => Self::ThisPc,
-            IpAddr::V4(ip) if ip.is_private() => Self::Lan,
+            IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => Self::Lan,
             _ => Self::Internet,
         }
     }
@@ -996,7 +1089,7 @@ impl HostTunnel {
         let endpoint = {
             let _guard = runtime.enter();
             Endpoint::new(
-                EndpointConfig::default(),
+                endpoint_config(),
                 Some(server_config(identity)?),
                 socket,
                 Arc::new(TokioRuntime),
@@ -1009,11 +1102,10 @@ impl HostTunnel {
 
         let alive = Arc::new(AtomicBool::new(true));
         // Keep our NAT mapping (and so the reflexive candidate) open while we wait.
-        if reflexive.addr.is_some() {
+        if let Some(server) = reflexive.server {
             let socket = punch_socket.try_clone()?;
             let alive = alive.clone();
             thread::spawn(move || {
-                let servers = stun_servers();
                 while alive.load(Ordering::Relaxed) {
                     for _ in 0..150 {
                         if !alive.load(Ordering::Relaxed) {
@@ -1021,13 +1113,21 @@ impl HostTunnel {
                         }
                         thread::sleep(Duration::from_millis(100));
                     }
-                    if let Some(server) = servers.first() {
-                        let _ = socket.send_to(&stun_request(&[7; 12]), server);
-                    }
+                    let _ = socket.send_to(&stun_request(&[7; 12]), server);
                 }
             });
         }
-        let signal = subscribe(token, move |guest| punch(&punch_socket, guest, Duration::from_secs(15)));
+        let signal = if reflexive.addr.is_some() {
+            HostNetwork { mapping: reflexive.mapping, forwarded: mapping.is_some() }.publish(token);
+            let active = alive.clone();
+            Some(Subscription::start(topic(&token, false), 0, 40, move |event| {
+                if let Some(guest) = unseal(&token, &event.message) {
+                    punch(&punch_socket, guest, Duration::from_secs(12), active.clone());
+                }
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             runtime: Some(runtime),
@@ -1243,7 +1343,7 @@ async fn choose_route(
     config: ClientConfig,
     token: [u8; 16],
     candidates: &[Candidate],
-    reflexive: &Reflexive,
+    failure: impl FnOnce() -> String,
     check: impl Fn() -> Result<()>,
 ) -> Result<MeasuredRoute> {
     check()?;
@@ -1302,7 +1402,7 @@ async fn choose_route(
             if refused {
                 anyhow::anyhow!("Хост отклонил код: он устарел или уже использован.")
             } else {
-                anyhow::anyhow!(failure_hint(reflexive))
+                anyhow::anyhow!(failure())
             }
         })
 }
@@ -1314,6 +1414,7 @@ pub struct GuestTunnel {
     probe: Arc<Mutex<ProbeStats>>,
     pinger: Arc<Pinger>,
     idle_rtt: Duration,
+    pub mapping: Mapping,
     pub kind: PathKind,
     pub same_machine: bool,
     /// Where this guest mirrors the host's ports.
@@ -1330,15 +1431,16 @@ impl GuestTunnel {
         ensure!(!candidates.is_empty(), "В коде приглашения нет адресов хоста.");
         let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         let port = socket.local_addr()?.port();
-        let reflexive = discover(&socket);
-        let mut mine: Vec<SocketAddrV4> = reflexive.addr.into_iter().collect();
-        mine.extend(lan_addresses().into_iter().take(8).map(|ip| SocketAddrV4::new(ip, port)));
-        publish(token, mine);
-        punch(
-            &socket,
-            candidates.iter().map(|c| c.addr).collect(),
-            CONNECT_TIMEOUT,
-        );
+        let internet = candidates.iter().any(|candidate| candidate.kind != PathKind::Local);
+        let diagnosis = internet.then(|| thread::spawn(move || HostNetwork::read(token)));
+        let reflexive = if internet { discover(&socket) } else { Reflexive::default() };
+        let punching = Arc::new(AtomicBool::new(true));
+        if internet {
+            let mut mine: Vec<SocketAddrV4> = reflexive.addr.into_iter().collect();
+            mine.extend(lan_addresses().into_iter().take(8).map(|ip| SocketAddrV4::new(ip, port)));
+            publish(topic(&token, false), seal(&token, &mine));
+            punch(&socket, candidates.iter().map(|c| c.addr).collect(), CONNECT_TIMEOUT, punching.clone());
+        }
 
         socket.set_read_timeout(None)?;
         socket.set_nonblocking(true)?;
@@ -1346,12 +1448,17 @@ impl GuestTunnel {
         let runtime = runtime()?;
         let endpoint = {
             let _guard = runtime.enter();
-            Endpoint::new(EndpointConfig::default(), None, socket, Arc::new(TokioRuntime))?
+            Endpoint::new(endpoint_config(), None, socket, Arc::new(TokioRuntime))?
         };
         let config = client_config(fingerprint)?;
-        let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = runtime.block_on(
-            choose_route(&endpoint, config, token, candidates, &reflexive, check),
-        )?;
+        let route = runtime.block_on(choose_route(&endpoint, config, token, candidates, || {
+            let host = diagnosis.and_then(|task| task.join().ok().flatten());
+            failure_hint(reflexive.mapping, host)
+        }, check));
+        punching.store(false, Ordering::Relaxed);
+        let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = route?;
+        ensure!(conn.max_datagram_size().is_some_and(|size| size >= crate::media::LEGACY_PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD),
+            "Маршрут не пропускает видеопакеты DuoLink.");
 
         let bind = |loopback: Ipv4Addr| runtime.block_on(async move {
             let mut listeners = Vec::new();
@@ -1394,6 +1501,7 @@ impl GuestTunnel {
             probe,
             pinger,
             idle_rtt,
+            mapping: reflexive.mapping,
             kind,
             same_machine,
             loopback,
@@ -1450,8 +1558,23 @@ impl GuestTunnel {
         self.idle_rtt
     }
 
+    pub fn video_payload(&self) -> usize {
+        // The RTP header and the tunnel's port tag share this QUIC datagram.
+        self.conn.max_datagram_size().unwrap_or_default().saturating_sub(crate::media::VIDEO_PACKET_OVERHEAD)
+    }
+
     pub fn describe(&self) -> &'static str {
         describe(self.kind, self.conn.remote_address())
+    }
+
+    pub fn network(&self) -> PeerNetwork {
+        if self.same_machine {
+            PeerNetwork::ThisPc
+        } else if self.kind == PathKind::Local {
+            PeerNetwork::from_address(self.conn.remote_address())
+        } else {
+            PeerNetwork::Internet
+        }
     }
 }
 
@@ -1489,12 +1612,20 @@ async fn authenticate(conn: &Connection, token: [u8; 16]) -> Result<(), AuthErro
     }
 }
 
-fn failure_hint(reflexive: &Reflexive) -> String {
-    if reflexive.symmetric {
-        "У вас строгий NAT. Пусть сессию создаст друг.".into()
-    } else {
-        "Хост не отвечает. Проверьте, что сессия ещё открыта.".into()
+fn failure_hint(guest: Mapping, host: Option<HostNetwork>) -> String {
+    match (guest, host) {
+        (guest, Some(HostNetwork { mapping: Mapping::ChangesWithDestination, forwarded: false })) => {
+            match guest {
+                Mapping::Public => "У вас публичный IPv4. Создайте сессию у себя и отправьте код другу.",
+                Mapping::ChangesWithDestination => "У обоих внешний порт меняется. Прямое соединение не удалось. Включите UPnP на роутере хоста или смените хоста.",
+                _ => "Внешний порт хоста меняется. Попробуйте создать сессию у себя или включить UPnP на роутере хоста.",
+            }
+        }
+        (Mapping::ChangesWithDestination, None) =>
+            "У вас меняется внешний порт. Попробуйте подключиться к хосту с публичным IPv4 или UPnP.",
+        _ => "Хост не отвечает. Проверьте, что сессия ещё открыта.",
     }
+    .into()
 }
 
 #[cfg(test)]
@@ -1703,40 +1834,47 @@ mod tests {
         drop(host);
     }
 
-    /// Pushes a sustained stream through the tunnel and counts what survives.
+    /// Sends video-sized packets from the Sunshine socket to the Moonlight socket.
     #[test]
     #[ignore = "binds stream ports and contacts STUN/UPnP"]
     fn tunnel_throughput() {
-        let sink = StdUdpSocket::bind((HOST_LOOPBACK, UDP_PORTS[0])).unwrap();
+        let video = StdUdpSocket::bind((HOST_LOOPBACK, VIDEO_PORT)).unwrap();
+        video.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let sink = StdUdpSocket::bind((HOST_LOOPBACK, 0)).unwrap();
         socket2::SockRef::from(&sink).set_recv_buffer_size(RECEIVE_BUFFER).unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
         let received = Arc::new(AtomicU64::new(0));
-        {
-            let received = received.clone();
-            thread::spawn(move || {
-                let mut buffer = [0u8; 2048];
-                while let Ok(count) = sink.recv(&mut buffer) {
-                    received.fetch_add(count as u64, Ordering::Relaxed);
-                }
-            });
-        }
         let identity = Identity::generate("bench").unwrap();
         let token = [6u8; 16];
         let host = HostTunnel::open(&identity, token).unwrap();
         let loopback: Vec<Candidate> = host.candidates.iter().filter(|c| c.addr.ip().is_loopback()).copied().collect();
         let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, || Ok(())).unwrap();
 
-        let client = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let target = SocketAddr::from((GUEST_LOOPBACK, UDP_PORTS[0]));
-        let payload = vec![1u8; 1100];
+        sink.send_to(b"PING", (GUEST_LOOPBACK, VIDEO_PORT)).unwrap();
+        let (count, target) = video.recv_from(&mut [0u8; 32]).unwrap();
+        assert_eq!(count, 4);
+        let reader = received.clone();
+        thread::spawn(move || {
+            let mut buffer = [0u8; 2048];
+            while let Ok(count) = sink.recv(&mut buffer) {
+                reader.fetch_add(count as u64, Ordering::Relaxed);
+            }
+        });
+        let payload = [1u8; crate::media::PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD - 2];
+        let host_conn = host.links.lock().unwrap()[0].conn.clone();
         for mbps in [100.0, 300.0, 500.0] {
             received.store(0, Ordering::Relaxed);
+            let before = dropped();
+            let transmitted = host_conn.stats().frame_tx.datagram;
+            let decrypted = guest.conn.stats().frame_rx.datagram;
+            let forwarded = LOCAL_VIDEO_SENT.load(Ordering::Relaxed);
             let rate = mbps * 1e6 / 8.0;
             let start = Instant::now();
             let mut sent = 0u64;
             while start.elapsed() < Duration::from_secs(1) {
                 let due = (start.elapsed().as_secs_f64() * rate) as u64;
                 while sent < due {
-                    client.send_to(&payload, target).unwrap();
+                    video.send_to(&payload, target).unwrap();
                     sent += payload.len() as u64;
                 }
                 std::hint::spin_loop();
@@ -1744,10 +1882,14 @@ mod tests {
             thread::sleep(Duration::from_millis(300));
             let got = received.load(Ordering::Relaxed);
             eprintln!(
-                "{mbps:>4.0} Мбит/с: доставлено {:.2} % ({} из {} пакетов)",
+                "{mbps:>4.0} Мбит/с: доставлено {:.2} % ({} из {} пакетов), QUIC отправил {}, принял {}, переслано локально {}, сброшено DuoLink {}",
                 got as f64 * 100.0 / sent as f64,
-                got / 1100,
-                sent / 1100
+                got / payload.len() as u64,
+                sent / payload.len() as u64,
+                host_conn.stats().frame_tx.datagram - transmitted,
+                guest.conn.stats().frame_rx.datagram - decrypted,
+                LOCAL_VIDEO_SENT.load(Ordering::Relaxed) - forwarded,
+                dropped() - before,
             );
         }
         drop(guest);
@@ -1781,6 +1923,27 @@ mod tests {
         let sealed = seal(&[1; 16], &addrs);
         assert_eq!(unseal(&[1; 16], &sealed), Some(addrs));
         assert_eq!(unseal(&[2; 16], &sealed), None);
-        assert_ne!(topic(&[1; 16]), topic(&[2; 16]));
+        assert_ne!(topic(&[1; 16], false), topic(&[2; 16], false));
+        assert_ne!(topic(&[1; 16], false), topic(&[1; 16], true));
+    }
+
+    #[test]
+    fn nat_hint_uses_both_peers_and_respects_upnp() {
+        let strict_host = HostNetwork { mapping: Mapping::ChangesWithDestination, forwarded: false };
+        assert!(failure_hint(Mapping::Public, Some(strict_host)).contains("публичный IPv4"));
+        assert!(failure_hint(Mapping::ChangesWithDestination, Some(strict_host)).contains("У обоих"));
+        let forwarded = HostNetwork { forwarded: true, ..strict_host };
+        assert!(failure_hint(Mapping::ChangesWithDestination, Some(forwarded)).contains("Хост не отвечает"));
+        assert!(!failure_hint(Mapping::ChangesWithDestination, None).contains("У обоих"));
+    }
+
+    #[test]
+    #[ignore = "contacts both DuoLink STUN ports over the internet"]
+    fn live_stun_ports() {
+        let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let started = Instant::now();
+        let replies = stun_batch(&socket, &infra::STUN.map(SocketAddr::V4), Duration::from_millis(700));
+        assert_eq!(replies.len(), 2);
+        eprintln!("two STUN replies in {:.1} ms", started.elapsed().as_secs_f64() * 1_000.0);
     }
 }

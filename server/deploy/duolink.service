@@ -1,0 +1,29 @@
+[Unit]
+Description=DuoLink signaling and STUN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/duolink/duolink-server
+Environment=DUOLINK_STATE_DIR=/var/lib/duolink
+Environment=DUOLINK_HTTP=127.0.0.1:8705
+Environment=DUOLINK_STUN_A=154.86.119.7:3478
+Environment=DUOLINK_STUN_B=154.86.119.7:3479
+DynamicUser=yes
+StateDirectory=duolink
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+LimitNOFILE=8192
+MemoryMax=192M
+CPUWeight=50
+TasksMax=48
+
+[Install]
+WantedBy=multi-user.target

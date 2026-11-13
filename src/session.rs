@@ -20,19 +20,21 @@ use crate::{
     audio::{AUDIO_PORT, AudioRecipient, GuestAudio, HostAudio, voice_app},
     bitrate::{Backoff, SAMPLE_INTERVAL},
     media::{
-        DEFAULT_FEC, GuestStream, HostStream, MAX_BITRATE_KBPS, MIN_AUTO_BITRATE_KBPS, MOONLIGHT,
-        PATH_SHARE, Preferences, SUNSHINE, UNMEASURED_BITRATE_KBPS, fec_for_loss, lobby_bitrate_limit, lobby_wire_budget,
+        Codec, DEFAULT_FEC, GuestStream, HostStream, LEGACY_PACKET_SIZE, MAX_BITRATE_KBPS,
+        MIN_AUTO_BITRATE_KBPS, MOONLIGHT, PACKET_SIZE, PATH_SHARE, Preferences, SUNSHINE,
+        UNMEASURED_BITRATE_KBPS, automatic_codec, fec_for_loss, lobby_bitrate_limit,
+        lobby_wire_budget, video_packet_size,
         stream_wire_kbps,
     },
     platform::{
-        KeepAwake, ProcessLock, WifiQuiet, background_recording, close_windows, display_max_refresh,
-        display_mode, vigem_present,
+        KeepAwake, ProcessLock, StreamingTiming, WifiQuiet, background_recording, close_windows,
+        display_max_refresh, display_mode, vigem_present, virtualhid_running,
     },
     protocol::{
         CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Mode, Reply, Request, StreamBandwidth, Wire,
         client_config, new_token, valid_pem,
     },
-    tunnel::{GuestTunnel, HostTunnel, PROBE_MBPS, PeerNetwork, dropped},
+    tunnel::{GuestTunnel, HostTunnel, Mapping, PROBE_MBPS, PeerNetwork, dropped},
 };
 
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -43,6 +45,8 @@ const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(9);
 const MEDIA_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MEDIA_DISCONNECT_GRACE: Duration = Duration::from_millis(200);
+pub(crate) const DECODE_FAILED: &str =
+    "Видеокарта не смогла декодировать поток. Попробуйте другой кодек или разрешите декодирование на CPU в настройках видео.";
 
 #[derive(Debug)]
 pub enum Event {
@@ -182,12 +186,10 @@ fn reserve_check(address: Ipv4Addr) -> Result<()> {
 fn reachability(tunnel: &HostTunnel) -> &'static str {
     if tunnel.forwarded {
         "Открыт через UPnP"
-    } else if tunnel.reflexive.addr.is_some() && !tunnel.reflexive.symmetric {
-        "Через пробивку NAT"
-    } else if tunnel.reflexive.symmetric {
-        "Строгий NAT"
-    } else {
+    } else if tunnel.reflexive.addr.is_none() {
         "Только локальная сеть"
+    } else {
+        tunnel.reflexive.mapping.label()
     }
 }
 
@@ -339,7 +341,8 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         .context("Не удалось зарезервировать сессию хоста.")?
         .context("На этом ПК уже открыта сессия DuoLink.")?;
     reserve_check(address)?;
-    if !vigem_present() {
+    let broker = virtualhid_running();
+    if !vigem_present() && !broker {
         worker.fact("Геймпады", "Нет драйвера");
     }
     if !SUNSHINE.path(&data).is_file() {
@@ -347,6 +350,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     }
     let engine = SUNSHINE.ensure(&data, || worker.check())?;
     worker.check()?;
+    let _timing = StreamingTiming::hold();
 
     let identity = Identity::generate("DuoLink Host")?;
     // One client identity for every guest: Sunshine trusts it from the start,
@@ -362,7 +366,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     // someone joins, it is already listening.
     let start_engine = |fec: u8| {
         HostStream::start(
-            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz,
+            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz, broker,
         )
     };
     let mut stream = start_engine(fec)?;
@@ -430,6 +434,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut next_log = Instant::now();
     let mut next_bandwidth = Instant::now();
     let mut disconnected = 0u64;
+    let mut launch_released = false;
 
     let close = |wire: &mut HostWire, reason: &str| {
         let _ = wire.send(&Reply::Closed { reason: reason.into() });
@@ -627,11 +632,10 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     && (g.fec.is_some() || g.since.elapsed() >= MEASURE_TIMEOUT)
             })
         {
-            // The first guest on a lossy path: restart Sunshine with more
-            // redundancy while nobody is watching yet.
-            let busy = guests.iter().any(|g| g.state == PlayerState::Playing);
+            // Sunshine's FEC is global. Set it from the first accepted path
+            // before releasing any streams in this lobby.
             let wanted_fec = guests[at].fec.unwrap_or(DEFAULT_FEC);
-            if !busy && wanted_fec > fec {
+            if !launch_released && wanted_fec != fec {
                 fec = wanted_fec;
                 drop(stream);
                 stream = start_engine(fec)?;
@@ -684,9 +688,11 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     own_audio,
                     audio_opus: own_audio && guest.audio_opus,
                     auto_bitrate_kbps,
+                    video_packet_size: Some(PACKET_SIZE),
                     client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
                 };
                 if let Some(guest) = reply_to_guest(&mut guests, at, &reply) {
+                    launch_released = true;
                     guest.sent_ready = true;
                     guest.since = Instant::now();
                     guest.bitrate_kbps = bitrate_kbps;
@@ -738,7 +744,8 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             && guest.bandwidth.is_some_and(|report| report.manual_kbps.is_none())
                             && guest.backoff.is_none()
                         {
-                            guest.backoff = Some(Backoff::new(Instant::now(), tunnel.upload(guest.port).and_then(|sample| sample.rtt)));
+                            let baseline = tunnel.upload(guest.port).and_then(|sample| sample.idle_rtt.or(sample.rtt));
+                            guest.backoff = Some(Backoff::new(Instant::now(), baseline));
                         }
                         guest.last_ping = Instant::now();
                         true
@@ -857,6 +864,8 @@ fn explain_moonlight_log(log: &str) -> &'static str {
         "У хоста другая версия DuoLink или остался старый процесс. Пусть хост выйдет из DuoLink через значок в трее, обновит программу и создаст лобби заново."
     } else if log.contains("Не удалось подключиться") || log.contains("Failed to connect") {
         "Moonlight не смог подключиться к хосту. Проверьте, что у хоста открыто лобби и стоит та же версия DuoLink."
+    } else if log.contains("hardware decoding") || log.contains("Failed to initialize video decoder") {
+        DECODE_FAILED
     } else {
         "Moonlight закрылся с ошибкой. Подробности в guest.log."
     }
@@ -869,6 +878,7 @@ struct GuestLaunch {
     mode: Mode,
     desktop: Option<Mode>,
     own_audio: bool,
+    packet_size: usize,
 }
 
 impl GuestLaunch {
@@ -882,6 +892,7 @@ impl GuestLaunch {
         GuestStream::start(
             engine, data, tunnel.loopback, tunnel.same_machine, self.own_audio, self.host,
             &self.certificate, &self.client, self.mode, self.desktop, preferences,
+            self.packet_size,
         )
     }
 }
@@ -913,11 +924,13 @@ fn guest(
     nickname: String,
 ) -> Result<String> {
     let automatic = preferences.bitrate.is_none();
+    let automatic_video = preferences.codec == Codec::Auto;
     if !MOONLIGHT.path(&data).is_file() {
         worker.status("Скачиваем Moonlight…");
     }
     let engine = MOONLIGHT.ensure(&data, || worker.check())?;
     worker.check()?;
+    let _timing = StreamingTiming::hold();
 
     worker.status("Ищем хост…");
     let tunnel = GuestTunnel::connect(invite.token, invite.fingerprint, &invite.candidates, || {
@@ -925,6 +938,9 @@ fn guest(
     })?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     worker.fact("Пинг до трансляции", rtt_ms(tunnel.idle_rtt()));
+    if !tunnel.same_machine && tunnel.mapping != Mapping::Unknown {
+        worker.fact("UDP", tunnel.mapping.label());
+    }
     let _wifi = quiet_wifi(worker);
     worker.status("Ждём хост…");
     let loopback = tunnel.loopback;
@@ -976,10 +992,12 @@ fn guest(
     });
     let fec = match loss_probe {
         Some(probe) => {
-            let fec = fec_for_loss(probe.loss);
-            worker.fact("Потери", format!("{:.1} % · коррекция {fec} %", probe.loss * 100.0));
+            let local = !matches!(tunnel.network(), PeerNetwork::Internet);
+            let fec = fec_for_loss(probe.loss, local);
+            worker.fact("Потери", format!("{:.1} %", probe.loss * 100.0));
             fec
         }
+        None if tunnel.same_machine => 5,
         None => DEFAULT_FEC,
     };
     wire.send(&Request::Measured {
@@ -1014,6 +1032,18 @@ fn guest(
                 waiting_restart = true;
                 wire.send(&Request::RestartReady { closed_cleanly: exited.is_some_and(|status| status.success()) })?;
             } else if let Some(status) = exited {
+                if !streaming && !waiting_restart && automatic_video && preferences.codec != Codec::Auto
+                    && let Some(settings) = &launch
+                {
+                    // Moonlight's own probe checks the chosen renderer and the
+                    // stream rate. If the driver accepted the profile but
+                    // Moonlight couldn't start it, use its automatic selection.
+                    preferences.codec = Codec::Auto;
+                    worker.fact("Кодек", preferences.codec.label());
+                    stream = Some(settings.start(&engine, &data, &tunnel, preferences)?);
+                    by = Instant::now() + START_TIMEOUT + SILENCE;
+                    continue;
+                }
                 let _ = wire.send(&Request::Leave);
                 if status.success() && streaming {
                     return Ok("Поток закрыт.".into());
@@ -1060,6 +1090,7 @@ fn guest(
                 own_audio,
                 audio_opus,
                 auto_bitrate_kbps,
+                video_packet_size: packet_limit,
                 client: Some(client),
             }) if launch.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let desktop = display_mode().ok();
@@ -1069,6 +1100,8 @@ fn guest(
                     "Хост прислал неверные данные."
                 );
                 let (bitrate, capped) = preferences.auto_bitrate(mode, path_kbps, auto_bitrate_kbps);
+                let packet_size = video_packet_size(packet_limit.unwrap_or(LEGACY_PACKET_SIZE).min(tunnel.video_payload()));
+                preferences.codec = automatic_codec(loopback, mode, preferences);
                 if auto_bitrate_kbps.is_some() {
                     wire.send(&Request::Bitrate { kbps: bitrate })?;
                 }
@@ -1076,8 +1109,12 @@ fn guest(
                 worker.fact("Режим", format!("{}×{} · {} FPS", mode.width, mode.height, mode.fps));
                 show_bitrate(worker, bitrate, capped);
                 worker.fact("Кодек", preferences.codec.label());
+                worker.fact("Размер видеопакета", format!("{packet_size}"));
                 worker.status("Открываем игру…");
-                let settings = GuestLaunch { host, certificate, client, mode, desktop, own_audio };
+                let settings = GuestLaunch {
+                    host, certificate, client, mode, desktop, own_audio,
+                    packet_size,
+                };
                 stream = Some(settings.start(&engine, &data, &tunnel, preferences)?);
                 launch = Some(settings);
                 if own_audio {

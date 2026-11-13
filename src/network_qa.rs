@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     bitrate::{Backoff, SAMPLE_INTERVAL},
-    media::{lobby_bitrate_limit, stream_wire_kbps},
+    media::{PACKET_SIZE, VIDEO_PACKET_OVERHEAD, lobby_bitrate_limit, stream_wire_kbps, video_packet_size},
 };
 use std::collections::BTreeMap;
 
@@ -36,7 +36,7 @@ fn route_selection_compares_media_rtt() {
         let mut candidates = Vec::new();
         for (kind, propagation, startup_delay) in [
             (PathKind::Forwarded, Duration::from_millis(9), Duration::ZERO),
-            (PathKind::Public, Duration::from_millis(4), Duration::from_millis(180)),
+            (PathKind::Public, Duration::from_millis(4), Duration::from_millis(80)),
         ] {
             let proxy = Arc::new(UdpSocket::bind(localhost).await.unwrap());
             let SocketAddr::V4(addr) = proxy.local_addr().unwrap() else { unreachable!() };
@@ -69,7 +69,6 @@ fn route_selection_compares_media_rtt() {
             });
         }
         let client = Endpoint::client(localhost).unwrap();
-        let reflexive = Reflexive::default();
         let first = client.connect_with(config.clone(), candidates[0].addr.into(), "duolink")
             .unwrap().await.unwrap();
         authenticate(&first, token).await.unwrap();
@@ -77,13 +76,51 @@ fn route_selection_compares_media_rtt() {
         assert_eq!(echoes, ROUTE_PINGS);
         first.close(VarInt::from_u32(0), b"sampled");
 
-        let winner = choose_route(&client, config, token, &candidates, &reflexive, || Ok(()))
+        let winner = choose_route(&client, config, token, &candidates, || "no route".into(), || Ok(()))
             .await.unwrap();
         assert_eq!(winner.kind, PathKind::Public);
         assert_eq!(winner.echo_count, ROUTE_PINGS);
         assert!(winner.rtt + Duration::from_millis(5) < slow_rtt);
         eprintln!("first path {:.2} ms RTT, selected {:.2} ms RTT",
             slow_rtt.as_secs_f64() * 1_000.0, winner.rtt.as_secs_f64() * 1_000.0);
+    });
+}
+
+#[test]
+fn media_datagrams_fit_the_1200_byte_path_and_keep_input_ahead() {
+    runtime().unwrap().block_on(async {
+        let identity = Identity::generate("datagram QA").unwrap();
+        let localhost = SocketAddr::from((HOST_LOOPBACK, 0));
+        let mut transport = TransportConfig::default();
+        transport.mtu_discovery_config(None).datagram_receive_buffer_size(Some(4 << 20));
+        let transport = Arc::new(transport);
+        let mut server_config = server_config(&identity).unwrap();
+        server_config.transport_config(transport.clone());
+        let mut client_config = client_config(identity.fingerprint()).unwrap();
+        client_config.transport_config(transport);
+        let server = Endpoint::server(server_config, localhost).unwrap();
+        let client = Endpoint::client(localhost).unwrap();
+        let connecting = client.connect_with(client_config, server.local_addr().unwrap(), "duolink").unwrap();
+        let incoming = server.accept().await.unwrap();
+        let (guest, host) = tokio::join!(connecting, incoming);
+        let guest = guest.unwrap();
+        let host = host.unwrap();
+        let limit = host.max_datagram_size().unwrap();
+        let video = video_packet_size(limit - VIDEO_PACKET_OVERHEAD);
+        assert_eq!(video, PACKET_SIZE);
+        let mut video_pool = PacketPool::new(true);
+        let mut input_pool = PacketPool::new(false);
+        let sender = DatagramSender::new(host);
+        sender.enqueue(&mut input_pool, MEDIA_PORT + 10, b"controller", true);
+        for _ in 0..120 {
+            sender.enqueue(&mut video_pool, VIDEO_PORT, &[9; PACKET_SIZE + VIDEO_PACKET_OVERHEAD - 2], false);
+        }
+        let send = tokio::spawn(async move { sender.run().await });
+        let first = tokio::time::timeout(Duration::from_secs(1), guest.read_datagram()).await.unwrap().unwrap();
+        assert_eq!(&first[2..], b"controller");
+        let second = tokio::time::timeout(Duration::from_secs(1), guest.read_datagram()).await.unwrap().unwrap();
+        assert_eq!(second.len(), video + VIDEO_PACKET_OVERHEAD);
+        send.abort();
     });
 }
 
@@ -174,7 +211,10 @@ async fn shaped_run(
         let (host, _) = connections[0].clone();
         let pinger = Pinger::new();
         // The receiver below echoes pings and updates this same host clock.
-        tasks.spawn(ping_loop(host.clone(), pinger.clone()));
+        let sender = DatagramSender::new(host.clone());
+        let sending = sender.clone();
+        tasks.spawn(async move { sending.run().await });
+        tasks.spawn(ping_loop(host.clone(), pinger.clone(), sender));
         let reader = pinger.clone();
         let stats = host.clone();
         tasks.spawn(async move {

@@ -3,6 +3,8 @@
 param(
     [string]$ViGEm = '',
     [string]$ViGEmSha = '',
+    [string]$VirtualHid = '',
+    [string]$VirtualHidSha = '',
     [switch]$Firewall,
     [int]$Port = 48170,
     [string]$Program = '',
@@ -27,6 +29,14 @@ try {
         # 3010 and 1641 mean success with a pending reboot.
         if ($process.ExitCode -notin 0, 3010, 1641) { throw "ViGEmBus installer exited with code $($process.ExitCode)" }
         $restartNeeded = $process.ExitCode -in 3010, 1641
+    }
+    if ($VirtualHid) {
+        Assert-Hash $VirtualHid $VirtualHidSha
+        Write-Output 'Installing Virtual HID Broker'
+        $arguments = '/i "{0}" /qn /norestart' -f $VirtualHid
+        $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -notin 0, 3010, 1641) { throw "Virtual HID Broker installer exited with code $($process.ExitCode)" }
+        $restartNeeded = $restartNeeded -or $process.ExitCode -in 3010, 1641
     }
     if ($Firewall) {
         Write-Output 'Configuring firewall'

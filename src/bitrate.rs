@@ -4,14 +4,19 @@ use std::time::{Duration, Instant};
 
 use crate::{media::MIN_AUTO_BITRATE_KBPS, tunnel::UploadSample};
 
-pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 const WARMUP: Duration = Duration::from_secs(2);
-const CONGESTED_WINDOWS: u8 = 2;
+const CONGESTION_HOLD: Duration = Duration::from_secs(1);
+const RTT_GROWTH: Duration = Duration::from_millis(20);
+const LOSS_WINDOW: Duration = Duration::from_secs(1);
 
 pub(crate) struct Backoff {
     baseline_rtt: Option<Duration>,
     previous: Option<(Instant, UploadSample)>,
-    congested: u8,
+    traffic: Option<(Instant, UploadSample)>,
+    queue_since: Option<Instant>,
+    loss_since: Option<Instant>,
+    delivery: Option<(f64, f64)>,
     ready_at: Instant,
     cooldown_until: Instant,
 }
@@ -21,7 +26,10 @@ impl Backoff {
         Self {
             baseline_rtt,
             previous: None,
-            congested: 0,
+            traffic: None,
+            queue_since: None,
+            loss_since: None,
+            delivery: None,
             ready_at: now + WARMUP,
             cooldown_until: now,
         }
@@ -29,7 +37,10 @@ impl Backoff {
 
     pub fn reset(&mut self, now: Instant) {
         self.previous = None;
-        self.congested = 0;
+        self.traffic = None;
+        self.queue_since = None;
+        self.loss_since = None;
+        self.delivery = None;
         self.ready_at = now + WARMUP;
     }
 
@@ -39,58 +50,79 @@ impl Backoff {
     }
 
     pub fn sample(&mut self, now: Instant, sample: UploadSample, bitrate: u32) -> Option<u32> {
-        if let Some(rtt) = sample.rtt {
+        if let Some(rtt) = sample.idle_rtt.or(sample.rtt) {
             self.baseline_rtt = Some(self.baseline_rtt.map_or(rtt, |baseline| baseline.min(rtt)));
         }
         let Some((then, previous)) = self.previous.replace((now, sample)) else {
-            self.congested = 0;
+            self.traffic = Some((now, sample));
             return None;
         };
         let elapsed = now.saturating_duration_since(then);
-        let sent = sample.sent.saturating_sub(previous.sent);
-        let lost = sample.lost.saturating_sub(previous.lost);
-        let bytes = sample.bytes.saturating_sub(previous.bytes);
-        let busy = sent >= 40 && bytes >= 16_384;
+        let busy = sample.sent.saturating_sub(previous.sent) >= 8
+            && sample.bytes.saturating_sub(previous.bytes) >= 3_276;
         if now < self.ready_at
             || now < self.cooldown_until
             || elapsed.is_zero()
-            || elapsed > SAMPLE_INTERVAL * 2
-            || !busy
+            || elapsed > SAMPLE_INTERVAL * 3
             || bitrate <= MIN_AUTO_BITRATE_KBPS
         {
-            self.congested = 0;
+            self.traffic = Some((now, sample));
+            self.queue_since = None;
+            self.loss_since = None;
+            self.delivery = None;
             return None;
         }
-        let loss = (lost as f64 / sent as f64).min(1.0);
-        let queue = self.baseline_rtt.zip(sample.rtt).is_some_and(|(baseline, rtt)| {
-            rtt.saturating_sub(baseline) >= Duration::from_millis(35).max(baseline / 3)
+        let high_rtt = busy && self.baseline_rtt.zip(sample.rtt).is_some_and(|(baseline, rtt)| {
+            rtt.saturating_sub(baseline) > RTT_GROWTH
         });
-        if !queue && loss < 0.05 {
-            self.congested = 0;
+        let queued = sustained(&mut self.queue_since, high_rtt, now);
+        let (window_start, window_sample) = *self.traffic.get_or_insert((then, previous));
+        let duration = now.duration_since(window_start);
+        if duration >= LOSS_WINDOW {
+            self.traffic = Some((now, sample));
+            let sent = sample.sent.saturating_sub(window_sample.sent);
+            let lost = sample.lost.saturating_sub(window_sample.lost);
+            let bytes = sample.bytes.saturating_sub(window_sample.bytes);
+            self.delivery = (sent >= 40 && bytes >= 16_384).then(|| {
+                let loss = (lost as f64 / sent as f64).min(1.0);
+                let kbps = bytes as f64 * 8.0 * (1.0 - loss) / duration.as_secs_f64() / 1000.0;
+                (loss, kbps)
+            });
+        }
+        let lossy = sustained(&mut self.loss_since, self.delivery.is_some_and(|(loss, _)| loss >= 0.05), now);
+        if !queued && !lossy {
             return None;
         }
-        self.congested += 1;
-        if self.congested < CONGESTED_WINDOWS {
-            return None;
-        }
+        // Small first step for queue growth without significant loss. Once
+        // packets are lost, use delivered throughput to cut more quickly.
+        let next = match self.delivery {
+            Some((loss, kbps)) if loss >= 0.05 => ((kbps * 0.75) as u32).min(bitrate * 3 / 4),
+            _ => bitrate * 4 / 5,
+        };
         self.reset(now);
-        // This estimate uses sent bytes and QUIC's inferred loss for the same window.
-        let delivered_kbps = bytes as f64 * 8.0 * (1.0 - loss) / elapsed.as_secs_f64() / 1000.0;
-        let budget = (delivered_kbps * 0.75) as u32;
-        Some(budget.min(bitrate * 3 / 4).max(MIN_AUTO_BITRATE_KBPS))
+        Some(next.max(MIN_AUTO_BITRATE_KBPS))
     }
+}
+
+fn sustained(since: &mut Option<Instant>, active: bool, now: Instant) -> bool {
+    if !active {
+        *since = None;
+        return false;
+    }
+    now.duration_since(*since.get_or_insert(now)) >= CONGESTION_HOLD
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample(second: u64, lost: u64, rtt_ms: u64) -> UploadSample {
+    fn sample(tick: u64, lost: u64, rtt_ms: u64) -> UploadSample {
         UploadSample {
-            sent: second * 1000,
+            sent: tick * 200,
             lost,
-            bytes: second * 1_000_000,
+            bytes: tick * 200_000,
             rtt: Some(Duration::from_millis(rtt_ms)),
+            idle_rtt: None,
         }
     }
 
@@ -98,35 +130,34 @@ mod tests {
     fn persistent_loss_backs_off_and_transient_loss_does_not() {
         let start = Instant::now();
         let mut backoff = Backoff::new(start, Some(Duration::from_millis(20)));
-        let mut tick = |second, loss, rtt| backoff.sample(
-            start + Duration::from_secs(second), sample(second, loss, rtt), 8_000,
-        );
-        assert_eq!(tick(0, 0, 20), None);
-        assert_eq!(tick(1, 0, 25), None);
-        assert_eq!(tick(2, 120, 100), None);
-        assert_eq!(tick(3, 120, 20), None);
-        assert_eq!(tick(4, 200, 95), None);
-        assert_eq!(tick(5, 450, 120), Some(4_500));
-        assert_eq!(tick(6, 700, 120), None);
+        let mut cuts = Vec::new();
+        for tick in 0..=26 {
+            let lost = if tick < 6 { 0 } else if tick < 16 { 100 } else { 100 + (tick - 15) * 40 };
+            if let Some(rate) = backoff.sample(start + SAMPLE_INTERVAL * tick as u32, sample(tick, lost, 20), 8_000) {
+                cuts.push((tick, rate));
+            }
+        }
+        assert_eq!(cuts, [(24, 4_800)]);
     }
 
     #[test]
     fn high_baseline_rtt_and_light_traffic_keep_the_stream_running() {
         let start = Instant::now();
         let mut backoff = Backoff::new(start, Some(Duration::from_millis(200)));
-        for second in 0..6 {
+        for tick in 0..20 {
             assert_eq!(backoff.sample(
-                start + Duration::from_secs(second), sample(second, 0, 220), 8_000,
+                start + SAMPLE_INTERVAL * tick as u32, sample(tick, 0, 220), 8_000,
             ), None);
         }
-        for second in 6..12 {
+        for tick in 20..40 {
             let idle = UploadSample {
-                sent: 5000 + second * 20,
-                lost: second * 4,
-                bytes: 5_000_000 + second * 1000,
+                sent: 4_000 + tick,
+                lost: 0,
+                bytes: 4_000_000 + tick * 200,
                 rtt: None,
+                idle_rtt: None,
             };
-            assert_eq!(backoff.sample(start + Duration::from_secs(second), idle, 8_000), None);
+            assert_eq!(backoff.sample(start + SAMPLE_INTERVAL * tick as u32, idle, 8_000), None);
         }
     }
 
@@ -134,12 +165,13 @@ mod tests {
     fn sustained_queueing_triggers_before_packet_loss() {
         let start = Instant::now();
         let mut backoff = Backoff::new(start, Some(Duration::from_millis(20)));
-        for second in 0..3 {
+        for tick in 0..15 {
+            let rtt = if tick < 5 { 20 } else { 43 };
             assert_eq!(backoff.sample(
-                start + Duration::from_secs(second), sample(second, 0, 100), 8_000,
+                start + SAMPLE_INTERVAL * tick as u32, sample(tick, 0, rtt), 8_000,
             ), None);
         }
-        assert_eq!(backoff.sample(start + Duration::from_secs(3), sample(3, 0, 100), 8_000), Some(6_000));
+        assert_eq!(backoff.sample(start + Duration::from_secs(3), sample(15, 0, 43), 8_000), Some(6_400));
     }
 
     #[test]
@@ -147,14 +179,14 @@ mod tests {
         let start = Instant::now();
         let mut backoff = Backoff::new(start, Some(Duration::from_millis(20)));
         backoff.resumed(start);
-        for second in 0..=8 {
+        for tick in 0..45 {
             assert_eq!(backoff.sample(
-                start + Duration::from_secs(second), sample(second, second * 100, 100), 8_000,
+                start + SAMPLE_INTERVAL * tick as u32, sample(tick, 0, 100), 8_000,
             ), None);
         }
         assert_eq!(
-            backoff.sample(start + Duration::from_secs(9), sample(9, 900, 100), 8_000),
-            Some(5_400)
+            backoff.sample(start + Duration::from_secs(9), sample(45, 0, 100), 8_000),
+            Some(6_400)
         );
     }
 }

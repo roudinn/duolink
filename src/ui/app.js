@@ -5,7 +5,7 @@ const send = (action, fields = {}) => window.ipc.postMessage(JSON.stringify({ ac
 const settings = $("settings");
 const guestCode = $("guest-code");
 const NUMBERS = ["width", "height", "fps", "bitrate"];
-const FLAGS = ["yuv444", "hdr", "windowed", "stats"];
+const FLAGS = ["yuv444", "hdr", "windowed", "stats", "smooth", "software_decode"];
 const STORE = "duolink.video.v1";
 const NICK = /^[A-Za-z0-9_.-]{3,16}$/;
 
@@ -379,11 +379,14 @@ function renderFriends(next) {
 
 function renderSettings(next) {
   show("copy-friend-code", next.me.chosen);
+  show("network-row", Boolean(next.network));
+  text("network-note", next.network ? tr(next.network) : "");
   show("discord-row", next.discord !== null);
   if (next.discord !== null) $("discord").checked = next.discord;
   $("autostart").checked = next.autostart;
   const u = next.update;
   const busy = sessionBusy(next);
+  $("virtual-hid").disabled = busy;
   const ready = u.state === "ready";
   const notes = {
     checking: tr("Проверяем…"),
@@ -463,6 +466,10 @@ document.addEventListener("click", (e) => {
       $("video-title").scrollIntoView({ block: "start" });
       break;
     case "close_settings": settings.close(); break;
+    case "virtual_hid":
+      settings.close();
+      send(action);
+      break;
     case "toggle_view": go(view === "friends" ? "play" : "friends"); break;
     case "ask_remove":
       confirmRemove = id;

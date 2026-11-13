@@ -2,8 +2,10 @@
 
 mod audio;
 mod bitrate;
+mod datagram;
 mod friends;
 mod gui;
+mod infra;
 mod media;
 mod platform;
 mod presence;

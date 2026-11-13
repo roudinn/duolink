@@ -134,6 +134,7 @@ enum Action {
     ClearCodeError,
     Paste,
     Graphics,
+    VirtualHid,
     CheckUpdate,
     Restart,
     Logs,
@@ -327,6 +328,7 @@ impl Pane {
                 Event::Finished { message, failed } => {
                     self.set(Phase::Idle, message.clone());
                     self.error = *failed;
+                    self.video_error = *failed && message == crate::session::DECODE_FAILED;
                     self.latency = None;
                     self.players.clear();
                     finished = true;
@@ -342,6 +344,7 @@ impl Pane {
 
 /// Results of background work, delivered back to the UI thread.
 enum Job {
+    Network(crate::tunnel::Mapping),
     Lookup { query: String, result: Result<[u8; 32]> },
     FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
     FriendAccepted { key: [u8; 32], result: Result<()> },
@@ -359,6 +362,7 @@ struct App {
     /// Discord status switch; `None` when this build has no Discord application.
     discord: Option<bool>,
     autostart: bool,
+    network: Option<&'static str>,
     me: MeView,
     friends: Vec<FriendView>,
     invitations: Vec<Invitation>,
@@ -394,6 +398,8 @@ struct App {
     #[serde(skip)]
     setup_cancelled: bool,
     #[serde(skip)]
+    driver_setup: bool,
+    #[serde(skip)]
     data: PathBuf,
 }
 
@@ -410,6 +416,7 @@ impl App {
             update: update::Status::Idle,
             discord: presence.as_ref().map(|_| discord_pref(&data)),
             autostart: crate::platform::autostart_enabled(),
+            network: None,
             me: MeView { name: String::new(), tag: String::new(), chosen: false },
             friends: Vec::new(),
             invitations: Vec::new(),
@@ -429,12 +436,19 @@ impl App {
             shown_presence: None,
             launched: Instant::now(),
             setup_cancelled: false,
+            driver_setup: false,
             data,
         };
         if app.identity.chosen {
             app.listen();
             friends::announce(&app.identity);
         }
+        let sender = app.jobs.0.clone();
+        let wake = app.wake.clone();
+        thread::spawn(move || {
+            let _ = sender.send(Job::Network(crate::tunnel::diagnose_network()));
+            wake();
+        });
         app.sync();
         Ok(app)
     }
@@ -705,6 +719,10 @@ impl App {
                 }
             }
             Action::Graphics => open_or_toast(view, OsStr::new(GRAPHICS))?,
+            Action::VirtualHid if self.session_idle() => {
+                self.driver_setup = true;
+                self.setup.begin(setup::install_virtualhid(self.data.clone()), "Проверяем драйвер геймпада…");
+            }
             Action::Logs => {
                 let directory = self.data.join("logs");
                 let _ = fs::create_dir_all(&directory);
@@ -863,7 +881,13 @@ impl App {
             }
         }
         if setup_done {
-            if std::mem::take(&mut self.setup_cancelled) {
+            if std::mem::take(&mut self.driver_setup) {
+                let cancelled = std::mem::take(&mut self.setup_cancelled);
+                if !cancelled && !self.setup.message.is_empty() {
+                    let _ = toast(view, &self.setup.message);
+                }
+                self.setup.set(Phase::Idle, "");
+            } else if std::mem::take(&mut self.setup_cancelled) {
                 self.host_for.clear();
                 self.setup.set(Phase::Idle, "");
                 self.host.set(Phase::Idle, "");
@@ -922,6 +946,7 @@ impl App {
 
         for job in self.jobs.1.try_iter().collect::<Vec<_>>() {
             match job {
+                Job::Network(mapping) => self.network = Some(mapping.label()),
                 Job::Lookup { query, result } => {
                     self.looking_up = false;
                     match result {

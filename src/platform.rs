@@ -24,7 +24,7 @@ use windows_sys::{
             Registry::{RRF_RT_REG_DWORD, RegGetValueW},
             Threading::{
                 ABOVE_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CreateMutexW, GetCurrentProcess,
-                GetCurrentThread, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
+                GetCurrentThread, GetPriorityClass, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
                 PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
                 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
                 ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, SetThreadPriority,
@@ -192,6 +192,64 @@ fn prioritize(handle: HANDLE, class: PROCESS_CREATION_FLAGS) {
 /// a game saturates the CPU and its window sits in the background.
 pub fn prioritize_self() {
     prioritize(unsafe { GetCurrentProcess() }, ABOVE_NORMAL_PRIORITY_CLASS);
+}
+
+/// Hold the timer request and boost DuoLink only while a tunnel is active.
+/// Tests or tools can host and join in the same process, so restore the
+/// original priority after the last session exits.
+pub(crate) struct StreamingTiming {
+    timer: bool,
+}
+
+static STREAM_TIMING: std::sync::Mutex<(usize, u32)> = std::sync::Mutex::new((0, 0));
+
+impl StreamingTiming {
+    pub fn hold() -> Self {
+        let mut state = STREAM_TIMING.lock().unwrap();
+        let handle = unsafe { GetCurrentProcess() };
+        if state.0 == 0 {
+            state.1 = unsafe { GetPriorityClass(handle) };
+            prioritize(handle, HIGH_PRIORITY_CLASS);
+        }
+        state.0 += 1;
+        Self { timer: unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) } == 0 }
+    }
+}
+
+impl Drop for StreamingTiming {
+    fn drop(&mut self) {
+        if self.timer {
+            unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+        }
+        let mut state = STREAM_TIMING.lock().unwrap();
+        state.0 -= 1;
+        if state.0 == 0 && state.1 != 0 {
+            unsafe { SetPriorityClass(GetCurrentProcess(), state.1) };
+        }
+    }
+}
+
+pub(crate) fn virtualhid_running() -> bool {
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    };
+    let name: Vec<u16> = "libvirtualhid_broker\0".encode_utf16().collect();
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return false;
+        }
+        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS);
+        let mut status = SERVICE_STATUS::default();
+        let running = !service.is_null() && QueryServiceStatus(service, &mut status) != 0
+            && status.dwCurrentState == SERVICE_RUNNING;
+        if !service.is_null() {
+            CloseServiceHandle(service);
+        }
+        CloseServiceHandle(manager);
+        running
+    }
 }
 
 /// For the threads that move stream packets.

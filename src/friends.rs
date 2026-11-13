@@ -1,7 +1,7 @@
-//! Friends without accounts or servers of our own.
+//! Friends without accounts. The server stores public keys and sealed messages.
 //!
 //! Every install owns an X25519 key pair. A user is `nickname#tag`, where the
-//! four-digit tag is derived from the public key. Two kinds of ntfy.sh
+//! four-digit tag is derived from the public key. Two kinds of
 //! topics, all derived by hashing, carry everything:
 //!
 //! * directory — `nickname#tag` → public key, so friends can be added by name;
@@ -11,14 +11,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::{Arc, mpsc::{self, Receiver}},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,14 +25,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::tunnel::{SIGNAL_SERVER, curl};
+use crate::infra::{self, Subscription};
 
 const CODE_PREFIX: &str = "DLF-";
 /// Invites older than this are stale: the host's session code has expired.
 pub const INVITE_LIFETIME: u64 = 15 * 60;
 const MAIL_WINDOW: u64 = 12 * 3600;
-/// ntfy.sh keeps messages for 12 hours, so the directory entry is refreshed
-/// well within that.
+/// Refresh the directory entry periodically while DuoLink runs.
 pub const DIRECTORY_REFRESH: Duration = Duration::from_secs(4 * 3600);
 
 pub fn now() -> u64 {
@@ -357,26 +350,12 @@ fn directory_topic(name: &str, tag: u16) -> String {
     topic("directory", format!("{}#{tag:04}", name.to_ascii_lowercase()).as_bytes())
 }
 
-fn post_once(topic: &str, body: &str, timeout: &str) -> Result<u16> {
-    let mut child = curl()?
-        .args(["--max-time", timeout, "--data-binary", "@-", "--output", "NUL", "--write-out", "%{http_code}"])
-        .arg(format!("{SIGNAL_SERVER}/{topic}"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(body.as_bytes()).is_ok());
-    let output = child.wait_with_output()?;
-    let status = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
-    // curl can see a success status before the response finishes.
-    Ok(if (!written || !output.status.success()) && (200..300).contains(&status) { 0 } else { status })
-}
-
 fn post(topic: &str, body: &str) -> Result<()> {
     for attempt in 0..3 {
         if attempt > 0 {
             thread::sleep(Duration::from_secs(2 * attempt));
         }
-        match post_once(topic, body, "10").unwrap_or(0) {
+        match infra::post(topic, body, "10").unwrap_or(0) {
             200..=299 => return Ok(()),
             429 => bail!("Лимит отправки. Попробуйте позже."),
             400..=499 => bail!("Сервис отклонил сообщение."),
@@ -409,19 +388,11 @@ pub fn announce(me: &Me) {
 
 /// Finds the public key behind `name#tag`.
 pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
-    let mut command = curl()?;
-    let output = command
-        .args(["--fail", "--max-time", "10"])
-        .arg(format!("{SIGNAL_SERVER}/{}/json?poll=1&since=all", directory_topic(name, wanted)))
-        .stdin(Stdio::null())
-        .output()
-        .context("Нет связи.")?;
-    ensure!(output.status.success(), "Нет связи.");
-    let keys: HashSet<[u8; 32]> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| event["event"] == "message")
-        .filter_map(|event| URL_SAFE_NO_PAD.decode(event["message"].as_str()?.trim()).ok())
+    let topic = directory_topic(name, wanted);
+    let keys: HashSet<[u8; 32]> = infra::history(&topic, "10")?
+        .into_iter()
+        .filter(|event| event.topic == topic)
+        .filter_map(|event| URL_SAFE_NO_PAD.decode(event.message.trim()).ok())
         .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
         // The tag is a function of the key: an entry that does not match is forged.
         .filter(|key| tag(key) == wanted)
@@ -443,89 +414,23 @@ pub struct Incoming {
 /// One long-lived subscription to our inbox.
 pub struct Inbox {
     pub messages: Receiver<Incoming>,
-    child: Arc<Mutex<Option<Child>>>,
-    stop: Arc<AtomicBool>,
+    _subscription: Subscription,
 }
 
 impl Inbox {
     /// `since`: latest mail time from the saved history.
     pub fn listen(me: &[u8; 32], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let inbox = inbox_topic(me);
-        let url = format!("{SIGNAL_SERVER}/{inbox}/json");
-
-        let (sender, messages): (Sender<Incoming>, _) = mpsc::channel();
-        let child = Arc::new(Mutex::new(None::<Child>));
-        let stop = Arc::new(AtomicBool::new(false));
-        {
-            let (child, stop) = (child.clone(), stop.clone());
-            thread::spawn(move || {
-                let mut cursor = since;
-                while !stop.load(Ordering::Relaxed) {
-                    let floor = now().saturating_sub(MAIL_WINDOW);
-                    let spawned = curl().ok().and_then(|mut command| {
-                        command
-                            .args(["--fail", "--no-buffer", "--max-time", "900"])
-                            // Replay the boundary second too. Multiple IDs
-                            // can share that timestamp, even across reconnects.
-                            .arg(format!("{url}?since={}", cursor.max(floor).saturating_sub(1)))
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::piped())
-                            .spawn()
-                            .ok()
-                    });
-                    let Some(mut process) = spawned else {
-                        thread::sleep(Duration::from_secs(5));
-                        continue;
-                    };
-                    let stdout = process.stdout.take();
-                    {
-                        let mut slot = child.lock().unwrap();
-                        if stop.load(Ordering::Relaxed) {
-                            let _ = process.kill();
-                            let _ = process.wait();
-                            break;
-                        }
-                        *slot = Some(process);
-                    }
-                    for line in stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(Result::ok)) {
-                        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                        if event["event"] != "message" || event["topic"] != inbox {
-                            continue;
-                        }
-                        let (Some(time), Some(text)) = (event["time"].as_u64(), event["message"].as_str()) else {
-                            continue;
-                        };
-                        cursor = cursor.max(time);
-                        if sender.send(Incoming { time, text: text.to_owned() }).is_err() {
-                            break;
-                        }
-                        wake();
-                    }
-                    if let Some(mut process) = child.lock().unwrap().take() {
-                        let _ = process.kill();
-                        let _ = process.wait();
-                    }
-                    if !stop.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_secs(2));
-                    }
-                }
-            });
-        }
-        Self { messages, child, stop }
+        let (sender, messages) = mpsc::channel();
+        let subscription = Subscription::start(inbox_topic(me), since, MAIL_WINDOW, move |event| {
+            if sender.send(Incoming { time: event.time, text: event.message }).is_ok() {
+                wake();
+            }
+        });
+        Self { messages, _subscription: subscription }
     }
 }
 
-impl Drop for Inbox {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(mut process) = self.child.lock().unwrap().take() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
-    }
-}
-
-/// The same sealed message can have several ntfy IDs when a POST is retried.
+/// Track processed envelopes across reconnects and app restarts.
 #[derive(Default, Deserialize, Serialize)]
 pub struct MailHistory {
     legacy_through: u64,
@@ -697,9 +602,9 @@ mod tests {
         assert_eq!(Book::load(dir.path()).entries.len(), 1);
     }
 
-    /// Two identities: directory lookup and friend requests through ntfy.sh.
+    /// Two identities: directory lookup and friend requests through the VPS.
     #[test]
-    #[ignore = "uses ntfy.sh over the internet"]
+    #[ignore = "uses the DuoLink signaling service over the internet"]
     fn live_directory_and_mail() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let suffix = &hex(&rand::random::<[u8; 3]>())[..5];

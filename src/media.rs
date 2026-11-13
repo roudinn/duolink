@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -10,27 +10,33 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::{
+    infra,
     platform::{Process, display_refresh_would_drop, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
 
 const DESKTOP: &str = "DuoLink";
 
-/// Video packet size. With RTP, Sunshine's encryption and the 2-byte tunnel
-/// header it still fits one QUIC datagram on a 1280-byte path, so a frame is
-/// never fragmented at the IP layer anywhere on the internet.
-const PACKET_SIZE: u32 = 1024;
+/// At QUIC's 1200-byte floor Quinn allows 1162 bytes with its default CID.
+/// Leave 16 for RTP and two for the port tag, and round down for Moonlight FEC.
+pub(crate) const PACKET_SIZE: usize = 1136;
+pub(crate) const LEGACY_PACKET_SIZE: usize = 1024;
+pub(crate) const VIDEO_PACKET_OVERHEAD: usize = 16 + 2;
+
+pub(crate) fn video_packet_size(limit: usize) -> usize {
+    if limit >= PACKET_SIZE { PACKET_SIZE } else { LEGACY_PACKET_SIZE }
+}
 
 pub const SUNSHINE: Engine = Engine {
     name: "Sunshine",
     directory: "sunshine-2026.914.233613",
     exe: "Sunshine/sunshine.exe",
     url: "https://github.com/SunshineStream/Sunshine/releases/download/v2026.914.233613/Sunshine-Windows-AMD64-lite.zip",
+    mirror: "sunshine-2026.914.233613-windows-amd64-lite.zip",
     sha256: "233008e46f4c0e501a586cbfd6c4fd4a4c0d414a0b5fc7f13c070eb92ec3824b",
 };
 
@@ -39,6 +45,7 @@ pub const MOONLIGHT: Engine = Engine {
     directory: "moonlight-6.2.0",
     exe: "Moonlight.exe",
     url: "https://github.com/moonlight-stream/moonlight-qt/releases/download/v6.2.0/MoonlightPortable-x64-6.2.0.zip",
+    mirror: "moonlight-6.2.0-windows-x64-portable.zip",
     sha256: "6f91d268b41ed5ca8066d9d7578dc403b8db190991ff48f00b1700465f8f7ebf",
 };
 
@@ -47,7 +54,31 @@ pub struct Engine {
     pub directory: &'static str,
     pub exe: &'static str,
     url: &'static str,
+    mirror: &'static str,
     sha256: &'static str,
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "downloads the pinned Windows engines and driver installer"]
+    fn live_mirror_installs_and_caches_pinned_dependencies() {
+        let data = tempfile::tempdir().unwrap();
+        let sunshine = SUNSHINE.ensure(data.path(), || Ok(())).unwrap();
+        let moonlight = MOONLIGHT.ensure(data.path(), || Ok(())).unwrap();
+        let driver = crate::setup::fetch(data.path(), &crate::setup::VIGEM, || Ok(())).unwrap();
+        assert!(sunshine.is_file() && moonlight.is_file() && driver.is_file());
+        for name in [SUNSHINE.directory, MOONLIGHT.directory, "download-ViGEmBus"] {
+            let log = fs::read_to_string(data.path().join("logs").join(format!("{name}.log"))).unwrap();
+            assert!(log.contains("sslip.io/downloads/"));
+            assert!(!log.contains("GET https://github.com/"));
+        }
+        assert_eq!(SUNSHINE.ensure(data.path(), || panic!("cached engine")).unwrap(), sunshine);
+        assert_eq!(MOONLIGHT.ensure(data.path(), || panic!("cached engine")).unwrap(), moonlight);
+        assert_eq!(crate::setup::fetch(data.path(), &crate::setup::VIGEM, || panic!("cached driver")).unwrap(), driver);
+    }
 }
 
 impl Engine {
@@ -69,40 +100,7 @@ impl Engine {
         fs::create_dir(&unpack)?;
         let (log, _) = create_log(data, self.directory)?;
 
-        run_tool(
-            Command::new(system_tool("curl.exe")?)
-                .args([
-                    "-q",
-                    "--fail",
-                    "--location",
-                    "--silent",
-                    "--show-error",
-                    "--proto",
-                    "=https",
-                    "--proto-redir",
-                    "=https",
-                    "--connect-timeout",
-                    "15",
-                    "--max-time",
-                    "180",
-                    "--output",
-                ])
-                .arg(&zip)
-                .arg(self.url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(log.try_clone()?),
-            &check,
-        )
-        .with_context(|| format!("Не удалось скачать {} с GitHub. См. журнал.", self.name))?;
-
-        let mut sha = Sha256::new();
-        std::io::copy(&mut File::open(&zip)?, &mut sha)?;
-        ensure!(
-            format!("{:x}", sha.finalize()) == self.sha256,
-            "Контрольная сумма {} не совпала.",
-            self.name
-        );
+        infra::fetch(self.name, self.url, Some(self.mirror), self.sha256, &zip, &log, &check)?;
         run_tool(
             Command::new(system_tool("tar.exe")?)
                 .arg("-xf")
@@ -148,7 +146,7 @@ fn create_log(data: &Path, name: &str) -> Result<(File, PathBuf)> {
 /// waits for another.
 const ENCODER: &str = "nvenc_preset = 1\n\
      nvenc_split_encode = enabled\n\
-     nvenc_realtime_hags = enabled\n\
+     nvenc_realtime_hags = disabled\n\
      nvenc_latency_over_power = enabled\n\
      amd_usage = ultralowlatency\n\
      amd_quality = speed\n\
@@ -157,27 +155,28 @@ const ENCODER: &str = "nvenc_preset = 1\n\
      qsv_slow_hevc = disabled\n";
 
 /// Forward error correction when nothing was measured.
-pub const DEFAULT_FEC: u8 = 20;
+pub const DEFAULT_FEC: u8 = 15;
 
 /// Redundancy for a measured random loss rate: enough to rebuild a frame
 /// without a keyframe round trip, and no more bandwidth than that needs.
-pub fn fec_for_loss(loss: f64) -> u8 {
+pub fn fec_for_loss(loss: f64, local: bool) -> u8 {
     match loss {
-        l if l < 0.002 => 15,
-        l if l < 0.01 => 20,
-        l if l < 0.03 => 30,
+        l if l < 0.002 => if local { 5 } else { 10 },
+        l if l < 0.01 => 15,
+        l if l < 0.03 => 25,
         l if l < 0.06 => 40,
         _ => 50,
     }
 }
 
-fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -> String {
+fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>, broker: bool) -> String {
     let refresh = match refresh_hz {
         Some(hz) => format!("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = {hz}\n"),
         None => "dd_refresh_rate_option = disabled\n".into(),
     };
     // A second pass tightens the per-frame bitrate on links that already lose packets.
-    let nvenc_twopass = if fec > DEFAULT_FEC { "quarter_res" } else { "disabled" };
+    let nvenc_twopass = if fec >= 40 { "quarter_res" } else { "disabled" };
+    let gamepad_driver = if broker { "all" } else { "vigembus" };
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -190,7 +189,7 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
          lan_encryption_mode = 0\n\
          wan_encryption_mode = 0\n\
          controller = enabled\n\
-         gamepad_driver = vigembus\n\
+         gamepad_driver = {gamepad_driver}\n\
          gamepad = x360\n\
          back_button_timeout = -1\n\
          keyboard = disabled\n\
@@ -205,6 +204,7 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
          dd_config_revert_on_disconnect = enabled\n\
          max_bitrate = 0\n\
          ping_timeout = 5000\n\
+         capture = ddx\n\
          hevc_mode = 0\n\
          av1_mode = 0\n\
          packetsize = {PACKET_SIZE}\n\
@@ -295,6 +295,7 @@ impl HostStream {
         peer_cert: &str,
         fec: u8,
         refresh_hz: Option<u32>,
+        broker: bool,
     ) -> Result<Self> {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
@@ -321,7 +322,7 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            host_config(rel, address, fec, refresh_hz),
+            host_config(rel, address, fec, refresh_hz, broker),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
@@ -422,6 +423,69 @@ impl Codec {
     }
 }
 
+/// Sunshine advertises codec support after probing the encoder it will use.
+fn sunshine_codecs(address: Ipv4Addr) -> Result<u32> {
+    let mut socket = TcpStream::connect_timeout(&(address, MEDIA_PORT).into(), Duration::from_secs(1))?;
+    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+    socket.write_all(b"GET /serverinfo HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut reply = String::new();
+    socket.take(16 * 1024).read_to_string(&mut reply)?;
+    let (_, field) = reply.split_once("<ServerCodecModeSupport>").context("Missing Sunshine codec flags")?;
+    let (value, _) = field.split_once("</ServerCodecModeSupport>").context("Invalid Sunshine codec flags")?;
+    Ok(value.parse()?)
+}
+
+pub(crate) fn automatic_codec(address: Ipv4Addr, mode: Mode, prefs: Preferences) -> Codec {
+    if prefs.codec != Codec::Auto || prefs.yuv444 {
+        return prefs.codec;
+    }
+    let Ok(codecs) = sunshine_codecs(address) else { return Codec::Auto };
+    use windows::Win32::Graphics::{
+        Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+        Direct3D11::{
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0,
+            D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
+            D3D11_SDK_VERSION, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11VideoDevice,
+        },
+        Dxgi::{IDXGIAdapter, Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010}},
+    };
+    use windows::core::Interface;
+
+    let mut device = None;
+    if unsafe { D3D11CreateDevice(None::<&IDXGIAdapter>, D3D_DRIVER_TYPE_HARDWARE,
+        Default::default(), D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION,
+        Some(&mut device), None, None) }.is_err()
+    {
+        return Codec::Auto;
+    }
+    let Some(video) = device.and_then(|device| device.cast::<ID3D11VideoDevice>().ok()) else {
+        return Codec::Auto;
+    };
+    // Flags from moonlight-common-c. Keep Sunshine's auto advertisement so it
+    // can expose HDR profiles and keep its preferred hardware encoder.
+    let (av1, hevc, hevc_profile, format) = if prefs.hdr {
+        (0x20000, 0x200, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010)
+    } else {
+        (0x10000, 0x100, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_NV12)
+    };
+    for (codec, flag, profile) in [
+        (Codec::Av1, av1, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0),
+        (Codec::Hevc, hevc, hevc_profile),
+    ] {
+        let desc = D3D11_VIDEO_DECODER_DESC {
+            Guid: profile,
+            SampleWidth: mode.width,
+            SampleHeight: mode.height,
+            OutputFormat: format,
+        };
+        if codecs & flag != 0 && unsafe { video.GetVideoDecoderConfigCount(&desc) }.is_ok_and(|count| count > 0) {
+            return codec;
+        }
+    }
+    Codec::Auto
+}
+
 /// Guest form exactly as typed in the interface.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -435,6 +499,8 @@ pub struct Form {
     pub hdr: bool,
     pub windowed: bool,
     pub stats: bool,
+    pub smooth: bool,
+    pub software_decode: bool,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
@@ -447,6 +513,8 @@ pub struct Preferences {
     pub hdr: bool,
     pub windowed: bool,
     pub stats: bool,
+    pub smooth: bool,
+    pub software_decode: bool,
 }
 
 pub const MAX_BITRATE_KBPS: u32 = 500_000;
@@ -530,6 +598,8 @@ impl Preferences {
             hdr: form.hdr,
             windowed: form.windowed,
             stats: form.stats,
+            smooth: form.smooth,
+            software_decode: form.software_decode,
         })
     }
 
@@ -620,6 +690,7 @@ impl GuestStream {
         mode: Mode,
         desktop: Option<Mode>,
         preferences: Preferences,
+        packet_size: usize,
     ) -> Result<Self> {
         let sessions = data.join("clients");
         fs::create_dir_all(&sessions)?;
@@ -633,7 +704,7 @@ impl GuestStream {
         fs::write(
             settings.join("Moonlight.ini"),
             format!(
-                "[General]\nuniqueid={}\ncertificate={}\nkey={}\n\n\
+                "[General]\nrichpresence=false\nuniqueid={}\ncertificate={}\nkey={}\n\n\
              [hosts]\nsize=1\n1\\hostname={DESKTOP}\n1\\uuid={host}\n1\\manualaddress={address}\n\
              1\\manualport={MEDIA_PORT}\n1\\srvcert={}\n1\\nvidiasw=false\n",
                 &uid[..16],
@@ -649,7 +720,7 @@ impl GuestStream {
         let mut command = Command::new(exe);
         command
             .current_dir(directory.path())
-            .args(guest_args(same_machine, mode, keep_desktop, preferences))
+            .args(guest_args(same_machine, mode, keep_desktop, preferences, packet_size))
             .arg(host.to_string())
             .arg(DESKTOP)
             .stdin(Stdio::null())
@@ -678,6 +749,7 @@ fn guest_args(
     mode: Mode,
     keep_desktop: bool,
     preferences: Preferences,
+    packet_size: usize,
 ) -> Vec<String> {
     let display = if same_machine {
         "windowed"
@@ -698,13 +770,11 @@ fn guest_args(
         "--video-codec",
         preferences.codec.moonlight(),
         "--video-decoder",
-        "auto",
+        if preferences.software_decode { "auto" } else { "hardware" },
         "--display-mode",
         display,
         "--audio-config",
         "stereo",
-        "--no-vsync",
-        "--no-frame-pacing",
         "--audio-on-host",
         "--no-mute-on-focus-loss",
         // In single-controller mode Moonlight keeps one virtual pad connected
@@ -723,8 +793,10 @@ fn guest_args(
     args.push(toggle(preferences.yuv444, "yuv444"));
     args.push(toggle(preferences.hdr, "hdr"));
     args.push(toggle(preferences.stats, "performance-overlay"));
+    args.push(toggle(preferences.smooth, "vsync"));
+    args.push(toggle(preferences.smooth, "frame-pacing"));
     // An explicit size also keeps Moonlight in its LAN mode (5 ms audio packets).
-    args.extend(["--packet-size".into(), PACKET_SIZE.to_string()]);
+    args.extend(["--packet-size".into(), packet_size.to_string()]);
     args
 }
 
@@ -852,30 +924,37 @@ mod tests {
 
     #[test]
     fn fec_tracks_measured_loss() {
-        assert_eq!(fec_for_loss(0.0), 15);
-        assert_eq!(fec_for_loss(0.005), 20);
-        assert_eq!(fec_for_loss(0.02), 30);
-        assert_eq!(fec_for_loss(0.05), 40);
-        assert_eq!(fec_for_loss(0.2), 50);
-        let config = host_config("x", Ipv4Addr::LOCALHOST, 90, None);
+        assert_eq!(fec_for_loss(0.0, true), 5);
+        assert_eq!(fec_for_loss(0.0, false), 10);
+        assert_eq!(fec_for_loss(0.005, false), 15);
+        assert_eq!(fec_for_loss(0.02, false), 25);
+        assert_eq!(fec_for_loss(0.05, false), 40);
+        assert_eq!(fec_for_loss(0.2, false), 50);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, 90, None, true);
         assert!(config.contains("fec_percentage = 60"));
         assert!(config.contains("nvenc_twopass = quarter_res"));
+        assert!(config.contains("gamepad_driver = all"));
     }
 
     #[test]
     fn engines_get_low_latency_flags() {
         let mode = Mode { width: 2560, height: 1440, fps: 165 };
-        let args = guest_args(false, mode, false, Preferences::default());
+        let args = guest_args(false, mode, false, Preferences::default(), PACKET_SIZE);
         let has = |flag: &str| args.iter().any(|arg| arg == flag);
-        for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "--multi-controller", "1024"] {
+        for flag in ["--no-vsync", "--no-frame-pacing", "fullscreen", "--background-gamepad", "--multi-controller", "1136", "hardware"] {
             assert!(has(flag), "missing {flag}");
         }
-        assert!(guest_args(true, mode, false, Preferences::default()).iter().any(|arg| arg == "windowed"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
+        assert!(guest_args(true, mode, false, Preferences::default(), PACKET_SIZE).iter().any(|arg| arg == "windowed"));
+        let smooth = guest_args(false, mode, false, Preferences { smooth: true, ..Preferences::default() }, PACKET_SIZE);
+        assert!(smooth.iter().any(|arg| arg == "--vsync"));
+        assert!(smooth.iter().any(|arg| arg == "--frame-pacing"));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None, false);
         assert!(config.contains("nvenc_twopass = disabled"));
         assert!(config.contains("nvenc_split_encode = enabled"));
         assert!(config.contains("amd_usage = ultralowlatency"));
-        assert!(config.contains("packetsize = 1024"));
+        assert!(config.contains("packetsize = 1136"));
+        assert!(config.contains("capture = ddx"));
+        assert!(config.contains("gamepad_driver = vigembus"));
         assert!(config.contains("bind_address = 127.0.0.1"));
     }
 
@@ -885,7 +964,7 @@ mod tests {
         let desktop = Mode { width: 1920, height: 1080, fps: 60 };
         let preferences = Preferences::default();
         let mode = preferences.mode(host);
-        let args = guest_args(false, mode, display_refresh_would_drop(desktop, mode.fps), preferences);
+        let args = guest_args(false, mode, display_refresh_would_drop(desktop, mode.fps), preferences, PACKET_SIZE);
         assert_eq!(mode, host);
         assert!(args.windows(2).any(|pair| pair == ["--resolution", "3840x2160"]));
         assert!(args.windows(2).any(|pair| pair == ["--fps", "240"]));
@@ -897,13 +976,13 @@ mod tests {
 
     #[test]
     fn monitor_refresh_is_independent_of_stream_fps() {
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, Some(165));
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, Some(165), false);
         assert!(config.contains("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = 165\n"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None, false);
         assert!(config.contains("dd_refresh_rate_option = disabled\n"));
 
         let stream = Mode { width: 1920, height: 1080, fps: 60 };
-        let args = guest_args(false, stream, true, Preferences::default());
+        let args = guest_args(false, stream, true, Preferences::default(), PACKET_SIZE);
         assert!(args.iter().any(|arg| arg == "borderless"));
     }
 }
