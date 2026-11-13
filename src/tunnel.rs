@@ -5,8 +5,8 @@
 //! streams and its UDP media ports as unreliable QUIC datagrams. On the guest,
 //! Moonlight talks to 127.0.0.2, where DuoLink mirrors the same ports.
 //!
-//! The host is found by racing every candidate in the invite: its LAN
-//! addresses, a UPnP-forwarded port and its STUN-reflexive public address.
+//! The guest compares the media RTT of the invite's LAN addresses, a
+//! UPnP-forwarded port and a STUN-reflexive public address.
 //! For the last one both NATs must be opened at once, so the guest publishes
 //! its own candidates (encrypted with the invite token) through ntfy.sh and
 //! both sides fire punch packets at each other while QUIC retries its handshake.
@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use quinn::{
@@ -69,6 +69,8 @@ const STUN_SERVERS: [&str; 3] = [
 ];
 pub(crate) const SIGNAL_SERVER: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const ROUTE_WINDOW: Duration = Duration::from_millis(500);
+const ROUTE_PINGS: usize = 3;
 /// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
 const PROBE_PORT: u16 = 0;
 /// The capacity probe sends at this rate; reaching most of it means the
@@ -1175,12 +1177,143 @@ async fn accept(endpoint: Endpoint, token: [u8; 16], links: Arc<Mutex<Vec<Link>>
 
 /* ----------------------------------------------------------------- guest */
 
+struct MeasuredRoute {
+    kind: PathKind,
+    conn: Connection,
+    echo_count: usize,
+    rtt: Duration,
+}
+
+impl MeasuredRoute {
+    fn rank(&self) -> (u8, Duration) {
+        let quality = match self.echo_count {
+            0 => 2,
+            1 => 1,
+            _ => 0,
+        };
+        (quality, self.rtt)
+    }
+}
+
+/// Time the same datagrams that carry the live ping, before any stream traffic.
+async fn measure_route(conn: &Connection) -> (usize, Duration) {
+    let wait = (conn.rtt() * 2).clamp(Duration::from_millis(60), Duration::from_millis(250));
+    let mut rtts = [Duration::ZERO; ROUTE_PINGS];
+    let mut count = 0;
+    for sequence in 0..ROUTE_PINGS as u8 {
+        let payload = [sequence; 8];
+        let expected = tag(PONG_PORT, &payload);
+        let sent = Instant::now();
+        if conn.send_datagram(tag(PING_PORT, &payload)).is_err() {
+            break;
+        }
+        let echoed = tokio::time::timeout(wait, async {
+            while let Ok(datagram) = conn.read_datagram().await {
+                if datagram == expected {
+                    return true;
+                }
+                if let Some(ping) = datagram.strip_prefix(&PING_PORT.to_be_bytes()) {
+                    let _ = conn.send_datagram(tag(PONG_PORT, ping));
+                }
+            }
+            false
+        }).await;
+        match echoed {
+            Ok(true) => {
+                rtts[count] = sent.elapsed();
+                count += 1;
+            }
+            Ok(false) => break,
+            Err(_) => {}
+        }
+    }
+    let rtts = &mut rtts[..count];
+    rtts.sort_unstable();
+    (count, rtts.get(count / 2).copied().unwrap_or_else(|| conn.rtt()))
+}
+
+enum RouteAttempt {
+    Measured(MeasuredRoute),
+    Refused,
+    Unavailable,
+}
+
+async fn choose_route(
+    endpoint: &Endpoint,
+    config: ClientConfig,
+    token: [u8; 16],
+    candidates: &[Candidate],
+    reflexive: &Reflexive,
+    check: impl Fn() -> Result<()>,
+) -> Result<MeasuredRoute> {
+    check()?;
+    let mut attempts = tokio::task::JoinSet::new();
+    for &Candidate { kind, addr } in candidates {
+        let Ok(connecting) = endpoint.connect_with(config.clone(), addr.into(), "duolink") else {
+            continue;
+        };
+        attempts.spawn(async move {
+            let Ok(Ok(conn)) = tokio::time::timeout(CONNECT_TIMEOUT, connecting).await else {
+                return RouteAttempt::Unavailable;
+            };
+            match authenticate(&conn, token).await {
+                Ok(()) => {
+                    let (echo_count, rtt) = measure_route(&conn).await;
+                    RouteAttempt::Measured(MeasuredRoute { kind, conn, echo_count, rtt })
+                }
+                Err(AuthError::Refused) => RouteAttempt::Refused,
+                Err(AuthError::Unavailable) => RouteAttempt::Unavailable,
+            }
+        });
+    }
+
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT + Duration::from_secs(1);
+    let mut compare_by = deadline;
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    let mut refused = false;
+    let mut routes = Vec::<MeasuredRoute>::new();
+    while !attempts.is_empty() {
+        tokio::select! {
+            _ = poll.tick() => check()?,
+            _ = tokio::time::sleep_until(compare_by) => {
+                if compare_by == deadline || routes.iter().any(|route| route.conn.close_reason().is_none()) {
+                    break;
+                }
+                compare_by = deadline;
+                routes.clear();
+            }
+            next = attempts.join_next() => match next {
+                Some(Ok(RouteAttempt::Measured(route))) if route.conn.close_reason().is_none() => {
+                    if routes.is_empty() {
+                        compare_by = deadline.min(tokio::time::Instant::now() + ROUTE_WINDOW);
+                    }
+                    routes.push(route);
+                }
+                Some(Ok(RouteAttempt::Refused)) => refused = true,
+                _ => {}
+            }
+        }
+    }
+    // Dropping the other connections and pending attempts closes them.
+    routes.into_iter()
+        .filter(|route| route.conn.close_reason().is_none())
+        .min_by_key(MeasuredRoute::rank)
+        .ok_or_else(|| {
+            if refused {
+                anyhow::anyhow!("Хост отклонил код: он устарел или уже использован.")
+            } else {
+                anyhow::anyhow!(failure_hint(reflexive))
+            }
+        })
+}
+
 pub struct GuestTunnel {
     runtime: Option<Runtime>,
     endpoint: Endpoint,
     conn: Connection,
     probe: Arc<Mutex<ProbeStats>>,
     pinger: Arc<Pinger>,
+    idle_rtt: Duration,
     pub kind: PathKind,
     pub same_machine: bool,
     /// Where this guest mirrors the host's ports.
@@ -1216,58 +1349,9 @@ impl GuestTunnel {
             Endpoint::new(EndpointConfig::default(), None, socket, Arc::new(TokioRuntime))?
         };
         let config = client_config(fingerprint)?;
-
-        // Race every candidate; the first authenticated connection wins.
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let guard = runtime.enter();
-        for candidate in candidates {
-            let Ok(connecting) = endpoint.connect_with(config.clone(), SocketAddr::V4(candidate.addr), "duolink") else {
-                continue;
-            };
-            let sender = sender.clone();
-            let kind = candidate.kind;
-            runtime.spawn(async move {
-                if let Ok(Ok(conn)) = tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-                    let _ = sender.send((kind, conn));
-                }
-            });
-        }
-        drop(sender);
-        drop(guard);
-
-        let deadline = Instant::now() + CONNECT_TIMEOUT + Duration::from_secs(1);
-        // A refusal from one address (say, our own DuoLink on 127.0.0.1) must
-        // not end the race while other addresses may still answer.
-        let mut refused = false;
-        let give_up = |refused: bool| -> anyhow::Error {
-            if refused {
-                anyhow::anyhow!("Хост отклонил код: он устарел или уже использован.")
-            } else {
-                anyhow::anyhow!(failure_hint(&reflexive))
-            }
-        };
-        let (kind, conn) = loop {
-            check()?;
-            if Instant::now() >= deadline {
-                return Err(give_up(refused));
-            }
-            let next = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await
-            });
-            match next {
-                Ok(Some((kind, conn))) => match runtime.block_on(authenticate(&conn, token)) {
-                    Ok(()) => break (kind, conn),
-                    Err(error) => {
-                        conn.close(VarInt::from_u32(0), b"");
-                        refused |= error.to_string().contains("denied");
-                    }
-                },
-                Ok(None) => return Err(give_up(refused)),
-                Err(_) => {}
-            }
-        };
-        // Let the losing attempts go.
-        runtime.spawn(async move { while receiver.recv().await.is_some() {} });
+        let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = runtime.block_on(
+            choose_route(&endpoint, config, token, candidates, &reflexive, check),
+        )?;
 
         let bind = |loopback: Ipv4Addr| runtime.block_on(async move {
             let mut listeners = Vec::new();
@@ -1309,6 +1393,7 @@ impl GuestTunnel {
             conn,
             probe,
             pinger,
+            idle_rtt,
             kind,
             same_machine,
             loopback,
@@ -1358,7 +1443,11 @@ impl GuestTunnel {
     }
 
     pub fn rtt(&self) -> Duration {
-        self.pinger.rtt().unwrap_or_else(|| self.conn.rtt())
+        self.pinger.rtt().unwrap_or(self.idle_rtt)
+    }
+
+    pub fn idle_rtt(&self) -> Duration {
+        self.idle_rtt
     }
 
     pub fn describe(&self) -> &'static str {
@@ -1377,23 +1466,27 @@ impl Drop for GuestTunnel {
     }
 }
 
-async fn authenticate(conn: &Connection, token: [u8; 16]) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&token).await?;
+#[derive(Debug)]
+enum AuthError {
+    Refused,
+    Unavailable,
+}
+
+async fn authenticate(conn: &Connection, token: [u8; 16]) -> Result<(), AuthError> {
+    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        send.write_all(&token).await.ok()?;
+        let _ = send.finish();
         let mut ack = [0u8; 1];
-        match recv.read_exact(&mut ack).await {
-            Ok(()) if ack[0] == 1 => Ok(()),
-            _ => match conn.close_reason() {
-                Some(quinn::ConnectionError::ApplicationClosed(close)) if close.error_code == VarInt::from_u32(3) => {
-                    bail!("denied")
-                }
-                _ => bail!("no ack"),
-            },
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("timeout"))?
+        recv.read_exact(&mut ack).await.ok()?;
+        Some(ack[0])
+    }).await;
+    match reply {
+        Ok(Some(1)) => Ok(()),
+        _ if matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == VarInt::from_u32(3)) => Err(AuthError::Refused),
+        _ => Err(AuthError::Unavailable),
+    }
 }
 
 fn failure_hint(reflexive: &Reflexive) -> String {

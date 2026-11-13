@@ -18,6 +18,75 @@ impl Drop for Timer {
     fn drop(&mut self) { unsafe { timeEndPeriod(1); } }
 }
 
+#[test]
+fn route_selection_compares_media_rtt() {
+    assert_eq!(unsafe { timeBeginPeriod(1) }, 0);
+    let _timer = Timer;
+    runtime().unwrap().block_on(async {
+        let identity = Identity::generate("route QA").unwrap();
+        let config = client_config(identity.fingerprint()).unwrap();
+        let token = [42; 16];
+        let localhost = SocketAddr::from((HOST_LOOPBACK, 0));
+        let server = Endpoint::server(server_config(&identity).unwrap(), localhost).unwrap();
+        let upstream = server.local_addr().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let links = Arc::new(Mutex::new(Vec::new()));
+        tasks.spawn(accept(server.clone(), token, links, Arc::new(ProbeGate::default())));
+
+        let mut candidates = Vec::new();
+        for (kind, propagation, startup_delay) in [
+            (PathKind::Forwarded, Duration::from_millis(9), Duration::ZERO),
+            (PathKind::Public, Duration::from_millis(4), Duration::from_millis(180)),
+        ] {
+            let proxy = Arc::new(UdpSocket::bind(localhost).await.unwrap());
+            let SocketAddr::V4(addr) = proxy.local_addr().unwrap() else { unreachable!() };
+            candidates.push(Candidate { kind, addr });
+            tasks.spawn(async move {
+                let mut ready_at = None;
+                let mut guest = None;
+                let mut buffer = [0; 4096];
+                let mut deliveries = tokio::task::JoinSet::new();
+                loop {
+                    let (len, from) = proxy.recv_from(&mut buffer).await.unwrap();
+                    let to = if from == upstream {
+                        let Some(guest) = guest else { continue };
+                        guest
+                    } else {
+                        guest = Some(from);
+                        upstream
+                    };
+                    let now = tokio::time::Instant::now();
+                    let ready_at = *ready_at.get_or_insert(now + startup_delay);
+                    let due = now.max(ready_at) + propagation;
+                    let data = buffer[..len].to_vec();
+                    let socket = proxy.clone();
+                    deliveries.spawn(async move {
+                        tokio::time::sleep_until(due).await;
+                        let _ = socket.send_to(&data, to).await;
+                    });
+                    while deliveries.try_join_next().is_some() {}
+                }
+            });
+        }
+        let client = Endpoint::client(localhost).unwrap();
+        let reflexive = Reflexive::default();
+        let first = client.connect_with(config.clone(), candidates[0].addr.into(), "duolink")
+            .unwrap().await.unwrap();
+        authenticate(&first, token).await.unwrap();
+        let (echoes, slow_rtt) = measure_route(&first).await;
+        assert_eq!(echoes, ROUTE_PINGS);
+        first.close(VarInt::from_u32(0), b"sampled");
+
+        let winner = choose_route(&client, config, token, &candidates, &reflexive, || Ok(()))
+            .await.unwrap();
+        assert_eq!(winner.kind, PathKind::Public);
+        assert_eq!(winner.echo_count, ROUTE_PINGS);
+        assert!(winner.rtt + Duration::from_millis(5) < slow_rtt);
+        eprintln!("first path {:.2} ms RTT, selected {:.2} ms RTT",
+            slow_rtt.as_secs_f64() * 1_000.0, winner.rtt.as_secs_f64() * 1_000.0);
+    });
+}
+
 #[derive(Default)]
 struct Samples {
     packets: Vec<f64>,

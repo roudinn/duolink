@@ -533,11 +533,9 @@ impl Preferences {
         })
     }
 
-    /// Stream mode: explicit values win; otherwise the host's desktop, scaled
-    /// down (keeping its aspect) when the guest screen is smaller. Pixels the
-    /// guest cannot show only cost encode, network and decode time.
-    pub fn mode(self, host: Mode, guest: Option<Mode>) -> Mode {
-        let (width, height) = self.resolution.unwrap_or_else(|| fit(host, guest));
+    /// Each automatic setting follows the host's stream mode.
+    pub fn mode(self, host: Mode) -> Mode {
+        let (width, height) = self.resolution.unwrap_or((host.width, host.height));
         Mode {
             width,
             height,
@@ -571,19 +569,6 @@ impl Preferences {
         let bitrate = ceiling.min(path_limit).min(lobby_limit);
         (bitrate, bitrate < ceiling && (path_kbps.is_some() || bitrate < path_limit))
     }
-}
-
-fn fit(host: Mode, guest: Option<Mode>) -> (u32, u32) {
-    let Some(guest) = guest.filter(|g| g.width > 0 && g.height > 0) else {
-        return (host.width, host.height);
-    };
-    let scale = (guest.width as f64 / host.width as f64)
-        .min(guest.height as f64 / host.height as f64);
-    if scale >= 1.0 {
-        return (host.width, host.height);
-    }
-    let even = |value: f64| ((value / 2.0).round() as u32 * 2).max(2);
-    (even(host.width as f64 * scale), even(host.height as f64 * scale))
 }
 
 /// Moonlight's default bitrate table, extrapolated linearly above 4K.
@@ -779,15 +764,10 @@ mod tests {
             height: 1080,
             fps: 144,
         };
-        assert_eq!(Preferences::parse(&form("", "", "", "")).unwrap().mode(mode, None), mode);
-        let auto = Preferences::default();
-        let small = Mode { width: 1280, height: 800, fps: 60 };
-        assert_eq!(auto.mode(mode, Some(small)), Mode { width: 1280, height: 720, fps: 144 });
-        let big = Mode { width: 3840, height: 2160, fps: 60 };
-        assert_eq!(auto.mode(mode, Some(big)), mode);
+        assert_eq!(Preferences::parse(&form("", "", "", "")).unwrap().mode(mode), mode);
         let custom = Preferences::parse(&form("7680", "4320", "240", "85")).unwrap();
         assert_eq!(
-            custom.mode(mode, Some(Mode { width: 1280, height: 720, fps: 60 })),
+            custom.mode(mode),
             Mode {
                 width: 7680,
                 height: 4320,
@@ -865,7 +845,7 @@ mod tests {
     fn auto_bitrate_saturates_for_large_custom_modes() {
         let preferences = Preferences::parse(&form("2000000000", "2000000000", "1000", "")).unwrap();
         let host = Mode { width: 1920, height: 1080, fps: 60 };
-        let mode = preferences.mode(host, None);
+        let mode = preferences.mode(host);
         assert_eq!(mode.fps, 1000);
         assert_eq!(preferences.bitrate_for(mode), MAX_BITRATE_KBPS);
     }
@@ -897,6 +877,22 @@ mod tests {
         assert!(config.contains("amd_usage = ultralowlatency"));
         assert!(config.contains("packetsize = 1024"));
         assert!(config.contains("bind_address = 127.0.0.1"));
+    }
+
+    #[test]
+    fn automatic_host_mode_reaches_moonlight_with_a_smaller_desktop() {
+        let host = Mode { width: 3840, height: 2160, fps: 240 };
+        let desktop = Mode { width: 1920, height: 1080, fps: 60 };
+        let preferences = Preferences::default();
+        let mode = preferences.mode(host);
+        let args = guest_args(false, mode, display_refresh_would_drop(desktop, mode.fps), preferences);
+        assert_eq!(mode, host);
+        assert!(args.windows(2).any(|pair| pair == ["--resolution", "3840x2160"]));
+        assert!(args.windows(2).any(|pair| pair == ["--fps", "240"]));
+        assert_eq!(Preferences::parse(&form("", "", "120", "")).unwrap().mode(host),
+            Mode { fps: 120, ..host });
+        assert_eq!(Preferences::parse(&form("1920", "1080", "", "")).unwrap().mode(host),
+            Mode { width: 1920, height: 1080, ..host });
     }
 
     #[test]

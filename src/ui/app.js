@@ -136,9 +136,11 @@ function renderPing(id, pane) {
   if (!on) return;
   const value = ms < 10 ? ms.toFixed(1) : String(Math.round(ms));
   const el = $(id);
-  if (el.dataset.value !== value) {
-    el.dataset.value = value;
-    el.replaceChildren(value, Object.assign(document.createElement("small"), { textContent: tr("мс") }));
+  const unit = tr("мс");
+  const key = value + unit;
+  if (el.dataset.value !== key) {
+    el.dataset.value = key;
+    el.replaceChildren(value, Object.assign(document.createElement("small"), { textContent: unit }));
   }
 }
 
@@ -228,6 +230,8 @@ function renderPlayers(players) {
     const label = player.state === "waiting" ? tr("Хочет играть")
       : player.state === "starting" ? tr("Открывает игру…") : ping;
     if (entry.note.textContent !== label) entry.note.textContent = label;
+    const title = player.state === "playing" && ping ? tr("Сетевой пинг (туда и обратно)") : "";
+    if (entry.note.title !== title) entry.note.title = title;
   }
 }
 

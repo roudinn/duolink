@@ -192,11 +192,15 @@ fn reachability(tunnel: &HostTunnel) -> &'static str {
 }
 
 fn connection_fact(label: &str, rtt: Duration) -> String {
+    format!("{label} · {}", rtt_ms(rtt))
+}
+
+fn rtt_ms(rtt: Duration) -> String {
     let ms = rtt.as_secs_f64() * 1000.0;
     if ms < 10.0 {
-        format!("{label} · {ms:.1} мс")
+        format!("{ms:.1} мс")
     } else {
-        format!("{label} · {ms:.0} мс")
+        format!("{ms:.0} мс")
     }
 }
 
@@ -920,6 +924,7 @@ fn guest(
         worker.check()
     })?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
+    worker.fact("Пинг до трансляции", rtt_ms(tunnel.idle_rtt()));
     let _wifi = quiet_wifi(worker);
     worker.status("Ждём хост…");
     let loopback = tunnel.loopback;
@@ -1058,7 +1063,7 @@ fn guest(
                 client: Some(client),
             }) if launch.is_none() && valid_pem(&certificate) && valid_pem(&client.certificate) => {
                 let desktop = display_mode().ok();
-                let mode = preferences.mode(mode, desktop);
+                let mode = preferences.mode(mode);
                 ensure!(
                     mode.width > 0 && mode.height > 0 && mode.fps > 0,
                     "Хост прислал неверные данные."
@@ -1313,7 +1318,15 @@ mod tests {
         );
         let data = data_dir().unwrap();
         let address = Ipv4Addr::LOCALHOST;
-        let initial_refresh = display_mode().unwrap().fps;
+        let host_mode = display_mode().unwrap();
+        let initial_refresh = host_mode.fps;
+        let auto_mode = std::env::var_os("DUOLINK_TEST_HOST_MODE").is_some();
+        let expected = if auto_mode {
+            Mode { fps: display_max_refresh(host_mode, |_| true).unwrap_or(initial_refresh), ..host_mode }
+        } else {
+            let fps = std::env::var("DUOLINK_TEST_FPS").unwrap_or_else(|_| "144".into());
+            Mode { width: 1920, height: 1080, fps: fps.parse().unwrap() }
+        };
         let host = Session::host(data.clone());
         let code = until(&host, Duration::from_secs(200), |event| match event {
             Event::Invite(code) => Some(code),
@@ -1336,17 +1349,14 @@ mod tests {
         assert!(result.contains("отклонил"), "{result}");
         assert!(host.events.try_recv().is_err());
         let invite = Invite::decode(&code).unwrap();
-        let fps = std::env::var("DUOLINK_TEST_FPS").unwrap_or_else(|_| "144".into());
-        let expected_mode = format!("mode=1920x1080x{fps}");
-        let prefs = Preferences::parse(&crate::media::Form {
-            width: "1920".into(),
-            height: "1080".into(),
-            fps,
-            bitrate: "30".into(),
+        let expected_mode = format!("mode={}x{}x{}", expected.width, expected.height, expected.fps);
+        let prefs = Preferences {
+            resolution: (!auto_mode).then_some((expected.width, expected.height)),
+            fps: (!auto_mode).then_some(expected.fps),
+            bitrate: Some(30_000),
             stats: true,
             ..Default::default()
-        })
-        .unwrap();
+        };
         let restart_test = std::env::var_os("DUOLINK_TEST_BITRATE_RESTART").is_some();
         let first_prefs = if restart_test { Preferences { bitrate: None, ..prefs } } else { prefs };
         let guest = Session::guest(data.clone(), invite, first_prefs, "Тест".into());
@@ -1370,6 +1380,18 @@ mod tests {
                     log.contains(&expected_mode),
                     "the requested stream mode was not forwarded"
                 );
+                if auto_mode {
+                    let log = std::fs::read_to_string(data.join("logs/host.log")).unwrap();
+                    let capture_size = format!("{}x{}", expected.width, expected.height);
+                    let capture_fps = format!("Requested frame rate [{}fps]", expected.fps);
+                    let (_, live) = log.split_once("CLIENT CONNECTED").unwrap();
+                    assert!(live.lines().any(|line| {
+                        line.strip_prefix("Capture size").and_then(|line| line.split_once(':'))
+                            .is_some_and(|(_, size)| size.trim() == capture_size)
+                    }), "Sunshine did not capture {capture_size}");
+                    assert!(live.contains(&capture_fps), "Sunshine did not request {} FPS", expected.fps);
+                    eprintln!("automatic mode confirmed by both engines: {expected_mode}");
+                }
                 break;
             }
             assert!(

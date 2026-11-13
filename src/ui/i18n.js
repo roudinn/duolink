@@ -229,6 +229,8 @@ const EN = Object.freeze({
   "Нет драйвера": "Driver missing",
   "Гость": "Guest",
   "Соединение": "Connection",
+  "Сетевой пинг (туда и обратно)": "Network round-trip time",
+  "Пинг до трансляции": "Ping before streaming",
   "Этот ПК": "This PC",
   "Локальная сеть": "Local network",
   "Интернет": "Internet",
