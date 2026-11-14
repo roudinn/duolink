@@ -387,6 +387,17 @@ pub fn announce(name: &str, public: &[u8; 32]) -> Result<()> {
     post(&directory_topic(name, tag(public)), &URL_SAFE_NO_PAD.encode(public))
 }
 
+/// The directory commits a successful POST before replying.
+pub fn publish_nickname(name: &str, public: &[u8; 32]) -> Result<()> {
+    let topic = directory_topic(name, tag(public));
+    let envelope = URL_SAFE_NO_PAD.encode(public);
+    match infra::post(&topic, &envelope, "5").unwrap_or(0) {
+        200..=299 => Ok(()),
+        429 => bail!("Лимит отправки. Попробуйте позже."),
+        _ => bail!("Не удалось опубликовать ник. Проверьте связь и повторите."),
+    }
+}
+
 /// Finds the public key behind `name#tag`.
 pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
     let topic = directory_topic(name, wanted);
@@ -613,7 +624,7 @@ mod tests {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let alice_inbox = Inbox::listen(&alice.public, now(), wake.clone());
         let bob_inbox = Inbox::listen(&bob.public, now(), wake);
-        announce(&alice.name, &alice.public).unwrap();
+        publish_nickname(&alice.name, &alice.public).unwrap();
 
         let (name, number) = parse_handle(&alice.handle()).unwrap();
         let started = std::time::Instant::now();

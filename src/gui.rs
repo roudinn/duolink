@@ -346,6 +346,7 @@ impl Pane {
 enum Job {
     Network(crate::tunnel::Mapping),
     Announced { name: String, published: bool },
+    NickPublished { name: String, result: Result<()> },
     Lookup { query: String, result: Result<[u8; 32]> },
     FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
     FriendAccepted { key: [u8; 32], result: Result<()> },
@@ -369,6 +370,7 @@ struct App {
     invitations: Vec<Invitation>,
     host_for: Vec<HostFor>,
     looking_up: bool,
+    saving_nick: bool,
     #[serde(skip)]
     identity: Me,
     #[serde(skip)]
@@ -426,6 +428,7 @@ impl App {
             invitations: Vec::new(),
             host_for: Vec::new(),
             looking_up: false,
+            saving_nick: false,
             mail_history: MailHistory::load(&data),
             sending_requests: HashSet::new(),
             identity,
@@ -748,22 +751,18 @@ impl App {
                 let _ = fs::create_dir_all(&directory);
                 open_or_toast(view, directory.as_os_str())?;
             }
-            Action::SetName { name } if !self.identity.chosen || self.identity.name != name.trim() => {
-                let first = !self.identity.chosen;
-                match self.identity.rename(&name) {
-                    Ok(()) => {
-                        self.next_announce = Some(Instant::now());
-                        if first {
-                            self.listen();
-                        } else {
-                            for friend in self.book.entries.iter().filter(|f| f.status != Status::Incoming) {
-                                if let Some(key) = friend.public() {
-                                    self.tell(&key, &Message::Rename { name: self.identity.name.clone() });
-                                }
-                            }
-                        }
-                        self.sync();
-                        toast(view, "Ник сохранён.")?;
+            Action::SetName { name } if !self.saving_nick => {
+                match friends::valid_nickname(&name) {
+                    Ok(name) => {
+                        self.saving_nick = true;
+                        let key = self.identity.public;
+                        let sender = self.jobs.0.clone();
+                        let wake = self.wake.clone();
+                        thread::spawn(move || {
+                            let result = friends::publish_nickname(&name, &key);
+                            let _ = sender.send(Job::NickPublished { name, result });
+                            wake();
+                        });
                     }
                     Err(error) => toast(view, &error.to_string())?,
                 }
@@ -968,7 +967,7 @@ impl App {
             match job {
                 Job::Network(mapping) => self.network = Some(mapping.label()),
                 Job::Announced { name, published } => {
-                    if name == self.identity.name {
+                    if name == self.identity.name && self.next_announce.is_none() {
                         let delay = if published { DIRECTORY_REFRESH } else { DIRECTORY_RETRY };
                         self.next_announce = Some(Instant::now() + delay);
                     }
@@ -984,6 +983,28 @@ impl App {
                             let _ = toast(view, &error.to_string());
                         }
                     }
+                }
+                Job::NickPublished { name, result } => {
+                    self.saving_nick = false;
+                    let first = !self.identity.chosen;
+                    let renamed = self.identity.name != name;
+                    let message = match result.and_then(|()| self.identity.rename(&name)) {
+                        Ok(()) => {
+                            self.next_announce = Some(Instant::now() + DIRECTORY_REFRESH);
+                            if first {
+                                self.listen();
+                            } else if renamed {
+                                for friend in self.book.entries.iter().filter(|f| f.status != Status::Incoming) {
+                                    if let Some(key) = friend.public() {
+                                        self.tell(&key, &Message::Rename { name: name.clone() });
+                                    }
+                                }
+                            }
+                            "Ник сохранён.".into()
+                        }
+                        Err(error) => error.to_string(),
+                    };
+                    let _ = toast(view, &message);
                 }
                 Job::FriendRequest { key, new, result } => {
                     self.sending_requests.remove(&key);

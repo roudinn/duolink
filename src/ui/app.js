@@ -345,6 +345,11 @@ function renderInvites(next) {
 }
 
 function renderFriends(next) {
+  for (const id of ["nick-form", "nick-settings"]) {
+    const button = $(id).querySelector("button[type=submit]");
+    button.disabled = next.savingNick;
+    button.textContent = tr(next.savingNick ? "Сохраняем…" : id === "nick-form" ? "Сохранить ник" : "Сохранить");
+  }
   text("me-name", next.me.name);
   text("me-tag", `#${next.me.tag}`);
   avatar($("me-avatar"), next.me.name);

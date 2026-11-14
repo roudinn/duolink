@@ -203,6 +203,8 @@ const EN = Object.freeze({
   "Не удалось отправить сообщение.": "Couldn't send the message.",
   "Нет связи.": "Couldn't reach the server.",
   "Ник не найден. Попросите друга открыть DuoLink или прислать код друга из настроек.": "Nickname not found. Ask your friend to open DuoLink or send their friend code from Settings.",
+  "Не удалось опубликовать ник. Проверьте связь и повторите.": "Couldn't publish the nickname. Check your connection and try again.",
+  "Сохраняем…": "Saving…",
   "Ник занят несколькими людьми. Попросите код друга.": "Several people share that nickname and tag. Ask for a friend code.",
   "Приглашение истекло.": "The invite expired.",
   "Отправляем приглашение…": "Sending invite…",
