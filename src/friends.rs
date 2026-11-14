@@ -33,6 +33,7 @@ pub const INVITE_LIFETIME: u64 = 15 * 60;
 const MAIL_WINDOW: u64 = 12 * 3600;
 /// Refresh the directory entry periodically while DuoLink runs.
 pub const DIRECTORY_REFRESH: Duration = Duration::from_secs(4 * 3600);
+pub const DIRECTORY_RETRY: Duration = Duration::from_secs(30);
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -381,9 +382,9 @@ pub fn deliver(envelope: &str, to: &[u8; 32]) -> Result<()> {
     post(&inbox_topic(to), envelope)
 }
 
-/// Lists us in the directory under `name#tag`.
-pub fn announce(me: &Me) {
-    post_background(directory_topic(&me.name, tag(&me.public)), URL_SAFE_NO_PAD.encode(me.public));
+/// Lists us in the directory under `name#tag`. Call off the UI thread.
+pub fn announce(name: &str, public: &[u8; 32]) -> Result<()> {
+    post(&directory_topic(name, tag(public)), &URL_SAFE_NO_PAD.encode(public))
 }
 
 /// Finds the public key behind `name#tag`.
@@ -399,7 +400,7 @@ pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
         .collect();
     match keys.len() {
         1 => Ok(keys.into_iter().next().unwrap()),
-        0 => bail!("Не найдено. Проверьте ник и тег."),
+        0 => bail!("Ник не найден. Попросите друга открыть DuoLink или прислать код друга из настроек."),
         _ => bail!("Ник занят несколькими людьми. Попросите код друга."),
     }
 }
@@ -612,8 +613,7 @@ mod tests {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let alice_inbox = Inbox::listen(&alice.public, now(), wake.clone());
         let bob_inbox = Inbox::listen(&bob.public, now(), wake);
-        announce(&alice);
-        thread::sleep(Duration::from_secs(3));
+        announce(&alice.name, &alice.public).unwrap();
 
         let (name, number) = parse_handle(&alice.handle()).unwrap();
         let started = std::time::Instant::now();

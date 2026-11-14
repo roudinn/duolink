@@ -28,7 +28,7 @@ use wry::{
 
 use crate::{
     friends::{
-        self, Book, DIRECTORY_REFRESH, INVITE_LIFETIME, Inbox, Incoming, MailHistory, Me, Message,
+        self, Book, DIRECTORY_REFRESH, DIRECTORY_RETRY, INVITE_LIFETIME, Inbox, Incoming, MailHistory, Me, Message,
         Status,
     },
     media::{Form, Preferences},
@@ -345,6 +345,7 @@ impl Pane {
 /// Results of background work, delivered back to the UI thread.
 enum Job {
     Network(crate::tunnel::Mapping),
+    Announced { name: String, published: bool },
     Lookup { query: String, result: Result<[u8; 32]> },
     FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
     FriendAccepted { key: [u8; 32], result: Result<()> },
@@ -385,6 +386,8 @@ struct App {
     #[serde(skip)]
     attention: bool,
     #[serde(skip)]
+    next_announce: Option<Instant>,
+    #[serde(skip)]
     updater: Option<Updater>,
     #[serde(skip)]
     quit: bool,
@@ -408,6 +411,7 @@ impl App {
         let identity = Me::load_or_create(&data)?;
         let book = Book::load(&data);
         let presence = Presence::start();
+        let next_announce = identity.chosen.then(Instant::now);
         let mut app = Self {
             host: Pane::default(),
             guest: Pane::default(),
@@ -430,6 +434,7 @@ impl App {
             jobs: mpsc::channel(),
             wake,
             attention: false,
+            next_announce,
             updater,
             quit: false,
             presence,
@@ -441,7 +446,6 @@ impl App {
         };
         if app.identity.chosen {
             app.listen();
-            friends::announce(&app.identity);
         }
         let sender = app.jobs.0.clone();
         let wake = app.wake.clone();
@@ -459,6 +463,22 @@ impl App {
             self.mail_history.latest(),
             self.wake.clone(),
         ));
+    }
+
+    fn announce_if_due(&mut self, now: Instant) {
+        if !self.next_announce.is_some_and(|deadline| now >= deadline) {
+            return;
+        }
+        self.next_announce = None;
+        let name = self.identity.name.clone();
+        let key = self.identity.public;
+        let sender = self.jobs.0.clone();
+        let wake = self.wake.clone();
+        thread::spawn(move || {
+            let published = friends::announce(&name, &key).is_ok();
+            let _ = sender.send(Job::Announced { name, published });
+            wake();
+        });
     }
 
     /// Mirrors identity and friends into the serialized state.
@@ -732,7 +752,7 @@ impl App {
                 let first = !self.identity.chosen;
                 match self.identity.rename(&name) {
                     Ok(()) => {
-                        friends::announce(&self.identity);
+                        self.next_announce = Some(Instant::now());
                         if first {
                             self.listen();
                         } else {
@@ -947,6 +967,13 @@ impl App {
         for job in self.jobs.1.try_iter().collect::<Vec<_>>() {
             match job {
                 Job::Network(mapping) => self.network = Some(mapping.label()),
+                Job::Announced { name, published } => {
+                    if name == self.identity.name {
+                        let delay = if published { DIRECTORY_REFRESH } else { DIRECTORY_RETRY };
+                        self.next_announce = Some(Instant::now() + delay);
+                    }
+                    continue;
+                }
                 Job::Lookup { query, result } => {
                     self.looking_up = false;
                     match result {
@@ -1166,8 +1193,6 @@ pub fn run(hidden: bool) -> Result<()> {
     } else {
         window.set_visible(true);
     }
-    let mut next_announce = Instant::now() + DIRECTORY_REFRESH;
-
     event_loop.run(move |event, _, control| {
         match event {
             WindowEvent::UserEvent(Action::Show) => {
@@ -1201,13 +1226,7 @@ pub fn run(hidden: bool) -> Result<()> {
                     }
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
-                let now = Instant::now();
-                if now >= next_announce {
-                    if app.identity.chosen {
-                        friends::announce(&app.identity);
-                    }
-                    next_announce = now + DIRECTORY_REFRESH;
-                }
+                app.announce_if_due(Instant::now());
             }
             WindowEvent::WindowEvent { event: NativeEvent::Focused(focused), .. } => {
                 memory_level(&view, !focused);
@@ -1222,8 +1241,8 @@ pub fn run(hidden: bool) -> Result<()> {
         *control = if app.active() {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(80))
         } else {
-            let deadline = app.next_invite_expiry().map_or(next_announce, |expires| expires.min(next_announce));
-            ControlFlow::WaitUntil(deadline)
+            app.next_invite_expiry().into_iter().chain(app.next_announce).min()
+                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
         };
     });
 }
