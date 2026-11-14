@@ -272,11 +272,15 @@ function friendRow(friend, busy, invited) {
   const who = document.createElement("div");
   who.className = "who";
   const name = document.createElement("b");
-  name.textContent = friend.name;
+  name.className = "friend-handle";
+  name.title = `${friend.name}#${friend.tag}`;
+  const nick = document.createElement("span");
+  nick.className = "friend-name";
+  nick.textContent = friend.name;
   const tag = document.createElement("span");
   tag.className = "tag";
   tag.textContent = `#${friend.tag}`;
-  name.append(tag);
+  name.append(nick, tag);
   who.append(name);
   row.append(face, who);
 

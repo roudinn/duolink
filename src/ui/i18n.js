@@ -233,6 +233,8 @@ const EN = Object.freeze({
   "Публичный IPv4": "Public IPv4",
   "Внешний порт совпал": "Same public port",
   "Внешний порт меняется": "Public port changes",
+  "У вас публичный IPv4. Если подключение не удастся, создайте сессию у себя.": "You have a public IPv4 address. If the connection fails, try hosting.",
+  "У обоих меняется внешний порт. Проверяем прямое подключение…": "Both networks change their public port. Trying a direct connection…",
   "У вас публичный IPv4. Создайте сессию у себя и отправьте код другу.": "You have a public IPv4 address. Host the session and send your friend the code.",
   "У обоих внешний порт меняется. Прямое соединение не удалось. Включите UPnP на роутере хоста или смените хоста.": "Both networks change their public port. Direct connection failed. Enable UPnP on the host router or switch hosts.",
   "Внешний порт хоста меняется. Попробуйте создать сессию у себя или включить UPnP на роутере хоста.": "The host's public port changes. Try hosting the session or enabling UPnP on the host router.",

@@ -933,9 +933,10 @@ fn guest(
     let _timing = StreamingTiming::hold();
 
     worker.status("Ищем хост…");
-    let tunnel = GuestTunnel::connect(invite.token, invite.fingerprint, &invite.candidates, || {
-        worker.check()
-    })?;
+    let tunnel = GuestTunnel::connect(
+        invite.token, invite.fingerprint, &invite.candidates,
+        |hint| worker.status(hint), || worker.check(),
+    )?;
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     worker.fact("Пинг до трансляции", rtt_ms(tunnel.idle_rtt()));
     if !tunnel.same_machine && tunnel.mapping != Mapping::Unknown {

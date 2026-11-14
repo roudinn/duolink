@@ -16,10 +16,11 @@
 mod network_qa;
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket as StdUdpSocket},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, mpsc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -455,7 +456,9 @@ fn transport() -> Arc<TransportConfig> {
         .keep_alive_interval(Some(Duration::from_millis(500)))
         .initial_mtu(1200)
         .mtu_discovery_config(Some(discovery))
-        .datagram_receive_buffer_size(Some(4 << 20))
+        // Quinn's receive queue is separate from the 4 MiB Winsock buffer.
+        // Give it headroom when the receiver decodes or forwards a frame burst.
+        .datagram_receive_buffer_size(Some(16 << 20))
         // Keep Quinn's FIFO shallow. Media waiting for capacity is scheduled
         // by DatagramSender, which can put audio and input ahead of video.
         .datagram_send_buffer_size(192 << 10)
@@ -852,6 +855,7 @@ async fn serve_guest(
         });
     }
     let mut pings = PacketPool::new(false);
+    let mut video_batch = 0;
     while let Ok(datagram) = conn.read_datagram().await {
         if datagram.len() < 2 {
             continue;
@@ -871,7 +875,25 @@ async fn serve_guest(
         if let Some((socket, client)) = routes.get(&port) {
             let target = *client.lock().unwrap();
             if let Some(target) = target {
-                match socket.send_to(&datagram[2..], target).await {
+                let payload = &datagram[2..];
+                // Loopback video usually writes immediately. Keep draining the
+                // QUIC receive buffer across bursts while yielding periodically.
+                let result = if port == VIDEO_PORT {
+                    video_batch += 1;
+                    if video_batch == 64 {
+                        video_batch = 0;
+                        tokio::task::consume_budget().await;
+                    }
+                    match socket.try_send_to(payload, target) {
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            socket.send_to(payload, target).await
+                        }
+                        result => result,
+                    }
+                } else {
+                    socket.send_to(payload, target).await
+                };
+                match result {
                     Ok(_) => {
                         #[cfg(test)]
                         if port == VIDEO_PORT {
@@ -1426,13 +1448,19 @@ impl GuestTunnel {
         token: [u8; 16],
         fingerprint: [u8; 32],
         candidates: &[Candidate],
+        show_hint: impl Fn(&'static str),
         check: impl Fn() -> Result<()>,
     ) -> Result<Self> {
         ensure!(!candidates.is_empty(), "В коде приглашения нет адресов хоста.");
         let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         let port = socket.local_addr()?.port();
         let internet = candidates.iter().any(|candidate| candidate.kind != PathKind::Local);
-        let diagnosis = internet.then(|| thread::spawn(move || HostNetwork::read(token)));
+        let (diagnosed, diagnosis) = mpsc::channel();
+        if internet {
+            thread::spawn(move || {
+                let _ = diagnosed.send(HostNetwork::read(token));
+            });
+        }
         let reflexive = if internet { discover(&socket) } else { Reflexive::default() };
         let punching = Arc::new(AtomicBool::new(true));
         if internet {
@@ -1451,10 +1479,20 @@ impl GuestTunnel {
             Endpoint::new(endpoint_config(), None, socket, Arc::new(TokioRuntime))?
         };
         let config = client_config(fingerprint)?;
-        let route = runtime.block_on(choose_route(&endpoint, config, token, candidates, || {
-            let host = diagnosis.and_then(|task| task.join().ok().flatten());
-            failure_hint(reflexive.mapping, host)
-        }, check));
+        let host_network = Cell::new(None);
+        let check = || {
+            check()?;
+            if let Ok(Some(host)) = diagnosis.try_recv() {
+                host_network.set(Some(host));
+                if let Some(hint) = connecting_hint(reflexive.mapping, host) {
+                    show_hint(hint);
+                }
+            }
+            Ok(())
+        };
+        let route = runtime.block_on(choose_route(
+            &endpoint, config, token, candidates, || failure_hint(reflexive.mapping, host_network.get()), check,
+        ));
         punching.store(false, Ordering::Relaxed);
         let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = route?;
         ensure!(conn.max_datagram_size().is_some_and(|size| size >= crate::media::LEGACY_PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD),
@@ -1609,6 +1647,17 @@ async fn authenticate(conn: &Connection, token: [u8; 16]) -> Result<(), AuthErro
         _ if matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(close))
             if close.error_code == VarInt::from_u32(3)) => Err(AuthError::Refused),
         _ => Err(AuthError::Unavailable),
+    }
+}
+
+fn connecting_hint(guest: Mapping, host: HostNetwork) -> Option<&'static str> {
+    if host.forwarded || host.mapping != Mapping::ChangesWithDestination {
+        return None;
+    }
+    match guest {
+        Mapping::Public => Some("У вас публичный IPv4. Если подключение не удастся, создайте сессию у себя."),
+        Mapping::ChangesWithDestination => Some("У обоих меняется внешний порт. Проверяем прямое подключение…"),
+        _ => None,
     }
 }
 
@@ -1817,7 +1866,7 @@ mod tests {
             .filter(|c| c.addr.ip().is_loopback())
             .copied()
             .collect();
-        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, || Ok(())).unwrap();
+        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, |_| {}, || Ok(())).unwrap();
 
         let client = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1848,7 +1897,7 @@ mod tests {
         let token = [6u8; 16];
         let host = HostTunnel::open(&identity, token).unwrap();
         let loopback: Vec<Candidate> = host.candidates.iter().filter(|c| c.addr.ip().is_loopback()).copied().collect();
-        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, || Ok(())).unwrap();
+        let guest = GuestTunnel::connect(token, identity.fingerprint(), &loopback, |_| {}, || Ok(())).unwrap();
 
         sink.send_to(b"PING", (GUEST_LOOPBACK, VIDEO_PORT)).unwrap();
         let (count, target) = video.recv_from(&mut [0u8; 32]).unwrap();
@@ -1932,8 +1981,12 @@ mod tests {
         let strict_host = HostNetwork { mapping: Mapping::ChangesWithDestination, forwarded: false };
         assert!(failure_hint(Mapping::Public, Some(strict_host)).contains("публичный IPv4"));
         assert!(failure_hint(Mapping::ChangesWithDestination, Some(strict_host)).contains("У обоих"));
+        assert!(connecting_hint(Mapping::Public, strict_host).is_some());
+        assert!(connecting_hint(Mapping::ChangesWithDestination, strict_host).is_some());
         let forwarded = HostNetwork { forwarded: true, ..strict_host };
         assert!(failure_hint(Mapping::ChangesWithDestination, Some(forwarded)).contains("Хост не отвечает"));
+        assert!(connecting_hint(Mapping::ChangesWithDestination, forwarded).is_none());
+        assert!(connecting_hint(Mapping::Unknown, strict_host).is_none());
         assert!(!failure_hint(Mapping::ChangesWithDestination, None).contains("У обоих"));
     }
 

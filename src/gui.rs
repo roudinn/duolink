@@ -1133,7 +1133,7 @@ pub fn run(hidden: bool) -> Result<()> {
     let updater = Updater::start(wake.clone());
     let view = WebViewBuilder::new_with_web_context(&mut context)
         .with_additional_browser_args(BROWSER_ARGS)
-        .with_background_color((11, 11, 11, 255))
+        .with_background_color((11, 11, 12, 255))
         .with_theme(wry::Theme::Dark)
         .with_https_scheme(true)
         .with_default_context_menus(false)
