@@ -51,7 +51,10 @@
             <button type="button" class="btn primary" data-action="copy" aria-label="Скопировать код"><svg aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button>
           </div>
           <div id="players" class="group players" aria-label="Игроки" hidden></div>
-          <details id="host-details" hidden><summary>Подробности</summary><dl id="host-facts" class="facts"></dl></details>
+          <details id="host-details" hidden>
+            <summary>Подробности</summary>
+            <div class="details-body"><dl id="host-facts" class="facts"></dl></div>
+          </details>
           <button type="button" id="host-stop" class="btn block" data-action="host_stop">Завершить сессию</button>
         </div>
 
@@ -59,7 +62,10 @@
           <h1 id="guest-title" tabindex="-1"></h1>
           <p id="guest-ping" class="ping" title="Сетевой пинг (туда и обратно)" aria-live="off" hidden></p>
           <p id="guest-message" class="muted" role="status"></p>
-          <details id="guest-details" hidden><summary>Подробности</summary><dl id="guest-facts" class="facts"></dl></details>
+          <details id="guest-details" hidden>
+            <summary>Подробности</summary>
+            <div class="details-body"><dl id="guest-facts" class="facts"></dl></div>
+          </details>
           <p id="guest-keys" class="hint" hidden><kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>Q</kbd> — закрыть трансляцию</p>
           <button type="button" id="guest-stop" class="btn block" data-action="guest_stop">Отключиться</button>
         </div>

@@ -13,7 +13,9 @@ let state;
 let view = "play";
 let confirmRemove = null;
 let toastTimer;
+let pendingPlayState;
 const main = document.querySelector("main");
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 // Wide windows show the friends panel beside the main area at all times.
 const wideQuery = window.matchMedia("(min-width: 721px)");
 const wide = () => wideQuery.matches;
@@ -421,13 +423,46 @@ function render(next) {
   renderSettings(next);
 }
 
+function hostScreen(next) {
+  if (!next || next.guest.phase !== "idle") return null;
+  if (next.setup.phase !== "idle" || next.host.phase === "working") return "prepare";
+  return next.host.phase === "idle" ? "home" : "lobby";
+}
+
 function applyState(next) {
+  if (pendingPlayState) {
+    pendingPlayState = next;
+    return;
+  }
+  const before = hostScreen(state);
+  const after = hostScreen(next);
+  if (before && after && before !== after && !$("play").hidden && !settings.open
+      && !reduceMotion.matches && document.visibilityState === "visible" && document.startViewTransition) {
+    pendingPlayState = next;
+    const transition = document.startViewTransition(() => {
+      const latest = pendingPlayState;
+      pendingPlayState = null;
+      updateState(latest);
+    });
+    transition.ready.catch(() => {});
+    return;
+  }
+  updateState(next);
+}
+
+function updateState(next) {
   const prev = state;
+  const focused = document.activeElement;
   state = next;
   if (prev?.me.name !== next.me.name || prev?.me.chosen !== next.me.chosen) {
     $("nick-edit").value = next.me.chosen ? next.me.name : "";
   }
   render(next);
+  if (!settings.open && main.contains(focused) && focused.closest("[hidden]")) {
+    const id = next.setup.phase !== "idle" ? "setup-title" :
+      next.host.phase !== "idle" ? "host-title" : next.guest.phase !== "idle" ? "guest-title" : "host-start";
+    $(id).focus();
+  }
   if (prev?.guest.phase === "live" && next.guest.phase === "idle") guestCode.value = "";
   if (next.host.phase === "approval" && prev?.host.phase !== "approval") {
     go("play");
