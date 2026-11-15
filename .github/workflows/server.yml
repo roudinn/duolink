@@ -30,6 +30,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx libnginx-mod-stream
           bash server/tests/nginx-capacity.sh server/target/release/duolink-server
+      - name: Prepare checked Linux build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p deploy-artifact
+          install -m 0755 server/target/release/duolink-server deploy-artifact/duolink-server
+          install -m 0644 server/deploy/nginx.conf deploy-artifact/duolink.conf
+          cd deploy-artifact
+          sha256sum duolink-server duolink.conf > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: duolink-server-linux-x86_64
+          path: deploy-artifact/
+          if-no-files-found: error
   public-health:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
