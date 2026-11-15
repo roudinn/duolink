@@ -29,4 +29,6 @@ node server/tests/capacity.mjs server/target/release/duolink-server
 
 На Windows укажите путь к `duolink-server.exe`. GitHub Actions также прогоняет тест через nginx с TLS и TCP-прокси. Эти проверки измеряют нагрузку сигналинга. Видео, звук и ввод идут напрямую между компьютерами.
 
+Для проверки рабочего VPS извне запустите вручную workflow `DuoLink server` или выполните `node server/tests/public-status.mjs`. Проверка делает один HTTPS-запрос и запрашивает ответ STUN на обоих портах.
+
 [Зеркало](https://duolink.154.86.119.7.sslip.io/downloads/) отдаёт три закреплённых артефакта из `/srv/duolink/downloads`. При обновлении используйте [SHA256SUMS](deploy/SHA256SUMS), [страницу зеркала](deploy/downloads.html), оригинальные релизные бинарники и их лицензии. Драйвер Virtual HID Broker скачивается с сайта поставщика.

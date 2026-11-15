@@ -1,6 +1,7 @@
 name: DuoLink server
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "server/**"
@@ -15,6 +16,7 @@ permissions:
 
 jobs:
   capacity:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -28,3 +30,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx libnginx-mod-stream
           bash server/tests/nginx-capacity.sh server/target/release/duolink-server
+  public-health:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check public HTTPS and both STUN ports
+        run: node server/tests/public-status.mjs
