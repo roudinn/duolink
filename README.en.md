@@ -18,8 +18,11 @@
 
 | | **DuoLink** | Parsec | Steam Remote Play Together |
 | --- | --- | --- | --- |
-| First session | **Session code and host approval. Both players can join without an account.** | Each player needs a Parsec account | The host signs in to Steam and sends an invite |
-| Server for invitations | **You can [run your own server](docs/SELF_HOSTING.md#сервер-на-linux).** | Parsec signaling | Steam signaling |
+| Account for the first session | **Session code. Neither player needs an account** | Both players need Parsec accounts | Host signs in to Steam |
+| Resolution and FPS | **Match the host display or set them manually. No plan limits** | Configurable. Settings above 60 FPS are available | Stream quality settings in Steam |
+| 4:4:4 color | **Free on compatible hardware** | Warp subscription or higher | Valve does not list it for Remote Play Together |
+
+**1080p at 144 FPS** verified in a local streaming test. Actual frame rate depends on hardware and network conditions.
 
 **What you can play with DuoLink.** Games with local multiplayer and support for multiple controllers, whether they're from Steam, another store, or running in an emulator. The guest sees the host's game and plays with a separate controller.
 
