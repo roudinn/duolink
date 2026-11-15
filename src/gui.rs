@@ -1190,13 +1190,13 @@ fn asset(path: &str) -> Response<Cow<'static, [u8]>> {
         .unwrap()
 }
 
-/// Keep Discord sharing off until the user enables it in settings.
+/// Discord status is enabled by default. An explicit setting takes precedence.
 fn discord_pref(data: &Path) -> bool {
     fs::read(data.join("prefs.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| value["discord"].as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn save_discord_pref(data: &Path, on: bool) -> Result<()> {
