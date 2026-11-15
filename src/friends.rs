@@ -391,10 +391,10 @@ pub fn announce(name: &str, public: &[u8; 32]) -> Result<()> {
 pub fn publish_nickname(name: &str, public: &[u8; 32]) -> Result<()> {
     let topic = directory_topic(name, tag(public));
     let envelope = URL_SAFE_NO_PAD.encode(public);
-    match infra::post(&topic, &envelope, "5").unwrap_or(0) {
+    match infra::post(&topic, &envelope, "5")? {
         200..=299 => Ok(()),
-        429 => bail!("Лимит отправки. Попробуйте позже."),
-        _ => bail!("Не удалось опубликовать ник. Проверьте связь и повторите."),
+        0 => bail!("Connection or DNS lookup timed out"),
+        status => bail!("HTTP {status}"),
     }
 }
 
@@ -433,7 +433,7 @@ impl Inbox {
     /// `since`: latest mail time from the saved history.
     pub fn listen(me: &[u8; 32], since: u64, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (sender, messages) = mpsc::channel();
-        let subscription = Subscription::start(inbox_topic(me), since, MAIL_WINDOW, move |event| {
+        let subscription = Subscription::start(inbox_topic(me), since, move |event| {
             if sender.send(Incoming { time: event.time, text: event.message }).is_ok() {
                 wake();
             }
@@ -466,7 +466,9 @@ impl MailHistory {
 
     pub fn remember(&mut self, time: u64, text: &str) -> bool {
         // Keep IDs through the replay window and the maximum POST retry time.
-        let floor = now().saturating_sub(MAIL_WINDOW + 1);
+        // The server already limits the replay window. Use its timestamps
+        // here as well so an incorrect Windows clock doesn't hide requests.
+        let floor = self.latest().max(time).saturating_sub(MAIL_WINDOW + 1);
         self.received.retain(|_, at| *at >= floor.saturating_sub(60));
         self.cancelled_invites.retain(|_, at| *at >= floor);
         if time < floor || time <= self.legacy_through {
@@ -622,8 +624,8 @@ mod tests {
         let suffix = &hex(&rand::random::<[u8; 3]>())[..5];
         let (alice, bob) = (me(a.path(), &format!("alice{suffix}")), me(b.path(), &format!("bob{suffix}")));
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let alice_inbox = Inbox::listen(&alice.public, now(), wake.clone());
-        let bob_inbox = Inbox::listen(&bob.public, now(), wake);
+        let alice_inbox = Inbox::listen(&alice.public, 0, wake.clone());
+        let bob_inbox = Inbox::listen(&bob.public, 0, wake);
         publish_nickname(&alice.name, &alice.public).unwrap();
 
         let (name, number) = parse_handle(&alice.handle()).unwrap();

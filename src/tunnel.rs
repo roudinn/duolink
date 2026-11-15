@@ -1142,7 +1142,7 @@ impl HostTunnel {
         let signal = if reflexive.addr.is_some() {
             HostNetwork { mapping: reflexive.mapping, forwarded: mapping.is_some() }.publish(token);
             let active = alive.clone();
-            Some(Subscription::start(topic(&token, false), 0, 40, move |event| {
+            Some(Subscription::start(topic(&token, false), 0, move |event| {
                 if let Some(guest) = unseal(&token, &event.message) {
                     punch(&punch_socket, guest, Duration::from_secs(12), active.clone());
                 }

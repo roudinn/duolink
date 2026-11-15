@@ -347,9 +347,9 @@ enum Job {
     Network(crate::tunnel::Mapping),
     Announced { name: String, published: bool },
     NickPublished { name: String, result: Result<()> },
-    Lookup { query: String, result: Result<[u8; 32]> },
-    FriendRequest { key: [u8; 32], new: bool, result: Result<()> },
-    FriendAccepted { key: [u8; 32], result: Result<()> },
+    Lookup { name: String, input: String, result: Result<[u8; 32]> },
+    FriendRequest { key: [u8; 32], new: bool, input: String, result: Result<()> },
+    FriendAccepted { key: [u8; 32], input: Option<String>, result: Result<()> },
     InviteSent { key: [u8; 32], at: u64, result: Result<()> },
 }
 
@@ -371,6 +371,10 @@ struct App {
     host_for: Vec<HostFor>,
     looking_up: bool,
     saving_nick: bool,
+    #[serde(skip)]
+    pending_nickname: Option<String>,
+    #[serde(skip)]
+    retry_nickname_at: Option<Instant>,
     #[serde(skip)]
     identity: Me,
     #[serde(skip)]
@@ -429,6 +433,8 @@ impl App {
             host_for: Vec::new(),
             looking_up: false,
             saving_nick: false,
+            pending_nickname: None,
+            retry_nickname_at: None,
             mail_history: MailHistory::load(&data),
             sending_requests: HashSet::new(),
             identity,
@@ -482,6 +488,26 @@ impl App {
             let _ = sender.send(Job::Announced { name, published });
             wake();
         });
+    }
+
+    fn publish_nickname(&self, name: String) {
+        let key = self.identity.public;
+        let sender = self.jobs.0.clone();
+        let wake = self.wake.clone();
+        thread::spawn(move || {
+            let result = friends::publish_nickname(&name, &key);
+            let _ = sender.send(Job::NickPublished { name, result });
+            wake();
+        });
+    }
+
+    fn retry_nickname_if_due(&mut self, now: Instant) {
+        if self.retry_nickname_at.is_some_and(|deadline| now >= deadline) {
+            self.retry_nickname_at = None;
+            if let Some(name) = self.pending_nickname.clone() {
+                self.publish_nickname(name);
+            }
+        }
     }
 
     /// Mirrors identity and friends into the serialized state.
@@ -549,26 +575,29 @@ impl App {
         );
     }
 
-    fn accept_friend(&mut self, key: [u8; 32]) {
+    fn accept_friend(&mut self, key: [u8; 32], input: Option<String>) {
         if self.sending_requests.insert(key) {
             self.send(
                 key,
                 &Message::FriendAccept { name: self.identity.name.clone() },
-                move |result| Job::FriendAccepted { key, result },
+                move |result| Job::FriendAccepted { key, input, result },
             );
         }
     }
 
     /// Adds `key` as a friend, or completes a pending request.
-    fn befriend(&mut self, view: &WebView, key: [u8; 32], name: &str) -> Result<()> {
+    fn befriend(&mut self, view: &WebView, key: [u8; 32], name: &str, input: String) -> Result<()> {
         if key == self.identity.public {
             return toast(view, "Это вы.");
         }
         let handle = friends::handle(name, &key);
         match self.book.find(&key).map(|f| f.status.clone()) {
-            Some(Status::Friend) => toast(view, &format!("{handle} уже в друзьях."))?,
+            Some(Status::Friend) => {
+                toast(view, &format!("{handle} уже в друзьях."))?;
+                clear_friend_input(view, &input)?;
+            }
             Some(Status::Incoming) => {
-                self.accept_friend(key);
+                self.accept_friend(key, Some(input));
             }
             status => {
                 if !self.sending_requests.insert(key) {
@@ -579,12 +608,11 @@ impl App {
                 self.send(
                     key,
                     &Message::FriendRequest { name: self.identity.name.clone() },
-                    move |result| Job::FriendRequest { key, new, result },
+                    move |result| Job::FriendRequest { key, new, input, result },
                 );
                 toast(view, "Отправляем запрос…")?;
             }
         }
-        view.evaluate_script("window.duo.friendAdded();")?;
         self.sync();
         Ok(())
     }
@@ -755,14 +783,11 @@ impl App {
                 match friends::valid_nickname(&name) {
                     Ok(name) => {
                         self.saving_nick = true;
-                        let key = self.identity.public;
-                        let sender = self.jobs.0.clone();
-                        let wake = self.wake.clone();
-                        thread::spawn(move || {
-                            let result = friends::publish_nickname(&name, &key);
-                            let _ = sender.send(Job::NickPublished { name, result });
-                            wake();
-                        });
+                        if self.pending_nickname.as_ref() != Some(&name) || self.retry_nickname_at.is_some() {
+                            self.retry_nickname_at = None;
+                            self.pending_nickname = Some(name.clone());
+                            self.publish_nickname(name);
+                        }
                     }
                     Err(error) => toast(view, &error.to_string())?,
                 }
@@ -771,7 +796,7 @@ impl App {
                 let query = query.trim().to_string();
                 if query.starts_with("DLF-") {
                     match friends::parse_code(&query) {
-                        Ok((key, name)) => self.befriend(view, key, &name)?,
+                        Ok((key, name)) => self.befriend(view, key, &name, query)?,
                         Err(error) => toast(view, &error.to_string())?,
                     }
                 } else if !self.looking_up {
@@ -782,7 +807,7 @@ impl App {
                             let wake = self.wake.clone();
                             thread::spawn(move || {
                                 let result = friends::lookup(&name, number);
-                                let _ = sender.send(Job::Lookup { query: name, result });
+                                let _ = sender.send(Job::Lookup { name, input: query, result });
                                 wake();
                             });
                         }
@@ -792,7 +817,7 @@ impl App {
             }
             Action::AcceptFriend { id } if self.identity.chosen => {
                 if let Some((_, key)) = self.friend(&id).filter(|(f, _)| f.status == Status::Incoming) {
-                    self.accept_friend(key);
+                    self.accept_friend(key, None);
                     self.sync();
                 }
             }
@@ -973,11 +998,11 @@ impl App {
                     }
                     continue;
                 }
-                Job::Lookup { query, result } => {
+                Job::Lookup { name, input, result } => {
                     self.looking_up = false;
                     match result {
                         Ok(key) => {
-                            let _ = self.befriend(view, key, &query);
+                            let _ = self.befriend(view, key, &name, input);
                         }
                         Err(error) => {
                             let _ = toast(view, &error.to_string());
@@ -985,29 +1010,43 @@ impl App {
                     }
                 }
                 Job::NickPublished { name, result } => {
-                    self.saving_nick = false;
-                    let first = !self.identity.chosen;
-                    let renamed = self.identity.name != name;
-                    let message = match result.and_then(|()| self.identity.rename(&name)) {
-                        Ok(()) => {
-                            self.next_announce = Some(Instant::now() + DIRECTORY_REFRESH);
-                            if first {
-                                self.listen();
-                            } else if renamed {
-                                for friend in self.book.entries.iter().filter(|f| f.status != Status::Incoming) {
-                                    if let Some(key) = friend.public() {
-                                        self.tell(&key, &Message::Rename { name: name.clone() });
+                    if self.pending_nickname.as_ref() != Some(&name) {
+                        continue;
+                    }
+                    let requested = std::mem::take(&mut self.saving_nick);
+                    if let Err(error) = result {
+                        let logs = self.data.join("logs");
+                        let _ = fs::create_dir_all(&logs);
+                        let _ = fs::write(logs.join("friends.log"), format!("Nickname publication: {error:#}\n"));
+                        let delay = if requested { Duration::from_secs(2) } else { DIRECTORY_RETRY };
+                        self.retry_nickname_at = Some(Instant::now() + delay);
+                    } else {
+                        self.pending_nickname = None;
+                        self.retry_nickname_at = None;
+                        let first = !self.identity.chosen;
+                        let renamed = name != self.identity.name;
+                        match self.identity.rename(&name) {
+                            Ok(()) => {
+                                self.next_announce = Some(Instant::now() + DIRECTORY_REFRESH);
+                                if first {
+                                    self.listen();
+                                } else if renamed {
+                                    for friend in self.book.entries.iter().filter(|f| f.status != Status::Incoming) {
+                                        if let Some(key) = friend.public() {
+                                            self.tell(&key, &Message::Rename { name: name.clone() });
+                                        }
                                     }
                                 }
                             }
-                            "Ник сохранён.".into()
+                            Err(error) => { let _ = toast(view, &error.to_string()); }
                         }
-                        Err(error) => error.to_string(),
-                    };
-                    let _ = toast(view, &message);
+                    }
                 }
-                Job::FriendRequest { key, new, result } => {
+                Job::FriendRequest { key, new, input, result } => {
                     self.sending_requests.remove(&key);
+                    if result.is_ok() {
+                        let _ = clear_friend_input(view, &input);
+                    }
                     if self.book.find(&key).is_some_and(|entry| entry.status == Status::Outgoing) {
                         match result {
                             Ok(()) => { let _ = toast(view, "Запрос отправлен."); }
@@ -1020,8 +1059,11 @@ impl App {
                         }
                     }
                 }
-                Job::FriendAccepted { key, result } => {
+                Job::FriendAccepted { key, input, result } => {
                     self.sending_requests.remove(&key);
+                    if let (Ok(()), Some(input)) = (&result, input) {
+                        let _ = clear_friend_input(view, &input);
+                    }
                     if let Some(friend) = self.book.find(&key).filter(|entry| entry.status == Status::Incoming) {
                         match result {
                             Ok(()) => {
@@ -1089,6 +1131,11 @@ impl App {
             thread::sleep(Duration::from_millis(30));
         }
     }
+}
+
+fn clear_friend_input(view: &WebView, input: &str) -> Result<()> {
+    view.evaluate_script(&format!("window.duo.friendAdded({});", serde_json::to_string(input)?))?;
+    Ok(())
 }
 
 fn toast(view: &WebView, message: &str) -> Result<()> {
@@ -1248,6 +1295,7 @@ pub fn run(hidden: bool) -> Result<()> {
                     window.request_user_attention(Some(UserAttentionType::Critical));
                 }
                 app.announce_if_due(Instant::now());
+                app.retry_nickname_if_due(Instant::now());
             }
             WindowEvent::WindowEvent { event: NativeEvent::Focused(focused), .. } => {
                 memory_level(&view, !focused);
@@ -1262,7 +1310,7 @@ pub fn run(hidden: bool) -> Result<()> {
         *control = if app.active() {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(80))
         } else {
-            app.next_invite_expiry().into_iter().chain(app.next_announce).min()
+            app.next_invite_expiry().into_iter().chain(app.next_announce).chain(app.retry_nickname_at).min()
                 .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
         };
     });

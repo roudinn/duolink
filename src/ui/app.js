@@ -601,7 +601,10 @@ language.addEventListener("change", () => {
 window.duo = {
   applyState,
   toast,
-  friendAdded() { $("add-input").value = ""; },
+  friendAdded(input) {
+    const field = $("add-input");
+    if (field.value.trim() === input) field.value = "";
+  },
   pasted(code) {
     guestCode.value = code;
     guestCode.removeAttribute("aria-invalid");
