@@ -1034,6 +1034,7 @@ pub enum PeerNetwork {
 impl PeerNetwork {
     pub fn from_address(addr: SocketAddr) -> Self {
         match addr.ip() {
+            IpAddr::V4(ip) if ip == crate::relay::HOST_BRIDGE => Self::Internet,
             ip if is_self(ip) => Self::ThisPc,
             IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => Self::Lan,
             _ => Self::Internet,
@@ -1052,6 +1053,7 @@ impl PeerNetwork {
 /// Human-readable description of the path a connection took.
 pub fn describe(kind: PathKind, addr: SocketAddr) -> &'static str {
     match (kind, addr.ip()) {
+        (PathKind::Relay, _) => "Интернет · ретрансляция",
         (_, ip) if is_self(ip) => "Этот ПК",
         (PathKind::Local, IpAddr::V4(ip)) if ip.is_private() => "Локальная сеть",
         (PathKind::Local, _) => "Прямое",
@@ -1121,6 +1123,13 @@ impl HostTunnel {
         let links = Arc::new(Mutex::new(Vec::<Link>::new()));
         let probes = Arc::new(ProbeGate::default());
         runtime.spawn(accept(endpoint.clone(), token, links.clone(), probes.clone()));
+        if !cfg!(test) {
+            runtime.spawn(crate::relay::host(crate::infra::relay_url(), token, port));
+        }
+        #[cfg(test)]
+        if let Ok(url) = std::env::var("DUOLINK_TEST_SESSION_RELAY") {
+            runtime.spawn(crate::relay::host(url, token, port));
+        }
 
         let alive = Arc::new(AtomicBool::new(true));
         // Keep our NAT mapping (and so the reflexive candidate) open while we wait.
@@ -1360,6 +1369,17 @@ enum RouteAttempt {
     Unavailable,
 }
 
+#[derive(Debug)]
+struct InviteRefused;
+
+impl std::fmt::Display for InviteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Хост отклонил код: он устарел или уже использован.")
+    }
+}
+
+impl std::error::Error for InviteRefused {}
+
 async fn choose_route(
     endpoint: &Endpoint,
     config: ClientConfig,
@@ -1422,11 +1442,38 @@ async fn choose_route(
         .min_by_key(MeasuredRoute::rank)
         .ok_or_else(|| {
             if refused {
-                anyhow::anyhow!("Хост отклонил код: он устарел или уже использован.")
+                InviteRefused.into()
             } else {
                 anyhow::anyhow!(failure())
             }
         })
+}
+
+async fn connect_relay(
+    endpoint: &Endpoint,
+    config: ClientConfig,
+    token: [u8; 16],
+    port: u16,
+    url: &str,
+    check: impl Fn() -> Result<()>,
+) -> Result<MeasuredRoute> {
+    let bridge = crate::relay::guest(url, token, port);
+    tokio::pin!(bridge);
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    let (addr, bridge) = loop {
+        tokio::select! {
+            result = &mut bridge => break result.context("Резервное подключение недоступно.")?,
+            _ = poll.tick() => check()?,
+        }
+    };
+    let route = choose_route(
+        endpoint, config, token, &[Candidate { kind: PathKind::Relay, addr }],
+        || "Не удалось подключиться через ретрансляцию.".to_owned(), check,
+    ).await;
+    if route.is_err() {
+        bridge.abort();
+    }
+    route
 }
 
 pub struct GuestTunnel {
@@ -1450,6 +1497,20 @@ impl GuestTunnel {
         candidates: &[Candidate],
         show_hint: impl Fn(&'static str),
         check: impl Fn() -> Result<()>,
+    ) -> Result<Self> {
+        let url = crate::infra::relay_url();
+        #[cfg(test)]
+        let url = std::env::var("DUOLINK_TEST_SESSION_RELAY").unwrap_or(url);
+        Self::connect_at(token, fingerprint, candidates, show_hint, check, &url)
+    }
+
+    fn connect_at(
+        token: [u8; 16],
+        fingerprint: [u8; 32],
+        candidates: &[Candidate],
+        show_hint: impl Fn(&'static str),
+        check: impl Fn() -> Result<()>,
+        relay_url: &str,
     ) -> Result<Self> {
         ensure!(!candidates.is_empty(), "В коде приглашения нет адресов хоста.");
         let socket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
@@ -1491,10 +1552,18 @@ impl GuestTunnel {
             Ok(())
         };
         let route = runtime.block_on(choose_route(
-            &endpoint, config, token, candidates, || failure_hint(reflexive.mapping, host_network.get()), check,
+            &endpoint, config.clone(), token, candidates, || failure_hint(reflexive.mapping, host_network.get()), &check,
         ));
         punching.store(false, Ordering::Relaxed);
-        let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = route?;
+        let MeasuredRoute { kind, conn, rtt: idle_rtt, .. } = match route {
+            Ok(route) => route,
+            Err(error) if error.is::<InviteRefused>() => return Err(error),
+            Err(_) => {
+                check()?;
+                show_hint("Пробуем подключиться через ретрансляцию…");
+                runtime.block_on(connect_relay(&endpoint, config, token, port, relay_url, check))?
+            }
+        };
         ensure!(conn.max_datagram_size().is_some_and(|size| size >= crate::media::LEGACY_PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD),
             "Маршрут не пропускает видеопакеты DuoLink.");
 
@@ -1531,7 +1600,7 @@ impl GuestTunnel {
         let pinger = Pinger::new();
         runtime.spawn(serve_guest(conn.clone(), listeners, sockets, probe.clone(), pinger.clone()));
 
-        let same_machine = is_self(conn.remote_address().ip());
+        let same_machine = kind != PathKind::Relay && is_self(conn.remote_address().ip());
         Ok(Self {
             runtime: Some(runtime),
             endpoint,
@@ -1943,6 +2012,43 @@ mod tests {
         }
         drop(guest);
         drop(host);
+    }
+
+    #[test]
+    #[ignore = "requires a running relay specified by DUOLINK_TEST_RELAY"]
+    fn strict_nat_falls_back_to_relay() {
+        let url = std::env::var("DUOLINK_TEST_RELAY").unwrap();
+        let identity = Identity::generate("relay-test").unwrap();
+        let token = rand::random();
+        let host = HostTunnel::open(&identity, token).unwrap();
+        let host_port = host.endpoint.local_addr().unwrap().port();
+        host.runtime.as_ref().unwrap().spawn(crate::relay::host(url.clone(), token, host_port));
+
+        // Keep the only direct candidate bound without answering any UDP.
+        let blocked = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(addr) = blocked.local_addr().unwrap() else { unreachable!() };
+        let guest = GuestTunnel::connect_at(
+            token, identity.fingerprint(), &[Candidate { kind: PathKind::Local, addr }],
+            |_| {}, || Ok(()), &url,
+        ).unwrap();
+        assert_eq!(guest.kind, PathKind::Relay);
+        assert!(!guest.same_machine);
+        assert!(matches!(guest.network(), PeerNetwork::Internet));
+
+        let video = StdUdpSocket::bind((HOST_LOOPBACK, VIDEO_PORT)).unwrap();
+        let client = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        video.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let target = (guest.loopback, VIDEO_PORT);
+        client.send_to(b"input", target).unwrap();
+        let mut payload = [0u8; 1200];
+        let (len, peer) = video.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..len], b"input");
+
+        let frame = [7u8; crate::media::PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD - 2];
+        video.send_to(&frame, peer).unwrap();
+        let (len, _) = client.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..len], frame.as_slice());
     }
 
     #[test]

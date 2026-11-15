@@ -35,6 +35,8 @@ pub enum PathKind {
     Forwarded = 1,
     /// The host's public address as seen by STUN; needs NAT hole punching.
     Public = 2,
+    /// A local bridge to the relay. Never encoded in invitations.
+    Relay = 3,
 }
 
 impl PathKind {

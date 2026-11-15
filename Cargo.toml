@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.14.9"
+version = "1.15.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -28,6 +28,8 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Di
 windows-core = "0.62"
 webview2-com = "0.39"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
 igd-next = "0.16"
 ring = "0.17"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }

@@ -17,6 +17,10 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::platform::{run_tool, system_tool};
 
+pub(crate) fn relay_url() -> String {
+    format!("wss://{}/relay", ORIGIN.trim_start_matches("https://"))
+}
+
 const ORIGIN: &str = "https://duolink.154.86.119.7.sslip.io";
 const SIGNAL_ADDRESS: &str = "duolink.154.86.119.7.sslip.io:443:154.86.119.7";
 static USE_FIXED_ADDRESS: AtomicBool = AtomicBool::new(false);

@@ -51,7 +51,7 @@ Yes, as a spectator. XInput games can see up to four controllers, including the 
 <details>
 <summary>What if both networks have strict NAT?</summary>
 
-Try swapping the host or moving one PC to another network. If you can manage the router, check UPnP. A session needs a working direct route.
+Update DuoLink on both PCs. If a direct connection fails, DuoLink tries the relay. The fallback limits bitrate, and latency depends on the route to the server.
 
 </details>
 

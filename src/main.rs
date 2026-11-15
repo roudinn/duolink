@@ -10,6 +10,7 @@ mod media;
 mod platform;
 mod presence;
 mod protocol;
+mod relay;
 mod session;
 mod setup;
 mod tunnel;

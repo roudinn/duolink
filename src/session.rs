@@ -937,6 +937,11 @@ fn guest(
         invite.token, invite.fingerprint, &invite.candidates,
         |hint| worker.status(hint), || worker.check(),
     )?;
+    const RELAY_VIDEO_KBPS: u32 = 4_000;
+    let relayed = tunnel.kind == crate::protocol::PathKind::Relay;
+    if relayed {
+        preferences.bitrate = preferences.bitrate.map(|kbps| kbps.min(RELAY_VIDEO_KBPS));
+    }
     worker.fact("Соединение", connection_fact(tunnel.describe(), tunnel.rtt()));
     worker.fact("Пинг до трансляции", rtt_ms(tunnel.idle_rtt()));
     if !tunnel.same_machine && tunnel.mapping != Mapping::Unknown {
@@ -971,9 +976,17 @@ fn guest(
         bitrate_restart: true,
     })
     .context("Не удалось связаться с хостом.")?;
-    worker.status("Меряем канал…");
-    let channel = tunnel.measure(PROBE_MBPS, Duration::from_millis(700));
-    let path_kbps = channel.map(|c| (c.mbps * 1_000.0) as u32);
+    let channel = if relayed {
+        None
+    } else {
+        worker.status("Меряем канал…");
+        tunnel.measure(PROBE_MBPS, Duration::from_millis(700))
+    };
+    let path_kbps = if relayed {
+        Some((f64::from(RELAY_VIDEO_KBPS) / PATH_SHARE).ceil() as u32)
+    } else {
+        channel.map(|c| (c.mbps * 1_000.0) as u32)
+    };
     if let Some(channel) = channel {
         worker.fact(
             "Канал",
@@ -1386,7 +1399,13 @@ mod tests {
         );
         assert!(result.contains("отклонил"), "{result}");
         assert!(host.events.try_recv().is_err());
-        let invite = Invite::decode(&code).unwrap();
+        let mut invite = Invite::decode(&code).unwrap();
+        let relay_test = std::env::var_os("DUOLINK_TEST_SESSION_RELAY").is_some();
+        let blocked = relay_test.then(|| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+        if let Some(blocked) = &blocked {
+            let SocketAddr::V4(addr) = blocked.local_addr().unwrap() else { unreachable!() };
+            invite.candidates = vec![crate::protocol::Candidate { kind: crate::protocol::PathKind::Local, addr }];
+        }
         let expected_mode = format!("mode={}x{}x{}", expected.width, expected.height, expected.fps);
         let prefs = Preferences {
             resolution: (!auto_mode).then_some((expected.width, expected.height)),
@@ -1400,12 +1419,20 @@ mod tests {
         let guest = Session::guest(data.clone(), invite, first_prefs, "Тест".into());
         let first = waiting(&host);
         host.decide(first, true);
+        let mut relay_seen = false;
         for session in [&host, &guest] {
             until(session, Duration::from_secs(50), |event| match event {
+                Event::Fact("Соединение", value) => {
+                    relay_seen |= value.contains("ретрансляция");
+                    None
+                }
                 Event::Streaming => Some(String::new()),
                 Event::Finished { message: error, .. } => panic!("{error}"),
                 _ => None,
             });
+        }
+        if relay_test {
+            assert!(relay_seen, "guest did not use the relay");
         }
         let by = Instant::now() + Duration::from_secs(12);
         loop {
