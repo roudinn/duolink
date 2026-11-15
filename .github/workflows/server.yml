@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Build and test server
         run: |
-          cargo test --locked --manifest-path server/Cargo.toml
+          cargo test --release --locked --manifest-path server/Cargo.toml
           cargo build --release --locked --manifest-path server/Cargo.toml
       - name: Exercise 100 simultaneous users through nginx
         run: |

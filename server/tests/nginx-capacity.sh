@@ -3,9 +3,11 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 test_dir=$(mktemp -d)
+nginx_pid=
 cleanup() {
-    if [[ -f "$test_dir/nginx.pid" ]]; then
-        nginx -p "$test_dir/" -c "$test_dir/nginx.conf" -s stop
+    if [[ -n "$nginx_pid" ]]; then
+        kill "$nginx_pid" 2>/dev/null || true
+        wait "$nginx_pid" 2>/dev/null || true
     fi
     rm -rf -- "$test_dir"
 }
@@ -26,7 +28,7 @@ sed -e 's/listen 80;/listen 127.0.0.1:18080;/' \
 cat >"$test_dir/nginx.conf" <<EOF
 load_module /usr/lib/nginx/modules/ngx_stream_module.so;
 pid $test_dir/nginx.pid;
-error_log stderr info;
+error_log stderr warn;
 worker_processes 1;
 events { worker_connections 2048; }
 stream {
@@ -39,5 +41,6 @@ http { include $test_dir/duolink.conf; }
 EOF
 
 nginx -p "$test_dir/" -c "$test_dir/nginx.conf" -t
-nginx -p "$test_dir/" -c "$test_dir/nginx.conf"
+nginx -p "$test_dir/" -c "$test_dir/nginx.conf" -g 'daemon off;' &
+nginx_pid=$!
 DUOLINK_CAPACITY_CA="$test_dir/cert.pem" node "$root/server/tests/capacity.mjs" "$1"
