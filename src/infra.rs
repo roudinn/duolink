@@ -99,9 +99,9 @@ pub(crate) fn post(topic: &str, body: &str, timeout: &str) -> Result<u16> {
 }
 
 pub(crate) fn history(topic: &str, timeout: &str) -> Result<Vec<SignalEvent>> {
-    let output = with_signal_route(|fixed| {
+    let request = || with_signal_route(|fixed| {
         let output = signal_curl(fixed)?
-            .args(["--fail", "--max-time", timeout])
+            .args(["--fail", "--max-time", timeout, "--write-out", "\n%{http_code}"])
             .arg(format!("{}/json?poll=1&since=all", signal(topic)))
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -109,11 +109,25 @@ pub(crate) fn history(topic: &str, timeout: &str) -> Result<Vec<SignalEvent>> {
             .context("Нет связи.")?;
         let retry = connection_failed(output.status.code());
         Ok((output, retry))
-    })?;
+    });
+    let mut output = request()?;
+    let (_, status) = history_response(&output.stdout);
+    if matches!(status, b"429" | b"503") {
+        thread::sleep(Duration::from_millis(400 + u64::from(rand::random::<u8>())));
+        output = request()?;
+    }
     ensure!(output.status.success(), "Нет связи.");
-    Ok(String::from_utf8_lossy(&output.stdout).lines()
+    let (body, _) = history_response(&output.stdout);
+    Ok(String::from_utf8_lossy(body).lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect())
+}
+
+fn history_response(output: &[u8]) -> (&[u8], &[u8]) {
+    match output.iter().rposition(|&byte| byte == b'\n') {
+        Some(end) => (&output[..end], &output[end + 1..]),
+        None => (output, b""),
+    }
 }
 
 /// A reconnecting NDJSON subscription. Read the boundary second again after a
@@ -220,14 +234,20 @@ pub(crate) fn fetch(
     check: &impl Fn() -> Result<()>,
 ) -> Result<()> {
     let mirror = mirror.map(|name| format!("{ORIGIN}/downloads/{name}"));
-    for (url, timeout) in mirror.as_deref().into_iter().map(|url| (url, "4"))
-        .chain([(origin, "15")])
+    for (url, timeout, retry) in mirror.as_deref().into_iter().map(|url| (url, "4", false))
+        .chain([(origin, "15", false)])
+        .chain(mirror.as_deref().into_iter().map(|url| (url, "4", true)))
     {
         check()?;
         let _ = fs::remove_file(target);
         let _ = writeln!(&*log, "GET {url}");
+        let mut download = curl()?;
+        if retry {
+            // The mirror may be full and the official source unavailable.
+            download.args(["--retry", "6", "--retry-max-time", "90"]);
+        }
         let outcome = run_tool(
-            curl()?.args(["--fail", "--location", "--show-error", "--proto-redir", "=https",
+            download.args(["--fail", "--location", "--show-error", "--proto-redir", "=https",
                 "--connect-timeout", timeout, "--max-time", "180", "--output"])
                 .arg(target).arg(url)
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.try_clone()?),

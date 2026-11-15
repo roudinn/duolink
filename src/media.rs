@@ -10,12 +10,13 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::{
     infra,
-    platform::{Process, display_refresh_would_drop, run_tool, system_tool},
+    platform::{Process, ProcessLock, display_refresh_would_drop, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
 
@@ -94,6 +95,23 @@ impl Engine {
 
         let engines = data.join("engines");
         fs::create_dir_all(&engines)?;
+        let cache = engines.canonicalize()?.to_string_lossy().to_lowercase();
+        let key = Sha256::digest(format!("{cache}/{}", self.directory).as_bytes());
+        let lock_name = format!(r"Local\DuoLink.Engine.{key:x}");
+        // Startup prefetch and the first session share one download per engine.
+        let _install = loop {
+            check()?;
+            if executable.is_file() {
+                return Ok(executable);
+            }
+            if let Some(install) = ProcessLock::try_acquire(&lock_name)? {
+                if executable.is_file() {
+                    return Ok(executable);
+                }
+                break install;
+            }
+            std::thread::sleep(Duration::from_millis(125));
+        };
         let stage = Builder::new().prefix(".install-").tempdir_in(&engines)?;
         let zip = stage.path().join("engine.zip");
         let unpack = stage.path().join("bundle");
