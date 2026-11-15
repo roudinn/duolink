@@ -14,17 +14,15 @@
   <img src="docs/preview.en.png" width="1000" alt="DuoLink lobby with a guest and the join-by-code form">
 </div>
 
-## How DuoLink compares
+## How to invite a friend
 
-The host runs the game. The guest sees the screen, hears the game and plays with their own gamepad. The game sees the guest's gamepad as a separate controller.
+| App | First session | What you can play |
+| --- | --- | --- |
+| **DuoLink** | **Send a code and approve your friend. Both players can play without an account.** | **Local co-op and versus games on and off Steam**, including fighting games from other stores and emulators with controller support |
+| Parsec | Host and guest sign in to Parsec accounts, then connect | Apps and games on the host PC |
+| Steam Remote Play Together | The host signs in to Steam, starts the game and sends an invite | Games that support Remote Play Together |
 
-| | DuoLink | Parsec | Steam Remote Play Together |
-| --- | --- | --- | --- |
-| What you need to join | **Session code and host approval. Neither player needs an account.** | Parsec accounts for host and guest | Host starts the game in Steam and sends an invite |
-| What you can play | **Local multiplayer outside Steam**, including fighting games from other stores and emulators that support controllers | Applications on the host PC | Games that support Remote Play Together |
-| Video settings | AV1 or HEVC when supported by both PCs. Manual bitrate | HEVC when supported by both PCs. Adjustable bandwidth limit | Stream quality settings in Steam |
-
-DuoLink uses a built-in direct QUIC tunnel. You can play without setting up Radmin VPN or ZeroTier.
+The game runs on the host PC. The guest sees the screen, hears the game and plays with their own gamepad. It appears as a separate controller on the host.
 
 ## First session
 
