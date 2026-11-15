@@ -14,17 +14,9 @@
   <img src="docs/preview.en.png" width="1000" alt="DuoLink lobby with a guest and the join-by-code form">
 </div>
 
-## How to invite a friend
+## What you can play
 
-| | **DuoLink** | Parsec | Steam Remote Play Together |
-| --- | --- | --- | --- |
-| Account for the first session | **Session code. Neither player needs an account** | Both players need Parsec accounts | Host signs in to Steam |
-| Resolution and FPS | **Match the host display or set them manually. No plan limits** | Configurable. Settings above 60 FPS are available | Stream quality settings in Steam |
-| 4:4:4 color | **Free on compatible hardware** | Warp subscription or higher | Valve does not list it for Remote Play Together |
-
-**1080p at 144 FPS** verified in a local streaming test. Actual frame rate depends on hardware and network conditions.
-
-**What you can play with DuoLink.** Games with local multiplayer and support for multiple controllers, whether they're from Steam, another store, or running in an emulator. The guest sees the host's game and plays with a separate controller.
+You can play games with local multiplayer and support for multiple controllers, including games from Steam, other stores, and emulators. The guest sees the host's game and plays with a separate controller.
 
 ## First session
 
@@ -72,4 +64,4 @@ Open **Friends**, save a nickname and add your friend by their nickname and tag 
 
 ## Documentation
 
-[Architecture and networking](docs/ARCHITECTURE.md) · [Build and self-host](docs/SELF_HOSTING.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
+[Architecture and networking](docs/ARCHITECTURE.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
