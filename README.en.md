@@ -16,7 +16,7 @@
 
 ## What you can play
 
-You can play games with local multiplayer and support for multiple controllers, including games from Steam, other stores, and emulators. The guest sees the host's game and plays with a separate controller.
+Play local multiplayer games online with a friend, including split-screen games, fighting games, and emulators that support multiple controllers. DuoLink streams the host's game and audio, and the guest joins with a separate gamepad.
 
 ## First session
 
