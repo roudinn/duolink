@@ -1,0 +1,49 @@
+name: Ошибка DuoLink
+description: Проблема с запуском, подключением, видео, звуком или геймпадами.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Приложите относящиеся к сбою логи из `%LOCALAPPDATA%\DuoLink\logs`. Папку можно открыть из настроек DuoLink.
+        Перед публикацией удалите из логов личные данные, IP-адреса и коды активных сессий `DL2-`.
+  - type: input
+    id: duolink-version
+    attributes:
+      label: Версия DuoLink
+      description: Если версии у хоста и гостя различаются, укажите обе.
+      placeholder: "Например, 1.14.7 на обоих ПК"
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Версия Windows
+      description: Версию и номер сборки можно посмотреть командой winver. Для сетевого сбоя укажите данные обоих ПК.
+      placeholder: "Например, Windows 11 24H2, сборка 26100"
+    validations:
+      required: true
+  - type: dropdown
+    id: nat
+    attributes:
+      label: Тип NAT
+      description: Значение UDP в настройках DuoLink на ПК, где возникла проблема. Данные второго ПК можно указать в описании.
+      options:
+        - Публичный IPv4
+        - Внешний порт совпал
+        - Внешний порт меняется
+        - Не удалось определить
+        - Программа не открывается или NAT не проверен
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Что произошло
+      description: Опишите шаги, ожидаемый результат и то, что получилось. Для сбоя в игре укажите её название.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Журналы и скриншоты
+      description: Приложите файл журнала или нужный фрагмент без активных кодов и личных данных.
