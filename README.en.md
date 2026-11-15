@@ -18,7 +18,7 @@
 
 | App | First session | What you can play |
 | --- | --- | --- |
-| **DuoLink** | **Send a code and approve your friend. Both players can play without an account.** | **Local co-op and versus games on and off Steam**, including fighting games from other stores and emulators with controller support |
+| **DuoLink** | **Send a code and approve your friend. Both players can play without an account.** | **Games with local multiplayer and support for multiple controllers.** Run a game from any store or in an emulator. |
 | Parsec | Host and guest sign in to Parsec accounts, then connect | Apps and games on the host PC |
 | Steam Remote Play Together | The host signs in to Steam, starts the game and sends an invite | Games that support Remote Play Together |
 
