@@ -1,0 +1,30 @@
+name: DuoLink server
+
+on:
+  push:
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  capacity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build and test server
+        run: |
+          cargo test --locked --manifest-path server/Cargo.toml
+          cargo build --release --locked --manifest-path server/Cargo.toml
+      - name: Exercise 100 simultaneous users through nginx
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx libnginx-mod-stream
+          bash server/tests/nginx-capacity.sh server/target/release/duolink-server

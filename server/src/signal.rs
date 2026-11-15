@@ -20,12 +20,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, broadcast};
 
 const BODY_LIMIT: usize = 2048;
-// Each client also uses a pair of sockets in the VPS's shared nginx.
-const SUBSCRIBERS: usize = 128;
+// A user can have both a friend inbox and a lobby rendezvous subscription.
+const SUBSCRIBERS: usize = 208;
 const SESSION_TTL: i64 = 40;
 const MAIL_TTL: i64 = 12 * 3600;
 const DIRECTORY_TTL: i64 = 7 * 24 * 3600;
-const HTTP_WORK: usize = 32;
+const DB_QUEUE: usize = 256;
+const DB_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy)]
 enum Topic {
@@ -83,7 +84,8 @@ struct Inner {
     db: Mutex<Connection>,
     listeners: Mutex<HashMap<String, broadcast::Sender<Arc<Message>>>>,
     permits: Arc<Semaphore>,
-    requests: Arc<Semaphore>,
+    db_queue: Arc<Semaphore>,
+    db_worker: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -112,7 +114,8 @@ impl Signal {
             db: Mutex::new(db),
             listeners: Mutex::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(SUBSCRIBERS)),
-            requests: Arc::new(Semaphore::new(HTTP_WORK)),
+            db_queue: Arc::new(Semaphore::new(DB_QUEUE)),
+            db_worker: Arc::new(Semaphore::new(1)),
         })))
     }
 
@@ -135,12 +138,24 @@ impl Signal {
             .subscribe()
     }
 
-    async fn history(&self, topic: String, since: i64) -> Result<Vec<Message>> {
-        let request = self.0.requests.clone().try_acquire_owned()?;
+    async fn run_db<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Inner) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let slot = self.0.db_queue.clone().try_acquire_owned()?;
+        // Queue on Tokio, so workers never block waiting for the same connection.
+        let worker = tokio::time::timeout(DB_WAIT, self.0.db_worker.clone().acquire_owned()).await??;
         let signal = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _request = request;
-            let db = signal.0.db.lock().unwrap();
+            let (_slot, _worker) = (slot, worker);
+            operation(&signal.0)
+        })
+        .await?
+    }
+
+    async fn history(&self, topic: String, since: i64) -> Result<Vec<Message>> {
+        self.run_db(move |signal| {
+            let db = signal.db.lock().unwrap();
             let mut rows = db.prepare_cached(
                 "SELECT id, time, body FROM message
                  WHERE topic = ?1 AND time >= ?2 AND expires > ?3 ORDER BY id",
@@ -158,16 +173,13 @@ impl Signal {
                 .collect::<rusqlite::Result<_>>()?;
             Ok(messages)
         })
-        .await?
+        .await
     }
 
     async fn store(&self, kind: Topic, topic: String, body: String) -> Result<()> {
-        let request = self.0.requests.clone().try_acquire_owned()?;
-        let signal = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _request = request;
+        self.run_db(move |signal| {
             let (ttl, limit) = kind.retention();
-            let mut db = signal.0.db.lock().unwrap();
+            let mut db = signal.db.lock().unwrap();
             let transaction = db.transaction()?;
             let now = crate::unix_time();
             let expires = now + ttl;
@@ -195,30 +207,28 @@ impl Signal {
             }
             transaction.commit()?;
             if let Some(id) = id
-                && let Some(listener) = signal.0.listeners.lock().unwrap().get(&topic)
+                && let Some(listener) = signal.listeners.lock().unwrap().get(&topic)
             {
                 let _ = listener.send(Arc::new(Message { event: "message", id, topic, time: now, message: body }));
             }
             Ok(())
-        }).await?
+        }).await
     }
 
     pub async fn cleanup(&self) -> Result<()> {
-        let signal = self.clone();
-        tokio::task::spawn_blocking(move || {
-            signal.0.db.lock().unwrap().execute(
+        self.run_db(|signal| {
+            signal.db.lock().unwrap().execute(
                 "DELETE FROM message WHERE expires <= ?1",
                 [crate::unix_time()],
             )?;
             signal
-                .0
                 .listeners
                 .lock()
                 .unwrap()
                 .retain(|_, listener| listener.receiver_count() != 0);
             Ok(())
         })
-        .await?
+        .await
     }
 }
 
