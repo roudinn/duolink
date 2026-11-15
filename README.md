@@ -3,6 +3,7 @@
 <div align="center">
   <h1>DuoLink</h1>
   <p>Локальный кооператив и versus через интернет на Windows.</p>
+  <p><strong>Вход по коду без аккаунтов. Поддержка игр вне Steam.</strong></p>
   <p>
     <img alt="Windows 10 и 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>
@@ -13,18 +14,17 @@
   <img src="docs/preview.png" width="1000" alt="Лобби DuoLink с гостем и форма подключения по коду">
 </div>
 
-## Во что можно играть
+## Сравнение с Parsec и Steam
 
 Игра запущена у хоста. Гость видит экран, слышит звук и управляет своим персонажем с геймпада. Игра видит геймпад гостя как отдельный контроллер.
 
 | | DuoLink | Parsec | Steam Remote Play Together |
 | --- | --- | --- | --- |
-| Вход в сессию | Код и подтверждение хоста, без аккаунта | Аккаунты Parsec | Хост запускает игру в Steam и отправляет приглашение |
-| Игры | Локальный мультиплеер на ПК хоста, включая файтинги и эмуляторы с поддержкой контроллеров | Приложения на ПК хоста | Игры с поддержкой Remote Play Together |
-| Соединение | Встроенный прямой туннель по QUIC. Radmin VPN и ZeroTier не требуются | Подключение через Parsec | Подключение через Steam |
-| Видео | AV1 или HEVC, если их поддерживают оба ПК. Битрейт можно задать вручную | HEVC при поддержке на обоих ПК | Настройки качества в Steam |
+| Что нужно для входа | **Код сессии и подтверждение хоста. Регистрация не нужна ни одному игроку.** | Аккаунты Parsec у хоста и гостя | Хост запускает игру в Steam и отправляет приглашение |
+| Во что можно играть | **Локальный мультиплеер вне Steam**, включая файтинги из других магазинов и эмуляторы с поддержкой контроллеров | Приложения на ПК хоста | Игры с поддержкой Remote Play Together |
+| Настройки видео | AV1 или HEVC при поддержке на обоих ПК. Ручной битрейт | HEVC при поддержке на обоих ПК. Настраиваемый лимит битрейта | Настройки качества потока в Steam |
 
-[Документация Parsec](https://support.parsec.app/hc/en-us/articles/32381199341716-Parsec-App-for-Windows) · [Регистрация в Parsec](https://support.parsec.app/hc/en-us/articles/32361325090836-Sign-Up) · [Steam Remote Play](https://store.steampowered.com/remoteplay)
+DuoLink соединяет оба ПК через встроенный прямой туннель QUIC. Radmin VPN и ZeroTier не требуются.
 
 ## Первая игра
 
