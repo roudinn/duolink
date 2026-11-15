@@ -16,13 +16,12 @@
 
 ## How to invite a friend
 
-| App | First session | What you can play |
-| --- | --- | --- |
-| **DuoLink** | **Send a code and approve your friend. Both players can play without an account.** | Local multiplayer with controllers in games from different stores and in emulators |
-| Parsec | Host and guest sign in to Parsec accounts, then connect | Local multiplayer with controllers in games from different stores and in emulators |
-| Steam Remote Play Together | The host signs in to Steam, starts the game and sends an invite | Local multiplayer with controllers in Steam games that support Remote Play Together |
+| | **DuoLink** | Parsec | Steam Remote Play Together |
+| --- | --- | --- | --- |
+| First session | **Session code and host approval. Both players can join without an account.** | Each player needs a Parsec account | The host signs in to Steam and sends an invite |
+| Server for invitations | **You can [run your own server](docs/SELF_HOSTING.md#сервер-на-linux).** | Parsec signaling | Steam signaling |
 
-The game runs on the host PC. The guest sees the screen, hears the game and plays with their own gamepad. It appears as a separate controller on the host.
+**What you can play with DuoLink.** Games with local multiplayer and support for multiple controllers, whether they're from Steam, another store, or running in an emulator. The guest sees the host's game and plays with a separate controller.
 
 ## First session
 
