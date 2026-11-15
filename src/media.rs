@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     infra,
-    platform::{Process, ProcessLock, display_refresh_would_drop, run_tool, system_tool},
+    platform::{PrivateDir, Process, ProcessLock, display_refresh_would_drop, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
 
@@ -261,7 +261,7 @@ fn is_ascii_path(path: &Path) -> bool {
 /// a Windows user name with other than Latin letters (for example "Пользователь")
 /// that fails: it starts with no trusted guest and every guest is "not paired".
 /// For such paths the session files go to a Latin-only folder instead.
-fn session_folder(config: &Path) -> Result<(TempDir, String, String)> {
+fn session_folder(config: &Path) -> Result<(PrivateDir, String, String)> {
     if !is_ascii_path(config) {
         let roots = ["ProgramData", "PUBLIC", "SystemDrive"].into_iter().filter_map(|variable| {
             let base = std::env::var_os(variable).map(PathBuf::from)?;
@@ -272,8 +272,7 @@ fn session_folder(config: &Path) -> Result<(TempDir, String, String)> {
             if !is_ascii_path(&base) || fs::create_dir_all(&base).is_err() {
                 continue;
             }
-            sweep(&base);
-            if let Ok(directory) = Builder::new().prefix("duolink-").tempdir_in(&base) {
+            if let Ok(directory) = PrivateDir::new(&base) {
                 let full = directory.path().to_string_lossy().replace('\\', "/");
                 if full.is_ascii() {
                     let conf = format!("{full}/sunshine.conf");
@@ -283,7 +282,7 @@ fn session_folder(config: &Path) -> Result<(TempDir, String, String)> {
         }
     }
     sweep(config);
-    let directory = Builder::new().prefix("duolink-").tempdir_in(config)?;
+    let directory = PrivateDir::new(config)?;
     let rel = directory.path().file_name().unwrap().to_string_lossy().into_owned();
     let conf = format!("config/{rel}/sunshine.conf");
     Ok((directory, rel, conf))
@@ -291,7 +290,7 @@ fn session_folder(config: &Path) -> Result<(TempDir, String, String)> {
 
 pub struct HostStream {
     process: Process,
-    _directory: TempDir,
+    _directory: PrivateDir,
     output: PathBuf,
     offset: u64,
     tail: String,

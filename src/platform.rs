@@ -4,7 +4,7 @@ use std::{
     mem::{size_of, zeroed},
 
     os::windows::{ffi::OsStrExt, io::AsRawHandle, process::CommandExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
 };
 
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use windows_sys::{
     Win32::{
         Devices::DeviceAndDriverInstallation::CM_Get_Device_Interface_List_SizeW,
-        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree},
         Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW},
         System::{
             JobObjects::{
@@ -40,6 +40,88 @@ use windows_sys::{
 };
 
 use crate::protocol::Mode;
+
+/// Protects data for the current Windows account with DPAPI.
+pub fn user_protected_data(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len().try_into()?,
+        pbData: bytes.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        if encrypt {
+            CryptProtectData(&input, null(), null(), null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        } else {
+            CryptUnprotectData(&input, null_mut(), null(), null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        }
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if output.pbData.is_null() {
+        return Ok(Vec::new());
+    }
+    // Windows allocates the output buffer and transfers its ownership to the caller.
+    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+    unsafe { LocalFree(output.pbData.cast()) };
+    Ok(bytes)
+}
+
+/// The owner and SYSTEM have access, including on an otherwise shared parent.
+pub struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    pub fn new(base: &Path) -> Result<Self> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::{
+            Security::{
+                Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+                SECURITY_ATTRIBUTES,
+            },
+            Storage::FileSystem::CreateDirectoryW,
+        };
+
+        let path = base.join(format!("duolink-{}", uuid::Uuid::new_v4()));
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor = null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows_sys::core::w!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"),
+                SDDL_REVISION_1, &mut descriptor, null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let created = unsafe { CreateDirectoryW(name.as_ptr(), &attrs) };
+        let error = (created == 0).then(io::Error::last_os_error);
+        unsafe { LocalFree(descriptor) };
+        if let Some(error) = error {
+            return Err(error.into());
+        }
+        Ok(Self(path))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 pub fn data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("DUOLINK_DATA_DIR") {

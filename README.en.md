@@ -64,4 +64,4 @@ Open **Friends**, save a nickname and add your friend by their nickname and tag 
 
 ## Documentation
 
-[Architecture and networking](docs/ARCHITECTURE.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
+[Architecture and networking](docs/ARCHITECTURE.md) · [Privacy (Russian)](docs/PRIVACY.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)

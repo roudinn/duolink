@@ -195,6 +195,7 @@ const EN = Object.freeze({
   "После # — четыре цифры.": "Use four digits after #.",
   "Это не код друга.": "Invalid friend code.",
   "Код друга повреждён.": "Invalid friend code.",
+  "Ключ друга недействителен.": "The friend's key is invalid.",
   "Это вы.": "That's you.",
   "Отправляем запрос…": "Sending request…",
   "Запрос отправлен.": "Request sent.",

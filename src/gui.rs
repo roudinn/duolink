@@ -548,7 +548,9 @@ impl App {
     }
 
     fn tell(&self, to: &[u8; 32], message: &Message) {
-        friends::send(self.identity.seal(to, message), to);
+        if let Ok(envelope) = self.identity.seal(to, message) {
+            friends::send(envelope, to);
+        }
     }
 
     fn send(&self, to: [u8; 32], message: &Message, done: impl FnOnce(Result<()>) -> Job + Send + 'static) {
@@ -556,7 +558,7 @@ impl App {
         let sender = self.jobs.0.clone();
         let wake = self.wake.clone();
         thread::spawn(move || {
-            let _ = sender.send(done(friends::deliver(&envelope, &to)));
+            let _ = sender.send(done(envelope.and_then(|envelope| friends::deliver(&envelope, &to))));
             wake();
         });
     }
@@ -1135,7 +1137,7 @@ impl App {
         }
         for target in &self.host_for {
             if let (Some(at), false) = (target.sent_at, target.joined) {
-                friends::send(self.identity.seal(&target.key, &Message::InviteCancel { at }), &target.key);
+                self.tell(&target.key, &Message::InviteCancel { at });
             }
         }
         self.inbox = None;
@@ -1188,13 +1190,13 @@ fn asset(path: &str) -> Response<Cow<'static, [u8]>> {
         .unwrap()
 }
 
-/// Discord status on by default; the switch in settings is remembered here.
+/// Keep Discord sharing off until the user enables it in settings.
 fn discord_pref(data: &Path) -> bool {
     fs::read(data.join("prefs.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| value["discord"].as_bool())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn save_discord_pref(data: &Path, on: bool) -> Result<()> {

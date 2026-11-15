@@ -25,9 +25,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::infra::{self, Subscription};
+use crate::{infra::{self, Subscription}, platform::user_protected_data};
 
 const CODE_PREFIX: &str = "DLF-";
+const PROTECTED_SECRET: &str = "dpapi:";
+const DEFAULT_NAME: &str = "player";
 /// Invites older than this are stale: the host's session code has expired.
 pub const INVITE_LIFETIME: u64 = 15 * 60;
 const MAIL_WINDOW: u64 = 12 * 3600;
@@ -91,16 +93,6 @@ pub fn parse_handle(text: &str) -> Result<(String, u16)> {
     Ok((name, number.parse()?))
 }
 
-fn suggested_nickname() -> String {
-    let base: String = std::env::var("USERNAME")
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-        .take(16)
-        .collect();
-    if base.chars().count() >= 3 { base } else { "player".into() }
-}
-
 /* -------------------------------------------------------------- identity */
 
 #[derive(Serialize, Deserialize)]
@@ -123,27 +115,41 @@ pub struct Me {
 impl Me {
     pub fn load_or_create(data: &Path) -> Result<Self> {
         let path = data.join("me.json");
-        if let Ok(text) = fs::read_to_string(&path)
-            && let Ok(stored) = serde_json::from_str::<StoredMe>(&text)
-            && let Ok(bytes) = URL_SAFE_NO_PAD.decode(&stored.secret)
-            && let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice())
-        {
+        let stored = match fs::read_to_string(&path) {
+            Ok(text) => Some(serde_json::from_str::<StoredMe>(&text).context("Файл профиля DuoLink повреждён.")?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Не удалось прочитать профиль DuoLink."),
+        };
+        if let Some(stored) = stored {
+            let protected = stored.secret.strip_prefix(PROTECTED_SECRET);
+            let mut bytes = URL_SAFE_NO_PAD.decode(protected.unwrap_or(&stored.secret))
+                .context("Ключ профиля DuoLink повреждён.")?;
+            if protected.is_some() {
+                bytes = user_protected_data(&bytes, false)
+                    .context("Не удалось открыть ключ профиля DuoLink под этой учётной записью Windows.")?;
+            }
+            let bytes = <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| anyhow::anyhow!("Ключ профиля DuoLink повреждён."))?;
             let secret = StaticSecret::from(bytes);
             // Nicknames from older versions may not be Latin: ask again.
             let valid = valid_nickname(&stored.name).ok();
-            return Ok(Self {
+            let me = Self {
                 public: PublicKey::from(&secret).to_bytes(),
                 secret,
                 chosen: stored.chosen && valid.is_some(),
-                name: valid.unwrap_or_else(suggested_nickname),
+                name: valid.unwrap_or_else(|| DEFAULT_NAME.into()),
                 path,
-            });
+            };
+            if protected.is_none() {
+                me.save(&me.name, me.chosen)?;
+            }
+            return Ok(me);
         }
         let secret = StaticSecret::random_from_rng(OsRng);
         let me = Self {
             public: PublicKey::from(&secret).to_bytes(),
             secret,
-            name: suggested_nickname(),
+            name: DEFAULT_NAME.into(),
             chosen: false,
             path,
         };
@@ -152,8 +158,10 @@ impl Me {
     }
 
     fn save(&self, name: &str, chosen: bool) -> Result<()> {
+        let protected = user_protected_data(&self.secret.to_bytes(), true)
+            .context("Не удалось защитить ключ профиля DuoLink.")?;
         let stored = StoredMe {
-            secret: URL_SAFE_NO_PAD.encode(self.secret.to_bytes()),
+            secret: format!("{PROTECTED_SECRET}{}", URL_SAFE_NO_PAD.encode(protected)),
             name: name.to_owned(),
             chosen,
         };
@@ -184,24 +192,27 @@ impl Me {
         format!("{CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
     }
 
-    fn cipher_with(&self, peer: &[u8; 32]) -> LessSafeKey {
+    fn cipher_with(&self, peer: &[u8; 32]) -> Option<LessSafeKey> {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer));
+        if !shared.was_contributory() {
+            return None;
+        }
         let key = digest(b"duolink/friend/v1", shared.as_bytes());
-        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap())
+        Some(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap()))
     }
 
     /// Envelope: sender public key ‖ nonce ‖ AES-GCM(message).
-    pub fn seal(&self, to: &[u8; 32], message: &Message) -> String {
+    pub fn seal(&self, to: &[u8; 32], message: &Message) -> Result<String> {
+        let key = self.cipher_with(to).context("Ключ друга недействителен.")?;
         let mut body = serde_json::to_vec(message).unwrap();
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
-        self.cipher_with(to)
-            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(to), &mut body)
+        key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(to), &mut body)
             .unwrap();
         let mut envelope = self.public.to_vec();
         envelope.extend_from_slice(&nonce);
         envelope.extend_from_slice(&body);
-        URL_SAFE_NO_PAD.encode(envelope)
+        Ok(URL_SAFE_NO_PAD.encode(envelope))
     }
 
     /// Opens an envelope addressed to us; returns the authenticated sender.
@@ -216,7 +227,7 @@ impl Me {
         }
         let nonce = Nonce::try_assume_unique_for_key(&bytes[32..44]).ok()?;
         let plain = self
-            .cipher_with(&sender)
+            .cipher_with(&sender)?
             .open_in_place(nonce, Aad::from(&self.public), &mut bytes[44..])
             .ok()?;
         Some((sender, serde_json::from_slice(plain).ok()?))
@@ -592,13 +603,38 @@ mod tests {
         let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (alice, bob, carol) = (me(a.path(), "alice"), me(b.path(), "bob"), me(c.path(), "carol"));
         let message = Message::Invite { name: "alice".into(), code: "DL2-xyz".into(), at: 42 };
-        let sealed = alice.seal(&bob.public, &message);
+        let sealed = alice.seal(&bob.public, &message).unwrap();
         assert_eq!(bob.open(&sealed), Some((alice.public, message)));
         assert_eq!(carol.open(&sealed), None);
+        assert!(alice.seal(&[0; 32], &Message::FriendRemove).is_err());
         assert_eq!(alice.open(&sealed), None);
-        let mut forged = URL_SAFE_NO_PAD.decode(carol.seal(&bob.public, &Message::FriendRemove)).unwrap();
+        let mut forged = URL_SAFE_NO_PAD.decode(carol.seal(&bob.public, &Message::FriendRemove).unwrap()).unwrap();
         forged[..32].copy_from_slice(&alice.public);
         assert_eq!(bob.open(&URL_SAFE_NO_PAD.encode(forged)), None);
+    }
+
+    #[test]
+    fn legacy_identity_is_protected_without_changing_its_public_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("me.json");
+        let original = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&original).to_bytes();
+        let legacy = URL_SAFE_NO_PAD.encode(original.to_bytes());
+        let profile = serde_json::json!({ "secret": legacy, "name": "mike", "chosen": true });
+        fs::write(&path, profile.to_string()).unwrap();
+
+        let loaded = Me::load_or_create(directory.path()).unwrap();
+        assert_eq!(loaded.handle(), handle("mike", &public));
+        assert!(loaded.chosen);
+        let now = fs::read_to_string(&path).unwrap();
+        assert!(now.contains(PROTECTED_SECRET));
+        assert!(!now.contains(&legacy));
+        assert_eq!(Me::load_or_create(directory.path()).unwrap().public, public);
+
+        fs::write(&path, profile.to_string().replace(&legacy, "dpapi:invalid")).unwrap();
+        let damaged = fs::read(&path).unwrap();
+        assert!(Me::load_or_create(directory.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
     }
 
     #[test]
@@ -639,9 +675,9 @@ mod tests {
             let message = inbox.messages.recv_timeout(Duration::from_secs(15)).expect("nothing arrived");
             who.open(&message.text).expect("cannot open")
         };
-        send(bob.seal(&alice.public, &Message::FriendRequest { name: bob.name.clone() }), &alice.public);
+        send(bob.seal(&alice.public, &Message::FriendRequest { name: bob.name.clone() }).unwrap(), &alice.public);
         assert_eq!(mail(&alice_inbox, &alice).0, bob.public);
-        send(alice.seal(&bob.public, &Message::FriendAccept { name: alice.name.clone() }), &bob.public);
+        send(alice.seal(&bob.public, &Message::FriendAccept { name: alice.name.clone() }).unwrap(), &bob.public);
         assert!(matches!(mail(&bob_inbox, &bob).1, Message::FriendAccept { .. }));
     }
 }

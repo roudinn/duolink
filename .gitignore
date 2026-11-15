@@ -1,1 +1,6 @@
 target/
+.qa/
+*.log
+*.pfx
+*.p12
+me.json
