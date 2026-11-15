@@ -3,7 +3,7 @@
 <div align="center">
   <h1>DuoLink</h1>
   <p>Локальный кооператив и versus через интернет на Windows.</p>
-  <p><strong>Вход по коду без аккаунтов. Поддержка игр вне Steam. Без встроенных лимитов FPS и разрешения.</strong></p>
+  <p><strong>Вход по коду без аккаунтов. Без встроенных лимитов FPS и разрешения.</strong></p>
   <p>
     <img alt="Windows 10 и 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>

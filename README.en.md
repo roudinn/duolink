@@ -3,7 +3,7 @@
 <div align="center">
   <h1>DuoLink</h1>
   <p>Play local co-op and versus games online on Windows.</p>
-  <p><strong>Join by code without an account. Works with games outside Steam. No built-in caps on FPS or resolution.</strong></p>
+  <p><strong>Join by code without an account. No built-in caps on FPS or resolution.</strong></p>
   <p>
     <img alt="Windows 10 and 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>
