@@ -6,12 +6,14 @@ use std::{
     os::windows::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_OBJECT_0},
+    Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW},
     System::Threading::{CREATE_NO_WINDOW, GetExitCodeProcess, WaitForSingleObject},
     UI::{
         Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
@@ -233,6 +235,27 @@ fn installed_exe() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn installer_recovers_a_missing_copy_and_keeps_an_equal_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Programs/DuoLink/DuoLink.exe");
+        let source = std::env::current_exe().unwrap();
+        let version = file_version(&source).expect("test executable has a Windows version resource");
+        prepare_installed_copy(&source, &target).unwrap();
+        assert_eq!(file_version(&target), Some(version));
+
+        let original = fs::metadata(&target).unwrap().len();
+        fs::OpenOptions::new().append(true).open(&target).unwrap().write_all(b"trailer").unwrap();
+        prepare_installed_copy(&source, &target).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().len(), original + 7);
+
+        fs::write(&target, b"incomplete").unwrap();
+        prepare_installed_copy(&source, &target).unwrap();
+        assert_eq!(file_version(&target), Some(version));
+        assert_eq!(fs::metadata(&target).unwrap().len(), original);
+    }
 
     #[test]
     #[ignore = "requires the DuoLink firewall rules on this Windows installation"]
@@ -273,11 +296,73 @@ fn register(exe: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn register_installed(exe: &Path) {
+    let marker = exe.with_file_name(format!(".registered-{VERSION}"));
+    if !marker.exists() && register(exe).is_ok() {
+        let _ = fs::write(marker, b"");
+    }
+}
+
 pub enum Launch {
     /// Keep running this process.
     Run,
+    /// The installed process registers once it holds the instance lock.
+    Installed(PathBuf),
     /// The installed copy was started; this process should exit.
     Handoff,
+}
+
+fn file_version(path: &Path) -> Option<(u32, u32)> {
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let length = unsafe { GetFileVersionInfoSizeW(name.as_ptr(), std::ptr::null_mut()) };
+    if length == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; length as usize];
+    if unsafe { GetFileVersionInfoW(name.as_ptr(), 0, length, buffer.as_mut_ptr().cast()) } == 0 {
+        return None;
+    }
+    let mut fixed = std::ptr::null_mut();
+    let mut size = 0;
+    let root = [u16::from(b'\\'), 0];
+    let found = unsafe { VerQueryValueW(buffer.as_ptr().cast(), root.as_ptr(), &mut fixed, &mut size) };
+    if found == 0 || fixed.is_null() || (size as usize) < size_of::<VS_FIXEDFILEINFO>() {
+        return None;
+    }
+    // The version resource is returned as a byte buffer and may be unaligned.
+    let fixed = unsafe { fixed.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
+    Some((fixed.dwFileVersionMS, fixed.dwFileVersionLS))
+}
+
+fn prepare_installed_copy(current: &Path, target: &Path) -> Result<()> {
+    let folder = target.parent().context("Не найдена папка установки DuoLink.")?;
+    fs::create_dir_all(folder)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _lock = loop {
+        if let Some(lock) = crate::update::update_lock(target)? {
+            break lock;
+        }
+        if target.is_file() {
+            return Ok(());
+        }
+        ensure!(Instant::now() < deadline, "Установка DuoLink уже выполняется.");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let installed = file_version(target);
+    if installed.zip(file_version(current)).is_some_and(|(old, new)| old >= new) {
+        return Ok(());
+    }
+
+    let staging = tempfile::tempdir_in(folder)?;
+    let staged = staging.path().join("DuoLink.exe");
+    fs::copy(current, &staged).context("Не удалось скопировать DuoLink в папку программ.")?;
+    // Windows does not allow replacing an executable that is still running.
+    if let Err(error) = fs::rename(staged, target)
+        && installed.is_none()
+    {
+        return Err(error).context("Не удалось установить DuoLink.");
+    }
+    Ok(())
 }
 
 /// Copies a downloaded DuoLink.exe into `%LOCALAPPDATA%\Programs\DuoLink`,
@@ -292,23 +377,9 @@ pub fn self_install() -> Result<Launch> {
     }
     let target = installed_exe()?;
     if same_path(&current, &target) {
-        // Repair shortcuts and the uninstall entry once per version.
-        let marker = target.with_file_name(format!(".registered-{VERSION}"));
-        if !marker.exists() && register(&target).is_ok() {
-            let _ = fs::write(marker, b"");
-        }
-        return Ok(Launch::Run);
+        return Ok(Launch::Installed(target));
     }
-    fs::create_dir_all(target.parent().unwrap())?;
-    let staged = target.with_extension("new");
-    fs::copy(&current, &staged).context("Не удалось скопировать DuoLink в папку программ.")?;
-    if fs::rename(&staged, &target).is_err() {
-        let _ = fs::remove_file(&staged);
-        // The installed copy is running: use this one for now.
-        return Ok(Launch::Run);
-    }
-    register(&target)?;
-    let _ = fs::write(target.with_file_name(format!(".registered-{VERSION}")), b"");
+    prepare_installed_copy(&current, &target)?;
     Command::new(&target)
         .current_dir(target.parent().unwrap())
         .spawn()

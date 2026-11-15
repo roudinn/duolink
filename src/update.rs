@@ -59,7 +59,7 @@ fn old_path(exe: &Path) -> PathBuf {
     exe.with_extension("old.exe")
 }
 
-fn update_lock(exe: &Path) -> Result<Option<ProcessLock>> {
+pub(crate) fn update_lock(exe: &Path) -> Result<Option<ProcessLock>> {
     let directory = exe.parent().context("Нет папки программы.")?.canonicalize()?;
     let file_name = exe.file_name().context("Нет имени файла программы.")?;
     let path = directory.join(file_name).to_string_lossy().to_lowercase();

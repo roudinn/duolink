@@ -52,6 +52,19 @@ OptimizationHints,AutofillServerCommunication,MediaRouter,SpareRendererForSitePe
 --disable-background-networking --disable-component-update --disable-default-apps --disable-sync \
 --no-first-run --renderer-process-limit=1";
 
+pub fn webview_missing() -> bool {
+    use webview2_com::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
+    use windows::{
+        Win32::{Foundation::ERROR_FILE_NOT_FOUND, System::Com::CoTaskMemFree},
+        core::{HRESULT, PCWSTR, PWSTR},
+    };
+
+    let mut version = PWSTR::null();
+    let result = unsafe { GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version) };
+    unsafe { CoTaskMemFree(Some(version.0.cast())) };
+    result.is_err_and(|error| error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0))
+}
+
 /// Lets WebView2 drop caches while the window is in the background.
 fn memory_level(view: &WebView, low: bool) {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -1247,7 +1260,7 @@ pub fn run(hidden: bool) -> Result<()> {
         })
         .with_url(VIEW)
         .build(&window)
-        .context("Не удалось открыть окно. Нужен Microsoft Edge WebView2 Runtime.")?;
+        .context("Не удалось открыть окно DuoLink.")?;
     prefetch_engines(data.clone());
     // Closing the window keeps DuoLink in the tray, so invites still arrive.
     let _tray = tray(event_loop.create_proxy())?;

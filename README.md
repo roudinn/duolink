@@ -8,7 +8,7 @@ Windows 10/11 (x64). Интерфейс на русском и английск�
 
 ## Установка
 
-Запустите `DuoLink.exe` на обоих ПК. Программа установится в `%LOCALAPPDATA%\Programs\DuoLink`, создаст ярлык и дальше будет обновляться сама. Если при запуске Windows сообщает, что не найден WebView2, установите [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/#download).
+Запустите `DuoLink.exe` на обоих ПК. Программа установится в `%LOCALAPPDATA%\Programs\DuoLink`, создаст ярлык и дальше будет обновляться сама. Если WebView2 отсутствует, DuoLink предложит открыть [страницу загрузки Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/#download).
 
 При первой сессии Windows может запросить разрешение на установку ViGEmBus. Драйвер нужен хосту для геймпадов гостей. Хост с лицензией Virtual HID Broker может установить его в настройках DuoLink.
 
