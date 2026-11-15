@@ -1,5 +1,6 @@
 mod signal;
 mod stun;
+mod relay;
 
 use std::{
     env,
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
     });
     tokio::try_join!(
         async {
-            axum::serve(http, signal.router())
+            axum::serve(http, signal.router().merge(relay::router()))
                 .await
                 .map_err(anyhow::Error::from)
         },
