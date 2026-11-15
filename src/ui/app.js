@@ -123,7 +123,10 @@ function renderSession(who, pane, table) {
   const title = table[pane.phase];
   text(`${who}-title`, tr(title));
   const message = pane.message.replace(/[…\s]+$/, "") === title ? "" : pane.message;
-  line(`${who}-message`, notice(message));
+  const relayed = who === "guest" && pane.phase === "live" && pane.facts.some(
+    ([name, value]) => name === "Соединение" && value.startsWith("Интернет · ретрансляция · "),
+  );
+  line(`${who}-message`, relayed ? tr("Через сервер. Задержка может быть выше.") : notice(message));
   show(`${who}-details`, pane.facts.length > 0);
   renderFacts(`${who}-facts`, pane.facts);
   $(`${who}-stop`).disabled = pane.phase === "stopping";

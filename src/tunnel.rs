@@ -1560,7 +1560,7 @@ impl GuestTunnel {
             Err(error) if error.is::<InviteRefused>() => return Err(error),
             Err(_) => {
                 check()?;
-                show_hint("Пробуем подключиться через ретрансляцию…");
+                show_hint("Напрямую подключиться не удалось. Пробуем через сервер…");
                 runtime.block_on(connect_relay(&endpoint, config, token, port, relay_url, check))?
             }
         };
