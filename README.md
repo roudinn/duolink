@@ -20,12 +20,38 @@
 
 ## Чем DuoLink отличается
 
-| Возможность | DuoLink | Parsec | Steam Remote Play Together |
-| --- | --- | --- | --- |
-| Игра без аккаунта у обоих | **Да, по коду** | Нет | Нет, хосту нужен Steam |
-| Игры вне Steam и эмуляторы | **Да** | Да | Игры с поддержкой Remote Play Together |
-| Лимиты FPS и разрешения | **Без встроенных лимитов** | Ограничены | Ограничены |
-| Игра без VPN и ручного проброса портов | **Да, с автоматическим резервом по HTTPS** | Да, если проходит прямой UDP | Да |
+<table>
+  <tr>
+    <td>Возможность</td>
+    <td><strong>DuoLink</strong></td>
+    <td>Parsec</td>
+    <td>Steam Remote Play Together</td>
+  </tr>
+  <tr>
+    <td>Игра без аккаунта у обоих</td>
+    <td><strong>Да, по коду</strong></td>
+    <td>Нет</td>
+    <td>Нет, хосту нужен Steam</td>
+  </tr>
+  <tr>
+    <td>Игры вне Steam и эмуляторы</td>
+    <td><strong>Да</strong></td>
+    <td>Да</td>
+    <td>Игры с поддержкой Remote Play Together</td>
+  </tr>
+  <tr>
+    <td>Лимиты FPS и разрешения</td>
+    <td><strong>Без встроенных лимитов</strong></td>
+    <td>Ограничены</td>
+    <td>Ограничены</td>
+  </tr>
+  <tr>
+    <td>Игра без VPN и ручного проброса портов</td>
+    <td><strong>Да, с автоматическим резервом по HTTPS</strong></td>
+    <td>Да, если проходит прямой UDP</td>
+    <td>Да</td>
+  </tr>
+</table>
 
 ## Первая игра
 

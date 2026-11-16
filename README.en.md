@@ -20,12 +20,38 @@ Play local multiplayer games online with a friend, including split-screen games,
 
 ## How DuoLink compares
 
-| Feature | DuoLink | Parsec | Steam Remote Play Together |
-| --- | --- | --- | --- |
-| Play without an account on either side | **Yes, with a session code** | No | No, the host needs Steam |
-| Non-Steam games and emulators | **Yes** | Yes | Games with Remote Play Together support |
-| FPS and resolution caps | **No built-in caps** | Limited | Limited |
-| Play without a VPN or manual port forwarding | **Yes, with automatic HTTPS fallback** | Yes, if direct UDP works | Yes |
+<table>
+  <tr>
+    <td>Feature</td>
+    <td><strong>DuoLink</strong></td>
+    <td>Parsec</td>
+    <td>Steam Remote Play Together</td>
+  </tr>
+  <tr>
+    <td>Play without an account on either side</td>
+    <td><strong>Yes, with a session code</strong></td>
+    <td>No</td>
+    <td>No, the host needs Steam</td>
+  </tr>
+  <tr>
+    <td>Non-Steam games and emulators</td>
+    <td><strong>Yes</strong></td>
+    <td>Yes</td>
+    <td>Games with Remote Play Together support</td>
+  </tr>
+  <tr>
+    <td>FPS and resolution caps</td>
+    <td><strong>No built-in caps</strong></td>
+    <td>Limited</td>
+    <td>Limited</td>
+  </tr>
+  <tr>
+    <td>Play without a VPN or manual port forwarding</td>
+    <td><strong>Yes, with automatic HTTPS fallback</strong></td>
+    <td>Yes, if direct UDP works</td>
+    <td>Yes</td>
+  </tr>
+</table>
 
 ## First session
 
