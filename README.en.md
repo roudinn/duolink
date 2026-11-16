@@ -4,6 +4,7 @@
   <h1>DuoLink</h1>
   <p>Play local co-op and versus games online on Windows.</p>
   <p><strong>Join by code without an account. No built-in caps on FPS or resolution.</strong></p>
+  <p>Direct QUIC with HTTPS fallback. Hardware AV1 or HEVC video and adaptive bitrate.</p>
   <p>
     <img alt="Windows 10 and 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>
@@ -11,6 +12,7 @@
   </p>
   <h3><a href="https://github.com/roudinn/duolink/releases/latest/download/DuoLink.exe">Download DuoLink for Windows</a></h3>
   <p><strong><a href="https://pay.cloudtips.ru/p/2d792cfa">Support DuoLink</a></strong></p>
+  <p><a href="https://roudinn.github.io/duolink/en.html">Official DuoLink website</a></p>
   <p><a href="https://github.com/roudinn/duolink/releases/latest">Portable build and release notes</a></p>
   <img src="docs/preview.en.png" width="1000" alt="DuoLink lobby with a guest and the join-by-code form">
 </div>

@@ -4,6 +4,7 @@
   <h1>DuoLink</h1>
   <p>Локальный кооператив и versus через интернет на Windows.</p>
   <p><strong>Вход по коду без аккаунтов. Без встроенных лимитов FPS и разрешения.</strong></p>
+  <p>Прямое подключение по QUIC с резервом через HTTPS. Аппаратное видео AV1 или HEVC и адаптивный битрейт.</p>
   <p>
     <img alt="Windows 10 и 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>
@@ -11,6 +12,7 @@
   </p>
   <h3><a href="https://github.com/roudinn/duolink/releases/latest/download/DuoLink.exe">Скачать DuoLink для Windows</a></h3>
   <p><strong><a href="https://pay.cloudtips.ru/p/2d792cfa">Поддержать DuoLink</a></strong></p>
+  <p><a href="https://roudinn.github.io/duolink/">Официальная страница DuoLink</a></p>
   <p><a href="https://github.com/roudinn/duolink/releases/latest">Портативная версия и список изменений</a></p>
   <img src="docs/preview.png" width="1000" alt="Лобби DuoLink с гостем и форма подключения по коду">
 </div>

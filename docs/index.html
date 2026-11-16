@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DuoLink — локальный кооператив через интернет на Windows</title>
+  <meta name="description" content="Играйте вдвоём по интернету в игры с локальным мультиплеером на Windows. Вход по коду, отдельный геймпад гостя. Скачать DuoLink и открыть репозиторий на GitHub.">
+  <link rel="canonical" href="https://roudinn.github.io/duolink/">
+  <link rel="alternate" hreflang="ru" href="https://roudinn.github.io/duolink/">
+  <link rel="alternate" hreflang="en" href="https://roudinn.github.io/duolink/en.html">
+  <link rel="alternate" hreflang="x-default" href="https://roudinn.github.io/duolink/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="DuoLink">
+  <meta property="og:title" content="DuoLink — локальный кооператив через интернет на Windows">
+  <meta property="og:description" content="Играйте вдвоём по интернету в игры с локальным мультиплеером на Windows. Вход по коду, отдельный геймпад гостя. Скачать DuoLink и открыть репозиторий на GitHub.">
+  <meta property="og:url" content="https://roudinn.github.io/duolink/">
+  <meta property="og:image" content="https://roudinn.github.io/duolink/preview.png">
+  <link rel="icon" href="duolink.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="./"><img src="duolink.svg" width="32" height="32" alt="">DuoLink</a>
+    <nav aria-label="Язык"><strong lang="ru">Русский</strong><a href="en.html" lang="en" hreflang="en">English</a></nav>
+  </header>
+  <main>
+    <h1>Локальный кооператив через интернет</h1>
+    <p class="intro">Запусти игру на своём ПК с Windows. Друг подключится по коду и сыграет с отдельным геймпадом.</p>
+    <div class="actions">
+      <a class="download" href="https://github.com/roudinn/duolink/releases/latest/download/DuoLink.exe">Скачать для Windows</a>
+      <a class="source" href="https://github.com/roudinn/duolink">Репозиторий на GitHub</a>
+    </div>
+    <img class="preview" src="preview.png" alt="Лобби DuoLink на Windows с гостем и кодом сессии">
+    <div class="details">
+      <section>
+        <h2>Как начать игру</h2>
+        <ol>
+        <li>Скачайте и запустите DuoLink на обоих ПК.</li>
+        <li>Хост запускает игру и отправляет другу код сессии.</li>
+        <li>Гость вводит код, а хост подтверждает подключение.</li>
+        </ol>
+      </section>
+      <section>
+        <h2>Какие игры подходят</h2>
+        <p>Игры с локальным мультиплеером и поддержкой нескольких геймпадов. Это могут быть файтинги, игры с разделённым экраном и эмуляторы. Игра нужна только на ПК хоста.</p>
+      </section>
+    </div>
+    <div class="details stream">
+      <section>
+        <h2>Подключение без VPN</h2>
+        <p>DuoLink сначала пробует прямое подключение по QUIC. Если UDP-маршрут недоступен, приложение автоматически пробует резервный ретранслятор по HTTPS. Обычно вручную настраивать проброс портов не нужно.</p>
+      </section>
+      <section>
+        <h2>Видео и задержка</h2>
+        <p>Аппаратное кодирование и декодирование AV1 или HEVC при поддержке железом. Битрейт можно задать вручную или оставить автоматическую регулировку. Встроенных лимитов FPS и разрешения нет. Задержка зависит от маршрута и устройств.</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
