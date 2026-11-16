@@ -280,18 +280,23 @@ kbd { padding: 2px 7px; border-radius: 7px; background: var(--raised); color: va
 .empty { padding: 12px 2px; }
 
 /* settings sheet */
-dialog { width: min(440px, calc(100vw - 28px)); max-height: calc(100vh - 40px); padding: 0; border: 1px solid var(--sep); border-top-color: var(--rim); border-radius: 32px; background: var(--bg); color: var(--text); box-shadow: 0 24px 48px rgb(0 0 0 / .5); }
+dialog { width: min(440px, calc(100vw - 28px)); max-height: calc(100vh - 40px); padding: 0; border: 0; background: transparent; color: var(--text); overflow: visible; }
 dialog[open] { display: flex; flex-direction: column; animation: sheet 200ms var(--ease-out); }
+.settings-panel, .settings-foot { border: 1px solid var(--sep); border-top-color: var(--rim); border-radius: 32px; background: var(--bg); }
+.settings-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 @keyframes sheet { from { opacity: 0; transform: translateY(14px) scale(.98); } }
 dialog::backdrop { background: rgb(0 0 0 / .62); }
-dialog > header { display: flex; flex: none; align-items: center; justify-content: space-between; padding: 14px 16px 10px 24px; }
+.settings-panel > header { display: flex; flex: none; align-items: center; justify-content: space-between; padding: 10px 16px 0 24px; }
 dialog h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
-.sheet { min-height: 0; overflow-y: auto; padding: 4px 16px 18px; display: flex; flex-direction: column; gap: 10px; scrollbar-gutter: stable both-edges; }
-.sheet .section { margin-top: 14px; }
+.sheet { min-height: 0; overflow-y: auto; margin-block-end: 12px; padding: 15px 12px 10px; display: flex; flex-direction: column; gap: 10px; scrollbar-gutter: stable both-edges; scroll-padding-block-start: 20px; mask-image: linear-gradient(to bottom, transparent, rgb(0 0 0 / .4) calc(var(--sheet-fade, 0px) * .45), #000 var(--sheet-fade, 0px)); }
+.sheet .section { margin-top: 14px; font-size: 17px; }
+.sheet .label { font-weight: 400; }
+#update-check:not(.primary) { border-color: var(--rim); }
 .sheet .row > button { flex: none; }
 .sheet .row > .label, .sheet .row-text { min-width: 0; }
 .sheet #video-feedback { padding: 4px 16px 0; }
-.settings-foot { display: flex; flex: none; justify-content: center; padding: 10px 16px; border-top: 1px solid var(--sep); }
+.settings-foot { display: flex; flex: none; justify-content: center; margin-block-start: -1px; padding: 5px 16px; border-color: rgb(255 255 255 / .045); }
+.settings-foot .btn { height: 44px; padding-inline: 24px; font-size: 15px; }
 .settings-foot .btn svg { width: 15px; height: 15px; }
 .dialog-feedback { padding: 12px 24px; border-top: 1px solid var(--sep); color: var(--muted); font-size: 14px; }
 .sheet > *, .view > *, .stack > * { flex-shrink: 0; }

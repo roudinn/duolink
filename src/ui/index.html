@@ -129,65 +129,67 @@
   </div>
 
   <dialog id="settings" aria-labelledby="settings-title">
-    <header>
-      <h2 id="settings-title">Настройки</h2>
-      <button type="button" class="round" data-action="close_settings" aria-label="Закрыть"><svg><use href="#i-close"/></svg></button>
-    </header>
-    <div class="sheet">
-      <div class="group">
-        <div class="row">
-          <label for="language" class="label">Язык</label>
-          <span class="select-wrap"><select id="language" class="inline"><option value="ru">Русский</option><option value="en">English</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span>
-        </div>
-      </div>
-      <p class="section">Профиль</p>
-      <div class="group">
-        <form id="nick-settings" class="row">
-          <label for="nick-edit" class="label">Ник</label>
-          <input id="nick-edit" class="inline" maxlength="16" placeholder="ник" autocomplete="off" spellcheck="false">
-          <button type="submit" class="btn small">Сохранить</button>
-        </form>
-        <div id="copy-friend-code" class="row" hidden><span class="label">Код друга</span><button type="button" class="btn small" data-action="copy_code">Скопировать</button></div>
-      </div>
-
-      <p id="video-title" class="section" tabindex="-1">Видео</p>
-      <p id="video-feedback" class="line" role="status" hidden></p>
-      <div class="group">
-        <div class="row"><span id="resolution-label" class="label">Разрешение</span>
-          <div class="dimensions" role="group" aria-labelledby="resolution-label">
-            <input id="width" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Ширина"><span class="muted" aria-hidden="true">×</span>
-            <input id="height" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Высота">
+    <div class="settings-panel">
+      <header>
+        <h2 id="settings-title">Настройки</h2>
+        <button type="button" class="round" data-action="close_settings" aria-label="Закрыть"><svg><use href="#i-close"/></svg></button>
+      </header>
+      <div class="sheet">
+        <div class="group">
+          <div class="row">
+            <label for="language" class="label">Язык</label>
+            <span class="select-wrap"><select id="language" class="inline"><option value="ru">Русский</option><option value="en">English</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span>
           </div>
+          <div class="row"><span class="row-text"><span class="label">Обновления</span><small id="update-note"></small></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
         </div>
-        <div class="row"><label for="fps" class="label">FPS</label><input id="fps" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
-        <div class="row"><label for="bitrate" class="label">Битрейт, Мбит/с</label><input id="bitrate" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
-        <div class="row"><label for="codec" class="label">Кодек</label>
-          <span class="select-wrap"><select id="codec" class="inline"><option value="auto">Авто</option><option value="hevc">HEVC</option><option value="av1">AV1</option><option value="h264">H.264</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span></div>
-        <label class="row"><span class="row-text"><span class="label">YUV 4:4:4</span><small>Цвет мелких деталей</small></span><input id="yuv444" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">HDR</span><input id="hdr" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Окно без рамки</span><input id="windowed" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Плавный вывод</span><input id="smooth" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Разрешить декодирование на CPU</span><input id="software_decode" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Статистика трансляции</span><input id="stats" type="checkbox" role="switch"></label>
-      </div>
+        <p class="section">Профиль</p>
+        <div class="group">
+          <form id="nick-settings" class="row">
+            <label for="nick-edit" class="label">Ник</label>
+            <input id="nick-edit" class="inline" maxlength="16" placeholder="ник" autocomplete="off" spellcheck="false">
+            <button type="submit" class="btn small">Сохранить</button>
+          </form>
+          <div id="copy-friend-code" class="row" hidden><span class="label">Код друга</span><button type="button" class="btn small" data-action="copy_code">Скопировать</button></div>
+        </div>
 
-      <p class="section">Система</p>
-      <div class="group">
-        <div class="row"><span class="label">Планирование GPU</span><button type="button" class="btn small" data-action="graphics" aria-label="Открыть настройки графики Windows">Открыть</button></div>
-        <div id="network-row" class="row" hidden><span class="label">UDP</span><small id="network-note"></small></div>
-        <div class="row"><span class="row-text"><span class="label">Virtual HID Broker</span><small>Нужна лицензия</small></span><button type="button" id="virtual-hid" class="btn small" data-action="virtual_hid">Настроить</button></div>
-        <div class="row"><span class="row-text"><span class="label">Обновления</span><small id="update-note"></small></span><button type="button" id="update-check" class="btn small" data-action="check_update">Проверить</button></div>
-        <label id="discord-row" class="row" hidden><span class="row-text"><span class="label">Статус в Discord</span><small>Только число игроков, без имён</small></span><input id="discord" type="checkbox" role="switch"></label>
-        <label class="row"><span class="label">Запускать с Windows</span><input id="autostart" type="checkbox" role="switch"></label>
-        <div class="row"><span class="label">Журналы</span><button type="button" class="btn small" data-action="logs" aria-label="Открыть журналы">Открыть</button></div>
+        <p id="video-title" class="section" tabindex="-1">Видео</p>
+        <p id="video-feedback" class="line" role="status" hidden></p>
+        <div class="group">
+          <div class="row"><span id="resolution-label" class="label">Разрешение</span>
+            <div class="dimensions" role="group" aria-labelledby="resolution-label">
+              <input id="width" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Ширина"><span class="muted" aria-hidden="true">×</span>
+              <input id="height" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16" aria-label="Высота">
+            </div>
+          </div>
+          <div class="row"><label for="fps" class="label">FPS</label><input id="fps" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
+          <div class="row"><label for="bitrate" class="label">Битрейт, Мбит/с</label><input id="bitrate" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
+          <div class="row"><label for="codec" class="label">Кодек</label>
+            <span class="select-wrap"><select id="codec" class="inline"><option value="auto">Авто</option><option value="hevc">HEVC</option><option value="av1">AV1</option><option value="h264">H.264</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span></div>
+          <label class="row"><span class="row-text"><span class="label">YUV 4:4:4</span><small>Цвет мелких деталей</small></span><input id="yuv444" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">HDR</span><input id="hdr" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">Окно без рамки</span><input id="windowed" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">Плавный вывод</span><input id="smooth" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">Разрешить декодирование на CPU</span><input id="software_decode" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">Статистика трансляции</span><input id="stats" type="checkbox" role="switch"></label>
+        </div>
+
+        <p class="section">Система</p>
+        <div class="group">
+          <div class="row"><span class="label">Планирование GPU</span><button type="button" class="btn small" data-action="graphics" aria-label="Открыть настройки графики Windows">Открыть</button></div>
+          <div id="network-row" class="row" hidden><span class="label">UDP</span><small id="network-note"></small></div>
+          <div class="row"><span class="row-text"><span class="label">Virtual HID Broker</span><small>Нужна лицензия</small></span><button type="button" id="virtual-hid" class="btn small" data-action="virtual_hid">Настроить</button></div>
+          <label id="discord-row" class="row" hidden><span class="row-text"><span class="label">Статус в Discord</span><small>Только число игроков, без имён</small></span><input id="discord" type="checkbox" role="switch"></label>
+          <label class="row"><span class="label">Запускать с Windows</span><input id="autostart" type="checkbox" role="switch"></label>
+          <div class="row"><span class="label">Журналы</span><button type="button" class="btn small" data-action="logs" aria-label="Открыть журналы">Открыть</button></div>
+        </div>
       </div>
+      <p id="settings-feedback" class="dialog-feedback" role="status" hidden></p>
     </div>
     <footer class="settings-foot">
       <button type="button" class="btn small" data-action="support">
         <span>Поддержать DuoLink</span><svg aria-hidden="true"><use href="#i-external"/></svg>
       </button>
     </footer>
-    <p id="settings-feedback" class="dialog-feedback" role="status" hidden></p>
   </dialog>
 
   <div id="toast" role="status" hidden></div>

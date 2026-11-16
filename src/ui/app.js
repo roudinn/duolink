@@ -412,6 +412,7 @@ function renderSettings(next) {
   text("update-note", notes[u.state] ?? pick(`Версия ${next.version}`, `Version ${next.version}`));
   text("update-check", tr(ready ? "Перезапустить" : "Проверить"));
   $("update-check").dataset.action = ready ? "restart" : "check_update";
+  $("update-check").classList.toggle("primary", ready && !busy);
   $("update-check").disabled = ["checking", "downloading"].includes(u.state) || (ready && busy);
   const downloading = u.state === "downloading";
   show("update-banner", (ready || downloading) && !busy);
@@ -545,6 +546,11 @@ document.addEventListener("click", (e) => {
     default: send(action, id ? { id } : {});
   }
 });
+
+const settingsSheet = settings.querySelector(".sheet");
+settingsSheet.addEventListener("scroll", () => {
+  settingsSheet.style.setProperty("--sheet-fade", `${Math.min(16, Math.max(0, settingsSheet.scrollTop))}px`);
+}, { passive: true });
 
 settings.addEventListener("click", (e) => { if (e.target === settings) settings.close(); });
 settings.addEventListener("close", () => line("settings-feedback", ""));
