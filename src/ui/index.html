@@ -16,6 +16,7 @@
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h9m4 0h3M4 17h3m4 0h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="3"/><path d="M15.5 8.5V7a2.5 2.5 0 0 0-2.5-2.5H7A2.5 2.5 0 0 0 4.5 7v6A2.5 2.5 0 0 0 7 15.5h1.5"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M13 5h6v6m0-6-8 8m6 0v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h5"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M20 12H4m6-6-6 6 6 6"/></symbol>
     <symbol id="i-paste" viewBox="0 0 24 24"><rect x="5.5" y="5" width="13" height="15.5" rx="3"/><path d="M9 5V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/></symbol>
   </svg>
@@ -180,6 +181,11 @@
         <div class="row"><span class="label">Журналы</span><button type="button" class="btn small" data-action="logs" aria-label="Открыть журналы">Открыть</button></div>
       </div>
     </div>
+    <footer class="settings-foot">
+      <button type="button" class="btn small" data-action="support">
+        <span>Поддержать DuoLink</span><svg aria-hidden="true"><use href="#i-external"/></svg>
+      </button>
+    </footer>
     <p id="settings-feedback" class="dialog-feedback" role="status" hidden></p>
   </dialog>
 

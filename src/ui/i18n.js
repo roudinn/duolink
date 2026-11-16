@@ -57,6 +57,7 @@ const EN = Object.freeze({
   "Проверить": "Check",
   "Журналы": "Logs",
   "Открыть журналы": "Open logs",
+  "Поддержать DuoLink": "Support DuoLink",
   "Создаём сессию": "Creating session",
   "Ждём друга": "Waiting for a friend",
   "Подключение": "Connection request",

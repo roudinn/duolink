@@ -43,6 +43,7 @@ use crate::{
 const VIEW: &str = "duolink://localhost/index.html";
 const WINDOWS_VIEW: &str = "https://duolink.localhost/index.html";
 const GRAPHICS: &str = "ms-settings:display-advancedgraphics";
+const SUPPORT_URL: &str = "https://pay.cloudtips.ru/p/2d792cfa";
 /// An update found this soon after launch installs and restarts on its own.
 const AUTO_RESTART: Duration = Duration::from_secs(120);
 /// WebView2 without what a local two-screen UI never uses: less memory and no
@@ -151,6 +152,7 @@ enum Action {
     CheckUpdate,
     Restart,
     Logs,
+    Support,
     SetName { name: String },
     AddFriend { query: String },
     AcceptFriend { id: String },
@@ -785,6 +787,7 @@ impl App {
                 }
             }
             Action::Graphics => open_or_toast(view, OsStr::new(GRAPHICS))?,
+            Action::Support => open_or_toast(view, OsStr::new(SUPPORT_URL))?,
             Action::VirtualHid if self.session_idle() => {
                 self.driver_setup = true;
                 self.setup.begin(setup::install_virtualhid(self.data.clone()), "Проверяем драйвер геймпада…");

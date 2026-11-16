@@ -273,6 +273,8 @@ dialog h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
 .sheet .section { margin-top: 14px; }
 .sheet .row > button { flex: none; }
 .sheet #video-feedback { padding: 4px 16px 0; }
+.settings-foot { display: flex; justify-content: center; padding: 10px 16px; border-top: 1px solid var(--sep); }
+.settings-foot .btn svg { width: 15px; height: 15px; }
 .dialog-feedback { padding: 12px 24px; border-top: 1px solid var(--sep); color: var(--muted); font-size: 14px; }
 .sheet > *, .view > *, .stack > * { flex-shrink: 0; }
 
