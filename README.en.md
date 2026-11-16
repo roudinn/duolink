@@ -10,6 +10,7 @@
     <img alt="Rust 1.88+" src="https://img.shields.io/badge/Rust-1.88%2B-303036?style=flat-square">
   </p>
   <h3><a href="https://github.com/roudinn/duolink/releases/latest/download/DuoLink.exe">Download DuoLink for Windows</a></h3>
+  <p><strong><a href="https://pay.cloudtips.ru/p/2d792cfa">Support DuoLink</a></strong></p>
   <p><a href="https://github.com/roudinn/duolink/releases/latest">Portable build and release notes</a></p>
   <img src="docs/preview.en.png" width="1000" alt="DuoLink lobby with a guest and the join-by-code form">
 </div>
@@ -102,7 +103,3 @@ Open **Friends**, save a nickname and add your friend by their nickname and tag 
 ## Documentation
 
 [Architecture and networking](docs/ARCHITECTURE.md) · [Privacy (Russian)](docs/PRIVACY.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
-
-## Support DuoLink
-
-[A one-time donation through CloudTips](https://pay.cloudtips.ru/p/2d792cfa) helps cover server costs and development.

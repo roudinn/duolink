@@ -10,6 +10,7 @@
     <img alt="Rust 1.88+" src="https://img.shields.io/badge/Rust-1.88%2B-303036?style=flat-square">
   </p>
   <h3><a href="https://github.com/roudinn/duolink/releases/latest/download/DuoLink.exe">Скачать DuoLink для Windows</a></h3>
+  <p><strong><a href="https://pay.cloudtips.ru/p/2d792cfa">Поддержать DuoLink</a></strong></p>
   <p><a href="https://github.com/roudinn/duolink/releases/latest">Портативная версия и список изменений</a></p>
   <img src="docs/preview.png" width="1000" alt="Лобби DuoLink с гостем и форма подключения по коду">
 </div>
@@ -102,7 +103,3 @@
 ## Документация
 
 [Архитектура и сеть](docs/ARCHITECTURE.md) · [Конфиденциальность](docs/PRIVACY.md) · [Сообщить об ошибке](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
-
-## Поддержать DuoLink
-
-[Разовый донат через CloudTips](https://pay.cloudtips.ru/p/2d792cfa) помогает оплачивать сервер и развивать DuoLink.

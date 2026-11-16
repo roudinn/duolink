@@ -7,6 +7,8 @@
 
 Для запуска из папки скачайте архив с `portable` в имени и распакуйте его. Файл `DuoLink-Licenses.txt` содержит уведомления о сторонних компонентах.
 
+**[Поддержать DuoLink](https://pay.cloudtips.ru/p/2d792cfa)**
+
 Контрольные суммы EXE и архивов опубликованы в `SHA256SUMS.txt`.
 
 <!-- Перед публикацией сформируйте SHA256SUMS.txt скриптом scripts/release-checksums.ps1 из готовых файлов релиза. -->
@@ -16,5 +18,3 @@
 <!-- Укажите, что изменилось для пользователя и когда это заметно. -->
 
 [Быстрый старт](https://github.com/roudinn/duolink#первая-игра) · [Сообщить об ошибке](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
-
-[Поддержать DuoLink через CloudTips](https://pay.cloudtips.ru/p/2d792cfa)
