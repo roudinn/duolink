@@ -73,7 +73,6 @@ main > #play { margin-block: auto; width: 100%; }
 .panel-foot { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-top: 1px solid var(--sep); }
 .panel-foot .field { height: 40px; padding: 0 12px; font-size: 14px; }
 .panel-foot .btn { height: 40px; padding: 0 14px; font-size: 14px; }
-#friend-sections { gap: 0; }
 .panel .group { background: none; border: 0; border-radius: 0; }
 .panel .section { margin: 12px 0 4px; padding: 0 12px; }
 .panel .section:first-child { margin-top: 4px; }
@@ -86,7 +85,7 @@ main > #play { margin-block: auto; width: 100%; }
 .panel .group + .group { margin-top: 10px; }
 .panel .friend .btn.small { height: 32px; padding: 0 12px; font-size: 13px; }
 .panel .friend .x { width: 32px; height: 32px; }
-.panel .friend:not(:hover) .x:not(:focus-visible) { opacity: 0; pointer-events: none; }
+.panel .friend:not(:hover) .x:not(:focus-visible) { position: absolute; right: 6px; opacity: 0; pointer-events: none; }
 .panel .empty { padding: 8px 12px; font-size: 14px; }
 .panel .me-chip { align-self: stretch; height: 44px; padding: 0 12px 0 5px; background: none; }
 .panel .me-chip:hover { background: var(--raised); }
@@ -182,14 +181,16 @@ label.row { cursor: pointer; }
 .dimensions { display: flex; align-items: center; gap: 8px; flex: none; }
 .inline { height: 36px; padding: 0 12px; color: var(--text); font-size: 14px; line-height: normal; user-select: text; }
 .inline::placeholder { color: var(--faint); }
-.inline.num { width: 68px; padding-inline: 8px; text-align: center; font-variant-numeric: tabular-nums; }
-.select-wrap { position: relative; display: inline-flex; flex: 0 0 132px; }
-.select-wrap svg { position: absolute; inset-inline-end: 13px; top: 50%; translate: 0 -50%; width: 14px; height: 14px; pointer-events: none; color: var(--muted); }
+.inline.num { width: 68px; padding: 0 8px 3px; text-align: center; font-variant-numeric: tabular-nums; }
+.select-wrap { position: relative; display: inline-flex; flex: 0 0 96px; }
+.select-wrap:has(#language) { flex-basis: 112px; }
+.select-wrap svg { position: absolute; inset-inline-end: 11px; top: 50%; translate: 0 -50%; width: 16px; height: 16px; pointer-events: none; color: var(--muted); }
 select.inline {
   appearance: none;
   width: 100%;
   cursor: pointer;
-  padding-inline: 30px;
+  padding: 0 0 2px;
+  padding-inline: 10px 34px;
   text-align: center;
   text-align-last: center;
   border: 1px solid var(--sep);
