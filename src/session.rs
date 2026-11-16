@@ -184,10 +184,10 @@ fn reserve_check(address: Ipv4Addr) -> Result<()> {
 
 /// One line about how reachable this host is from the internet.
 fn reachability(tunnel: &HostTunnel) -> &'static str {
-    if tunnel.forwarded {
-        "Открыт через UPnP"
+    if tunnel.forwarded() {
+        "UPnP: порт 48170 открыт"
     } else if tunnel.reflexive.addr.is_none() {
-        "Только локальная сеть"
+        "UPnP: недоступен на роутере"
     } else {
         tunnel.reflexive.mapping.label()
     }
@@ -375,7 +375,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
 
     let token = new_token();
     worker.status("Открываем доступ…");
-    let tunnel = HostTunnel::open(&identity, token)?;
+    let mut tunnel = HostTunnel::open(&identity, token)?;
     worker.check()?;
     worker.fact("Доступ", reachability(&tunnel));
     worker.fact(
@@ -593,6 +593,11 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
 
         // Reopens and new streams share one queue: Sunshine's "connected" has no guest ID.
         let now = Instant::now();
+        // A router that answered UPnP/NAT-PMP after the code was shown updates
+        // the lobby's reachability line in place.
+        if tunnel.refresh() {
+            worker.fact("Доступ", reachability(&tunnel));
+        }
         if now >= next_bandwidth {
             next_bandwidth = now + SAMPLE_INTERVAL;
             for guest in &mut guests {

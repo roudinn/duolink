@@ -22,8 +22,7 @@ use std::{
     sync::{
         Arc, Mutex, mpsc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    thread,
+    },    thread,
     time::{Duration, Instant},
 };
 
@@ -61,14 +60,23 @@ pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA
 const VIDEO_PORT: u16 = MEDIA_PORT + 9;
 pub const UDP_PORTS: [u16; 4] = [VIDEO_PORT, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
 const ALPN: &[u8] = b"duolink/2";
-const STUN_SERVERS: [&str; 3] = [
+/// Public STUN servers probed independently of DuoLink's own VPS, so external
+/// address and NAT type are still discovered when the signal server is down.
+const STUN_SERVERS: [&str; 4] = [
     "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
     "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.stunprotocol.org:3478",
 ];
+/// Upper bound for one STUN round trip when the server is unreachable; lets the
+/// whole discovery finish in well under a second even when our VPS is down.
+const STUN_TIMEOUT: Duration = Duration::from_millis(900);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const ROUTE_WINDOW: Duration = Duration::from_millis(500);
 const ROUTE_PINGS: usize = 3;
+/// When the relay is unreachable, keep hammering the invite's addresses with
+/// QUIC Initial and punch packets before giving up.
+const LAST_RESORT: Duration = Duration::from_secs(6);
 const MAX_QUIC_UDP_PAYLOAD: u16 = 1232;
 /// Datagram "port" reserved for the bandwidth probe; Sunshine never uses 0.
 const PROBE_PORT: u16 = 0;
@@ -138,10 +146,20 @@ fn parse_stun(message: &[u8], txid: &[u8; 12]) -> Option<SocketAddrV4> {
 }
 
 fn stun_servers() -> Vec<SocketAddr> {
+    // Resolve everything up front so a stalled DNS lookup of one host cannot
+    // delay the rest of discovery.
     STUN_SERVERS
         .iter()
         .filter_map(|host| host.to_socket_addrs().ok()?.find(SocketAddr::is_ipv4))
         .collect()
+}
+
+/// All STUN origins in polling order: public servers first (they are the
+/// fallback that must work when our VPS is unreachable), the VPS second.
+fn stun_origins() -> Vec<SocketAddr> {
+    let mut servers = stun_servers();
+    servers.extend(infra::STUN.map(SocketAddr::V4));
+    servers
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,13 +198,15 @@ fn stun_batch(socket: &StdUdpSocket, servers: &[SocketAddr], wait: Duration) -> 
         (server, transaction, None)
     }).collect();
     let mut buffer = [0; 512];
+    // One shared deadline across every server, so a single silent origin (our
+    // VPS when it is down) cannot stall the rest of the batch.
+    let deadline = Instant::now() + wait;
     for _ in 0..2 {
         for (server, transaction, answer) in &requests {
             if answer.is_none() {
                 let _ = socket.send_to(&stun_request(transaction), server);
             }
         }
-        let deadline = Instant::now() + wait;
         while requests.iter().any(|request| request.2.is_none())
             && let Some(left) = deadline.checked_duration_since(Instant::now())
         {
@@ -211,12 +231,13 @@ fn stun_batch(socket: &StdUdpSocket, servers: &[SocketAddr], wait: Duration) -> 
 }
 
 fn discover(socket: &StdUdpSocket) -> Reflexive {
-    let mut answers = stun_batch(socket, &infra::STUN.map(SocketAddr::V4), Duration::from_millis(300));
-    if answers.len() < 2 || answers[0].1 == answers[1].1 {
-        // Two ports on one IP can't reveal address-dependent mapping. Use a
-        // second STUN origin if available, and retain the VPS mapping for peers.
-        answers.extend(stun_batch(socket, &stun_servers(), Duration::from_millis(350)));
-    }
+    // Ask everyone at once with a short budget. When the VPS is down, the
+    // public servers still answer within the window; when everything is up,
+    // answers from distinct origins let us distinguish Full Cone from
+    // Symmetric NAT. Keep the VPS mapping in the result so peers that reach it
+    // can still rendezvous through it.
+    let servers = stun_origins();
+    let answers = stun_batch(socket, &servers, STUN_TIMEOUT);
     let Some(&(server, addr)) = answers.first() else { return Reflexive::default() };
     let mapping = if answers.iter().any(|(_, other)| *other != addr) {
         Mapping::ChangesWithDestination
@@ -238,16 +259,38 @@ pub(crate) fn diagnose_network() -> Mapping {
 
 /* ------------------------------------------------------------------ UPnP */
 
+/// An open port mapping, closed again when the session ends.
 pub struct PortMapping {
-    gateway: igd_next::Gateway,
+    kind: PortMappingKind,
     port: u16,
+}
+
+enum PortMappingKind {
+    Upnp(igd_next::Gateway),
+    NatPmp,
+}
+
+impl PortMapping {
+    fn remove(&mut self) {
+        match &mut self.kind {
+            PortMappingKind::Upnp(gateway) => {
+                let _ = gateway.remove_port(igd_next::PortMappingProtocol::UDP, self.port);
+            }
+            PortMappingKind::NatPmp => {
+                // NAT-PMP has no explicit delete; a zero-lifetime request removes it.
+                if let Ok(gateway) = natpmp::get_default_gateway()
+                    && let Ok(mut client) = natpmp::Natpmp::new_with(gateway)
+                {
+                    let _ = client.send_port_mapping_request(natpmp::Protocol::UDP, self.port, self.port, 0);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for PortMapping {
     fn drop(&mut self) {
-        let _ = self
-            .gateway
-            .remove_port(igd_next::PortMappingProtocol::UDP, self.port);
+        self.remove();
     }
 }
 
@@ -256,9 +299,60 @@ fn shared_address(ip: Ipv4Addr) -> bool {
     a == 100 && (64..128).contains(&b)
 }
 
+/// Tries NAT-PMP (RFC 6886) on the default gateway. Returns the public endpoint.
+fn forward_natpmp(port: u16) -> Option<(SocketAddrV4, PortMapping)> {
+    let gateway = natpmp::get_default_gateway().ok()?;
+    let mut client = natpmp::Natpmp::new_with(gateway).ok()?;
+
+    // Read a reply, sleeping between attempts as the non-blocking client expects.
+    fn await_reply(client: &mut natpmp::Natpmp, want: fn(&natpmp::Response) -> bool) -> Option<natpmp::Response> {
+        for _ in 0..12 {
+            if let Ok(reply) = client.read_response_or_retry()
+                && want(&reply)
+            {
+                return Some(reply);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    // The public address comes from a separate request.
+    let external = {
+        client.send_public_address_request().ok()?;
+        match await_reply(&mut client, |r| matches!(r, natpmp::Response::Gateway(_)))? {
+            natpmp::Response::Gateway(reply) => *reply.public_address(),
+            _ => return None,
+        }
+    };
+    if external.is_private() || shared_address(external) || external.is_unspecified() {
+        return None;
+    }
+
+    // Now open the UDP mapping.
+    client
+        .send_port_mapping_request(natpmp::Protocol::UDP, port, port, 6 * 3600)
+        .ok()?;
+    let external_port = match await_reply(&mut client, |r| matches!(r, natpmp::Response::UDP(_)))? {
+        natpmp::Response::UDP(mapping) => mapping.public_port(),
+        _ => return None,
+    };
+    Some((
+        SocketAddrV4::new(external, external_port),
+        PortMapping {
+            kind: PortMappingKind::NatPmp,
+            port: external_port,
+        },
+    ))
+}
+
 /// Asks the router to forward `port`. Returns the public endpoint, unless the
 /// router itself sits behind another NAT (then forwarding would not help).
 fn forward_port(port: u16) -> Option<(SocketAddrV4, PortMapping)> {
+    forward_upnp(port).or_else(|| forward_natpmp(port))
+}
+
+fn forward_upnp(port: u16) -> Option<(SocketAddrV4, PortMapping)> {
     let gateway = igd_next::search_gateway(igd_next::SearchOptions {
         timeout: Some(Duration::from_millis(2500)),
         single_search_timeout: Some(Duration::from_millis(2500)),
@@ -287,7 +381,7 @@ fn forward_port(port: u16) -> Option<(SocketAddrV4, PortMapping)> {
     Some((
         SocketAddrV4::new(external, external_port),
         PortMapping {
-            gateway,
+            kind: PortMappingKind::Upnp(gateway),
             port: external_port,
         },
     ))
@@ -1069,11 +1163,12 @@ pub struct HostTunnel {
     endpoint: Endpoint,
     pub candidates: Vec<Candidate>,
     pub reflexive: Reflexive,
-    pub forwarded: bool,
+    forwarded: AtomicBool,
+    mapping: Mutex<Option<PortMapping>>,
+    mapping_rx: Mutex<Option<mpsc::Receiver<Option<(SocketAddrV4, PortMapping)>>>>,
     links: Arc<Mutex<Vec<Link>>>,
     probes: Arc<ProbeGate>,
     alive: Arc<AtomicBool>,
-    _mapping: Option<PortMapping>,
     _signal: Option<Subscription>,
 }
 
@@ -1084,9 +1179,16 @@ impl HostTunnel {
             .context("Сетевой порт занят.")?;
         let port = socket.local_addr()?.port();
 
-        let mapping = thread::spawn(move || forward_port(port));
+        // Ask the router for a forward concurrently with STUN discovery, but
+        // never block lobby creation on it: if the router is slow or silent the
+        // code is still generated instantly from the STUN and LAN candidates.
+        let (mapping_tx, mapping_rx) = mpsc::channel::<Option<(SocketAddrV4, PortMapping)>>();
+        thread::spawn(move || {
+            let _ = mapping_tx.send(forward_port(port));
+        });
         let reflexive = discover(&socket);
-        let mapping = mapping.join().ok().flatten();
+        // Give UPnP/NAT-PMP a moment that overlaps the STUN wait, then move on.
+        let mapping = mapping_rx.recv_timeout(Duration::from_millis(1200)).ok().flatten();
 
         let mut candidates = Vec::new();
         if let Some((addr, _)) = &mapping {
@@ -1160,18 +1262,48 @@ impl HostTunnel {
             None
         };
 
+        let forwarded = mapping.is_some();
         Ok(Self {
             runtime: Some(runtime),
             endpoint,
             candidates,
             reflexive,
-            forwarded: mapping.is_some(),
+            forwarded: AtomicBool::new(forwarded),
+            mapping: Mutex::new(mapping.map(|(_, mapping)| mapping)),
+            mapping_rx: Mutex::new(Some(mapping_rx)),
             links,
             probes,
             alive,
-            _mapping: mapping.map(|(_, mapping)| mapping),
             _signal: signal,
         })
+    }
+
+    /// Whether the router currently forwards the tunnel port (UPnP or NAT-PMP).
+    pub fn forwarded(&self) -> bool {
+        self.forwarded.load(Ordering::Relaxed)
+    }
+
+    /// Picks up a port mapping that finished after the invite was already shown.
+    /// Returns true when the router just became reachable through a forwarded port.
+    pub fn refresh(&mut self) -> bool {
+        let received = self
+            .mapping_rx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+            .flatten();
+        let Some((addr, mapping)) = received else {
+            return false;
+        };
+        *self.mapping.lock().unwrap() = Some(mapping);
+        self.forwarded.store(true, Ordering::Relaxed);
+        // The code is already in the guest's hands, but keeping the candidate
+        // here lets any later reconnect in the same session try the forwarded port.
+        if !self.candidates.iter().any(|c| c.addr == addr) {
+            self.candidates.push(Candidate { kind: PathKind::Forwarded, addr });
+        }
+        true
     }
 
     /// Keep test traffic off the uplink once the lobby starts streaming.
@@ -1537,6 +1669,9 @@ impl GuestTunnel {
         socket.set_read_timeout(None)?;
         socket.set_nonblocking(true)?;
         enlarge(socket2::SockRef::from(&socket));
+        // Держим отдельный дескриптор сокета, чтобы при недоступности ретранслятора
+        // сделать агрессивный P2P-дозвон с того же порта, который публикуется в коде.
+        let punch_socket = socket.try_clone()?;
         let runtime = runtime()?;
         let endpoint = {
             let _guard = runtime.enter();
@@ -1564,7 +1699,26 @@ impl GuestTunnel {
             Err(_) => {
                 check()?;
                 show_hint("Напрямую подключиться не удалось. Пробуем через сервер…");
-                runtime.block_on(connect_relay(&endpoint, config, token, port, relay_url, check))?
+                match runtime.block_on(connect_relay(&endpoint, config.clone(), token, port, relay_url, check)) {
+                    Ok(route) => route,
+                    Err(error) if error.is::<crate::relay::RelayFull>() => return Err(error),
+                    Err(_) => {
+                        // Сервер ретрансляции недоступен. Делаем ещё одну, более
+                        // агрессивную попытку пробиться напрямую ко всем адресам хоста.
+                        check()?;
+                        show_hint("Сервер ретрансляции недоступен. Пробуем пробиться напрямую…");
+                        let punching = Arc::new(AtomicBool::new(true));
+                        punch(&punch_socket, candidates.iter().map(|c| c.addr).collect(), LAST_RESORT, punching.clone());
+                        let route = runtime.block_on(choose_route(
+                            &endpoint, config, token, candidates,
+                            || failure_hint(reflexive.mapping, host_network.get()), &check,
+                        ));
+                        punching.store(false, Ordering::Relaxed);
+                        route.map_err(|_| anyhow::anyhow!(
+                            "Прямое подключение не прошло (закрыт порт 48170 у хоста или строгий NAT), а сервер ретрансляции сейчас недоступен."
+                        ))?
+                    }
+                }
             }
         };
         ensure!(conn.max_datagram_size().is_some_and(|size| size >= crate::media::LEGACY_PACKET_SIZE + crate::media::VIDEO_PACKET_OVERHEAD),

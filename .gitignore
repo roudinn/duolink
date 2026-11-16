@@ -1,5 +1,6 @@
 target/
 .qa/
+.release-assets/
 *.log
 *.pfx
 *.p12
