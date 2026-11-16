@@ -18,6 +18,17 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
+#[derive(Debug)]
+pub(crate) struct RelayFull;
+
+impl std::fmt::Display for RelayFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ретранслятор занят. Для прямого подключения попробуйте сделать хостом игрока с публичным IPv4 или включённым UPnP.")
+    }
+}
+
+impl std::error::Error for RelayFull {}
+
 pub const HOST_BRIDGE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 254);
 const MAX_DATAGRAM: usize = 1232;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -39,6 +50,9 @@ async fn connect(url: &str, token: [u8; 16], guest: bool) -> Result<Socket> {
         loop {
             match socket.next().await {
                 Some(Ok(Message::Binary(data))) if data.as_ref() == b"ready" => return Ok(socket),
+                Some(Ok(Message::Binary(data))) if data.as_ref() == b"RelayFull" => {
+                    return Err(RelayFull.into());
+                }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 _ => anyhow::bail!("Сервер ретрансляции недоступен."),
             }

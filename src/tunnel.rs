@@ -1462,7 +1462,10 @@ async fn connect_relay(
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     let (addr, bridge) = loop {
         tokio::select! {
-            result = &mut bridge => break result.context("Резервное подключение недоступно.")?,
+            result = &mut bridge => match result {
+                Err(error) if error.is::<crate::relay::RelayFull>() => return Err(error),
+                result => break result.context("Резервное подключение недоступно.")?,
+            },
             _ = poll.tick() => check()?,
         }
     };

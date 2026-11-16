@@ -18,6 +18,15 @@
 
 Play local multiplayer games online with a friend, including split-screen games, fighting games, and emulators that support multiple controllers. DuoLink streams the host's game and audio, and the guest joins with a separate gamepad.
 
+## How DuoLink compares
+
+| Feature | DuoLink | Parsec | Steam Remote Play Together |
+| --- | --- | --- | --- |
+| Accounts | **Neither player needs one** | Both players need a Parsec account | Host uses Steam. Guests can join by link without an account |
+| Games | **Local multiplayer games and emulators with controller support** | Streams the host desktop, including games outside Steam | Steam games marked Remote Play Together |
+| Video settings | **No built-in FPS or resolution cap**. AV1 or HEVC on supported hardware | Resolution, FPS and bitrate settings. H.264 or HEVC | Resolution, frame rate and bandwidth settings |
+| Connecting from different networks | **Direct QUIC with automatic HTTPS fallback** | Direct UDP. Some networks require additional setup | Connects through Steam |
+
 ## First session
 
 1. Download and run `DuoLink.exe` on both PCs.
@@ -30,7 +39,9 @@ Play local multiplayer games online with a friend, including split-screen games,
 The main download is the installer. Extract the ZIP with `portable` in its name to run DuoLink from its own folder.
 
 > [!WARNING]
-> The current release EXE is unsigned. Windows may show a SmartScreen warning. Download the file from DuoLink's official release. If Windows blocks it, include the warning text in a bug report. [How Windows verifies publishers](https://learn.microsoft.com/windows/apps/package-and-deploy/code-signing-options)
+> The release EXE is unsigned, so Windows may show a SmartScreen warning. DuoLink’s source is public. With the [build prerequisites](docs/SELF_HOSTING.md#windows-клиент) installed, run `cargo build --release --locked` to build it yourself.
+>
+> Compare `Get-FileHash .\DuoLink.exe -Algorithm SHA256` with `SHA256SUMS.txt` in the release assets. If Defender quarantines a file, check the detection name in Protection history and [submit the file to Microsoft for analysis](https://www.microsoft.com/en-us/wdsi/filesubmission).
 
 ## FAQ
 
@@ -51,7 +62,7 @@ Yes, as a spectator. XInput games can see up to four controllers, including the 
 <details>
 <summary>What if both networks have strict NAT?</summary>
 
-Update DuoLink on both PCs. If a direct connection fails, DuoLink tries the relay. The fallback limits bitrate, and latency depends on the route to the server.
+Update DuoLink on both PCs. If a direct connection fails, DuoLink tries the relay. The fallback limits bitrate, and latency depends on the route to the server. Communities can also [run their own relay](docs/SELF_HOSTING.md#свой-ретранслятор).
 
 </details>
 

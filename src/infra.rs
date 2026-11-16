@@ -18,6 +18,11 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use crate::platform::{run_tool, system_tool};
 
 pub(crate) fn relay_url() -> String {
+    if let Ok(url) = std::env::var("DUOLINK_RELAY_URL")
+        && url.starts_with("wss://")
+    {
+        return url;
+    }
     format!("wss://{}/relay", ORIGIN.trim_start_matches("https://"))
 }
 
