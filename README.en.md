@@ -22,10 +22,10 @@ Play local multiplayer games online with a friend, including split-screen games,
 
 | Feature | DuoLink | Parsec | Steam Remote Play Together |
 | --- | --- | --- | --- |
-| Accounts | **Neither player needs one** | Both players need a Parsec account | Host uses Steam. Guests can join by link without an account |
-| Games | **Local multiplayer games and emulators with controller support** | Streams the host desktop, including games outside Steam | Steam games marked Remote Play Together |
-| Video settings | **No built-in FPS or resolution cap**. AV1 or HEVC on supported hardware | Resolution, FPS and bitrate settings. H.264 or HEVC | Resolution, frame rate and bandwidth settings |
-| Connecting from different networks | **Direct QUIC with automatic HTTPS fallback** | Direct UDP. Some networks require additional setup | Connects through Steam |
+| Play without an account on either side | **Yes, with a session code** | No | No, the host needs Steam |
+| Non-Steam games and emulators | **Yes** | Yes | Games with Remote Play Together support |
+| FPS and resolution caps | **No built-in caps** | Up to 8192 × 4320 | Up to 8K |
+| Play without a VPN or manual port forwarding | **Yes, with automatic HTTPS fallback** | Yes, if direct UDP works | Yes |
 
 ## First session
 
