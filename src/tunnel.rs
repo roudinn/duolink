@@ -60,8 +60,8 @@ pub const TCP_PORTS: [u16; 4] = [CONTROL_PORT, MEDIA_PORT - 5, MEDIA_PORT, MEDIA
 const VIDEO_PORT: u16 = MEDIA_PORT + 9;
 pub const UDP_PORTS: [u16; 4] = [VIDEO_PORT, MEDIA_PORT + 10, MEDIA_PORT + 11, crate::audio::AUDIO_PORT];
 const ALPN: &[u8] = b"duolink/2";
-/// Public STUN servers probed independently of DuoLink's own VPS, so external
-/// address and NAT type are still discovered when the signal server is down.
+/// Public STUN servers, so external address and NAT type are always discovered
+/// without depending on any private server.
 const STUN_SERVERS: [&str; 4] = [
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
@@ -1225,8 +1225,9 @@ impl HostTunnel {
         let links = Arc::new(Mutex::new(Vec::<Link>::new()));
         let probes = Arc::new(ProbeGate::default());
         runtime.spawn(accept(endpoint.clone(), token, links.clone(), probes.clone()));
-        if !cfg!(test) {
-            runtime.spawn(crate::relay::host(crate::infra::relay_url(), token, port));
+        let url = crate::infra::relay_url();
+        if !url.is_empty() {
+            runtime.spawn(crate::relay::host(url, token, port));
         }
         #[cfg(test)]
         if let Ok(url) = std::env::var("DUOLINK_TEST_SESSION_RELAY") {
@@ -1698,8 +1699,17 @@ impl GuestTunnel {
             Err(error) if error.is::<InviteRefused>() => return Err(error),
             Err(_) => {
                 check()?;
-                show_hint("Напрямую подключиться не удалось. Пробуем через сервер…");
-                match runtime.block_on(connect_relay(&endpoint, config.clone(), token, port, relay_url, check)) {
+                if relay_url.is_empty() {
+                    // No relay server: go straight to the aggressive direct punch.
+                    show_hint("Сервер ретрансляции недоступен. Пробуем пробиться напрямую…");
+                } else {
+                    show_hint("Напрямую подключиться не удалось. Пробуем через сервер…");
+                }
+                match if relay_url.is_empty() {
+                    Err(anyhow::anyhow!("no relay"))
+                } else {
+                    runtime.block_on(connect_relay(&endpoint, config.clone(), token, port, relay_url, check))
+                } {
                     Ok(route) => route,
                     Err(error) if error.is::<crate::relay::RelayFull>() => return Err(error),
                     Err(_) => {

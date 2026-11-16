@@ -18,20 +18,27 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use crate::platform::{run_tool, system_tool};
 
 pub(crate) fn relay_url() -> String {
+    // No relay server is deployed; direct P2P is the only path. Return an
+    // empty string so callers skip the relay entirely. A custom relay can
+    // still be injected via DUOLINK_RELAY_URL.
     if let Ok(url) = std::env::var("DUOLINK_RELAY_URL")
         && url.starts_with("wss://")
     {
         return url;
     }
-    format!("wss://{}/relay", ORIGIN.trim_start_matches("https://"))
+    String::new()
 }
 
-const ORIGIN: &str = "https://duolink.154.86.119.7.sslip.io";
-const SIGNAL_ADDRESS: &str = "duolink.154.86.119.7.sslip.io:443:154.86.119.7";
+// Signalling runs on ntfy.sh, a public publish/subscribe service reachable
+// without our own server. Messages are already sealed (AES-256-GCM), so a
+// public topic leaks nothing. Every topic is a 32-hex hash, so it is hard to
+// guess and effectively private.
+const ORIGIN: &str = "https://ntfy.sh";
 static USE_FIXED_ADDRESS: AtomicBool = AtomicBool::new(false);
+// STUN uses public servers only (Google, Cloudflare); no private VPS.
 pub(crate) const STUN: [SocketAddrV4; 2] = [
-    SocketAddrV4::new(std::net::Ipv4Addr::new(154, 86, 119, 7), 3478),
-    SocketAddrV4::new(std::net::Ipv4Addr::new(154, 86, 119, 7), 3479),
+    SocketAddrV4::new(std::net::Ipv4Addr::new(142, 250, 74, 14), 19302),
+    SocketAddrV4::new(std::net::Ipv4Addr::new(162, 159, 192, 9), 3478),
 ];
 
 fn curl() -> Result<Command> {
@@ -42,16 +49,13 @@ fn curl() -> Result<Command> {
 }
 
 fn signal(topic: &str) -> String {
-    format!("{ORIGIN}/signal/{topic}")
+    format!("{ORIGIN}/{topic}")
 }
 
 fn signal_curl(fixed: bool) -> Result<Command> {
     let mut command = curl()?;
     command.args(["--connect-timeout", "3"]);
-    if fixed {
-        // Keep the HTTPS hostname, SNI and certificate verification.
-        command.args(["--resolve", SIGNAL_ADDRESS]);
-    }
+    let _ = fixed;
     Ok(command)
 }
 
@@ -74,9 +78,9 @@ fn with_signal_route<T>(request: impl Fn(bool) -> Result<(T, bool)>) -> Result<T
 
 #[derive(Deserialize)]
 pub(crate) struct SignalEvent {
-    pub id: u64,
     pub topic: String,
     pub time: u64,
+    #[serde(default)]
     pub message: String,
 }
 
@@ -129,6 +133,7 @@ pub(crate) fn history(topic: &str, timeout: &str) -> Result<Vec<SignalEvent>> {
     let (body, _) = history_response(&output.stdout);
     Ok(String::from_utf8_lossy(body).lines()
         .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|event: &SignalEvent| !event.message.is_empty())
         .collect())
 }
 
@@ -154,13 +159,13 @@ impl Subscription {
         let task_stop = stop.clone();
         thread::spawn(move || {
             let mut cursor = since;
-            let mut last_id = 0;
+            let mut last_time = 0;
             let mut retry = 1;
             let mut fixed = USE_FIXED_ADDRESS.load(Ordering::Relaxed);
             let mut deliver = |event: SignalEvent| {
-                if event.topic == topic && event.id > last_id {
+                if event.topic == topic && !event.message.is_empty() && event.time >= last_time {
                     cursor = cursor.max(event.time);
-                    last_id = event.id;
+                    last_time = event.time;
                     receive(event);
                 }
                 cursor
@@ -236,44 +241,31 @@ pub(crate) fn sha256(path: &Path) -> Result<String> {
 pub(crate) fn fetch(
     name: &str,
     origin: &str,
-    mirror: Option<&str>,
+    _mirror: Option<&str>,
     expected: &str,
     target: &Path,
     log: &File,
     check: &impl Fn() -> Result<()>,
 ) -> Result<()> {
-    let mirror = mirror.map(|name| format!("{ORIGIN}/downloads/{name}"));
-    for (url, timeout, retry) in mirror.as_deref().into_iter().map(|url| (url, "4", false))
-        .chain([(origin, "15", false)])
-        .chain(mirror.as_deref().into_iter().map(|url| (url, "4", true)))
-    {
-        check()?;
-        let _ = fs::remove_file(target);
-        let _ = writeln!(&*log, "GET {url}");
-        let mut download = curl()?;
-        if retry {
-            // The mirror may be full and the official source unavailable.
-            download.args(["--retry", "6", "--retry-max-time", "90"]);
-        }
-        let outcome = run_tool(
-            download.args(["--fail", "--location", "--show-error", "--proto-redir", "=https",
-                "--connect-timeout", timeout, "--max-time", "180", "--output"])
-                .arg(target).arg(url)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.try_clone()?),
-            check,
-        );
-        check()?;
-        if outcome.is_err() {
-            continue;
-        }
-        if sha256(target)? == expected {
-            return Ok(());
-        }
-        let _ = writeln!(&*log, "SHA-256 mismatch");
-        let _ = fs::remove_file(target);
-        if url == origin {
-            anyhow::bail!("Контрольная сумма {name} не совпала.");
-        }
+    // No mirror server is deployed: download straight from the source (GitHub),
+    // which is reachable without our own infrastructure.
+    let _ = fs::remove_file(target);
+    let _ = writeln!(&*log, "GET {origin}");
+    let outcome = run_tool(
+        curl()?.args(["--fail", "--location", "--show-error", "--proto-redir", "=https",
+            "--connect-timeout", "15", "--max-time", "180", "--output"])
+            .arg(target).arg(origin)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.try_clone()?),
+        check,
+    );
+    check()?;
+    if outcome.is_err() {
+        anyhow::bail!("Не удалось скачать {name}. См. журнал.");
     }
-    anyhow::bail!("Не удалось скачать {name}. См. журнал.");
+    if sha256(target)? == expected {
+        return Ok(());
+    }
+    let _ = writeln!(&*log, "SHA-256 mismatch");
+    let _ = fs::remove_file(target);
+    anyhow::bail!("Контрольная сумма {name} не совпала.");
 }

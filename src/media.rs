@@ -73,8 +73,7 @@ mod download_tests {
         assert!(sunshine.is_file() && moonlight.is_file() && driver.is_file());
         for name in [SUNSHINE.directory, MOONLIGHT.directory, "download-ViGEmBus"] {
             let log = fs::read_to_string(data.path().join("logs").join(format!("{name}.log"))).unwrap();
-            assert!(log.contains("sslip.io/downloads/"));
-            assert!(!log.contains("GET https://github.com/"));
+            assert!(log.contains("GET https://github.com/"));
         }
         assert_eq!(SUNSHINE.ensure(data.path(), || panic!("cached engine")).unwrap(), sunshine);
         assert_eq!(MOONLIGHT.ensure(data.path(), || panic!("cached engine")).unwrap(), moonlight);
