@@ -24,7 +24,7 @@ Play local multiplayer games online with a friend, including split-screen games,
 | --- | --- | --- | --- |
 | Play without an account on either side | **Yes, with a session code** | No | No, the host needs Steam |
 | Non-Steam games and emulators | **Yes** | Yes | Games with Remote Play Together support |
-| FPS and resolution caps | **No built-in caps** | Up to 8192 × 4320 | Up to 8K |
+| FPS and resolution caps | **No built-in caps** | Limited | Limited |
 | Play without a VPN or manual port forwarding | **Yes, with automatic HTTPS fallback** | Yes, if direct UDP works | Yes |
 
 ## First session
