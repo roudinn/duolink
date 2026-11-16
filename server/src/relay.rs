@@ -21,6 +21,14 @@ use tokio::sync::{Semaphore, mpsc};
 
 const MAX_DATAGRAM: usize = 1232;
 const MAX_GUESTS: usize = 4;
+const MAX_RELAY_SESSIONS: usize = 5;
+const ROOM_BYTES_PER_SECOND: f64 = 1_000_000.0;
+const ROOM_BURST: f64 = 64_000.0;
+
+async fn report_full(socket: &mut WebSocket) {
+    send(socket, Message::Binary(b"RelayFull".to_vec().into())).await;
+    let _ = send(socket, Message::Close(None)).await;
+}
 const BYTES_PER_SECOND: f64 = 3_000_000.0;
 const BURST: f64 = 160_000.0;
 type Key = [u8; 32];
@@ -29,6 +37,7 @@ type Queue = mpsc::Sender<Message>;
 struct Room {
     host: Queue,
     guests: HashMap<u32, Queue>,
+    budget: Budget,
 }
 
 struct Budget {
@@ -37,11 +46,17 @@ struct Budget {
 }
 
 impl Budget {
-    fn take(&mut self, bytes: usize) -> bool {
+    fn new(burst: f64) -> Self {
+        Self {
+            remaining: burst,
+            updated: Instant::now(),
+        }
+    }
+
+    fn take(&mut self, bytes: usize, rate: f64, burst: f64) -> bool {
         let now = Instant::now();
-        self.remaining = (self.remaining
-            + now.duration_since(self.updated).as_secs_f64() * BYTES_PER_SECOND)
-            .min(BURST);
+        self.remaining =
+            (self.remaining + now.duration_since(self.updated).as_secs_f64() * rate).min(burst);
         self.updated = now;
         if self.remaining < bytes as f64 {
             return false;
@@ -65,10 +80,7 @@ pub fn router() -> Router {
             rooms: Mutex::new(HashMap::new()),
             sockets: Semaphore::new(48),
             next_guest: AtomicU32::new(1),
-            budget: Mutex::new(Budget {
-                remaining: BURST,
-                updated: Instant::now(),
-            }),
+            budget: Mutex::new(Budget::new(BURST)),
         }))
 }
 
@@ -89,6 +101,7 @@ async fn send(socket: &mut WebSocket, msg: Message) -> bool {
 
 async fn serve(relay: Arc<Relay>, mut socket: WebSocket) {
     let Ok(_permit) = relay.sockets.try_acquire() else {
+        report_full(&mut socket).await;
         return;
     };
     let Ok(Some(Ok(Message::Binary(hello)))) =
@@ -110,26 +123,39 @@ async fn serve(relay: Arc<Relay>, mut socket: WebSocket) {
                     Room {
                         host: outgoing,
                         guests: HashMap::new(),
+                        budget: Budget::new(ROOM_BURST),
                     },
                 );
-                0
+                Some(0)
             }
             1 => {
+                let active = rooms
+                    .values()
+                    .filter(|room| !room.guests.is_empty())
+                    .count();
                 let Some(room) = rooms.get_mut(&key) else {
                     return;
                 };
-                if room.guests.len() >= MAX_GUESTS {
-                    return;
+                if room.guests.len() >= MAX_GUESTS
+                    || (room.guests.is_empty() && active >= MAX_RELAY_SESSIONS)
+                {
+                    None
+                } else {
+                    let id = relay.next_guest.fetch_add(1, Ordering::Relaxed);
+                    if id == 0 || room.guests.contains_key(&id) {
+                        return;
+                    }
+                    room.guests.insert(id, outgoing);
+                    Some(id)
                 }
-                let id = relay.next_guest.fetch_add(1, Ordering::Relaxed);
-                if id == 0 || room.guests.contains_key(&id) {
-                    return;
-                }
-                room.guests.insert(id, outgoing);
-                id
             }
             _ => return,
         }
+    };
+
+    let Some(id) = id else {
+        report_full(&mut socket).await;
+        return;
     };
 
     if send(&mut socket, Message::Binary(b"ready"[..].to_vec().into())).await {
@@ -165,8 +191,10 @@ async fn serve(relay: Arc<Relay>, mut socket: WebSocket) {
 }
 
 fn forward(relay: &Relay, key: &Key, id: u32, packet: axum::body::Bytes) {
-    let rooms = relay.rooms.lock().unwrap();
-    let Some(room) = rooms.get(key) else { return };
+    let mut rooms = relay.rooms.lock().unwrap();
+    let Some(room) = rooms.get_mut(key) else {
+        return;
+    };
     let (target, datagram) = if id == 0 {
         if packet.len() <= 4 {
             return;
@@ -185,7 +213,14 @@ fn forward(relay: &Relay, key: &Key, id: u32, packet: axum::body::Bytes) {
         datagram.extend_from_slice(&packet);
         (&room.host, datagram.into())
     };
-    if datagram.len() <= MAX_DATAGRAM + 4 && relay.budget.lock().unwrap().take(datagram.len() + 48)
+    let bytes = datagram.len() + 48;
+    if datagram.len() <= MAX_DATAGRAM + 4
+        && room.budget.take(bytes, ROOM_BYTES_PER_SECOND, ROOM_BURST)
+        && relay
+            .budget
+            .lock()
+            .unwrap()
+            .take(bytes, BYTES_PER_SECOND, BURST)
     {
         let _ = target.try_send(Message::Binary(datagram));
     }
