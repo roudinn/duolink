@@ -17,6 +17,7 @@
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="3"/><path d="M15.5 8.5V7a2.5 2.5 0 0 0-2.5-2.5H7A2.5 2.5 0 0 0 4.5 7v6A2.5 2.5 0 0 0 7 15.5h1.5"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
     <symbol id="i-external" viewBox="0 0 24 24"><path d="M13 5h6v6m0-6-8 8m6 0v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h5"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M20 12H4m6-6-6 6 6 6"/></symbol>
     <symbol id="i-paste" viewBox="0 0 24 24"><rect x="5.5" y="5" width="13" height="15.5" rx="3"/><path d="M9 5V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/></symbol>
   </svg>
@@ -136,7 +137,7 @@
       <div class="group">
         <div class="row">
           <label for="language" class="label">Язык</label>
-          <select id="language" class="inline"><option value="ru">Русский</option><option value="en">English</option></select>
+          <span class="select-wrap"><select id="language" class="inline"><option value="ru">Русский</option><option value="en">English</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span>
         </div>
       </div>
       <p class="section">Профиль</p>
@@ -161,7 +162,7 @@
         <div class="row"><label for="fps" class="label">FPS</label><input id="fps" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
         <div class="row"><label for="bitrate" class="label">Битрейт, Мбит/с</label><input id="bitrate" class="inline num" inputmode="numeric" placeholder="авто" maxlength="16"></div>
         <div class="row"><label for="codec" class="label">Кодек</label>
-          <select id="codec" class="inline"><option value="auto">Авто</option><option value="hevc">HEVC</option><option value="av1">AV1</option><option value="h264">H.264</option></select></div>
+          <span class="select-wrap"><select id="codec" class="inline"><option value="auto">Авто</option><option value="hevc">HEVC</option><option value="av1">AV1</option><option value="h264">H.264</option></select><svg aria-hidden="true"><use href="#i-chevron-down"/></svg></span></div>
         <label class="row"><span class="row-text"><span class="label">YUV 4:4:4</span><small>Цвет мелких деталей</small></span><input id="yuv444" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">HDR</span><input id="hdr" type="checkbox" role="switch"></label>
         <label class="row"><span class="label">Окно без рамки</span><input id="windowed" type="checkbox" role="switch"></label>
