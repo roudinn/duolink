@@ -1,8 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
+import { isIPv4 } from "node:net";
 
-const address = "154.86.119.7";
-const origin = "https://duolink.154.86.119.7.sslip.io";
+const address = process.env.DUOLINK_HEALTH_IPV4;
+const origin = process.env.DUOLINK_HEALTH_ORIGIN?.replace(/\/$/, "");
+if (!address || !isIPv4(address) || !origin?.startsWith("https://")) {
+  console.error("Set DUOLINK_HEALTH_IPV4 to your server IPv4 and DUOLINK_HEALTH_ORIGIN to its HTTPS origin.");
+  process.exit(2);
+}
 
 async function checkHttps() {
   try {

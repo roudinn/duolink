@@ -2,6 +2,15 @@ name: DuoLink server
 
 on:
   workflow_dispatch:
+    inputs:
+      ipv4:
+        description: Public IPv4 of a self-hosted server
+        type: string
+        required: true
+      origin:
+        description: HTTPS origin of a self-hosted server
+        type: string
+        required: true
   push:
     paths:
       - "server/**"
@@ -53,4 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Check public HTTPS and both STUN ports
+        env:
+          DUOLINK_HEALTH_IPV4: ${{ inputs.ipv4 }}
+          DUOLINK_HEALTH_ORIGIN: ${{ inputs.origin }}
         run: node server/tests/public-status.mjs

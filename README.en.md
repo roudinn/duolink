@@ -4,7 +4,7 @@
   <h1>DuoLink</h1>
   <p>Play local co-op and versus games online on Windows.</p>
   <p><strong>Join by code without an account. No built-in caps on FPS or resolution.</strong></p>
-  <p>Direct QUIC with HTTPS fallback. Hardware AV1 or HEVC video and adaptive bitrate.</p>
+  <p>Direct QUIC connection. Hardware AV1 or HEVC video and adaptive bitrate.</p>
   <p>
     <img alt="Windows 10 and 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-303036?style=flat-square">
     <a href="https://github.com/roudinn/duolink/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/roudinn/duolink?style=flat-square&amp;color=303036"></a>
@@ -50,7 +50,7 @@ Play local multiplayer games online with a friend, including split-screen games,
   </tr>
   <tr>
     <td>Play without a VPN or manual port forwarding</td>
-    <td><strong>Yes, with automatic HTTPS fallback</strong></td>
+    <td><strong>Yes, if direct UDP works</strong></td>
     <td>Yes, if direct UDP works</td>
     <td>Yes</td>
   </tr>
@@ -91,7 +91,7 @@ Yes, as a spectator. XInput games can see up to four controllers, including the 
 <details>
 <summary>What if both networks have strict NAT?</summary>
 
-Update DuoLink on both PCs. If a direct connection fails, DuoLink tries the relay. The fallback limits bitrate, and latency depends on the route to the server. Communities can also [run their own relay](docs/SELF_HOSTING.md#свой-ретранслятор).
+DuoLink connects directly. If the connection fails, try switching hosts. A public IPv4 address on either side or an open UDP port on the router can help. The release has no built-in relay.
 
 </details>
 

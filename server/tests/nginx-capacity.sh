@@ -13,7 +13,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-hostname=duolink.154.86.119.7.sslip.io
+hostname=link.example.net
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$hostname" \
     -addext "subjectAltName=DNS:$hostname" \
     -keyout "$test_dir/key.pem" -out "$test_dir/cert.pem" 2>"$test_dir/openssl.log"

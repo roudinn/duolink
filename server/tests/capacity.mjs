@@ -19,7 +19,7 @@ const caPath = process.env.DUOLINK_CAPACITY_CA;
 const transport = caPath ? https : http;
 const tls = caPath ? {
   ca: readFileSync(caPath),
-  servername: "duolink.154.86.119.7.sslip.io",
+  servername: "link.example.net",
 } : {};
 
 const state = mkdtempSync(join(tmpdir(), "duolink-capacity-"));
