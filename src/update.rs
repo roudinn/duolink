@@ -1,7 +1,7 @@
 //! Self-update from GitHub releases.
 //!
 //! The newest release's `DuoLink.exe` is downloaded next to the running exe,
-//! verified against the SHA-256 digest GitHub publishes for the asset, and
+//! verified against the published SHA-256 digest, and
 //! swapped in: Windows lets a running image be renamed, so the old file moves
 //! aside and the new one takes its name. The next start runs the new version
 //! and deletes the leftover.
@@ -106,7 +106,7 @@ struct Release {
 /// the time of the fastest.
 const PARTS: u64 = 4;
 
-fn latest() -> Result<Release> {
+fn latest_from_api() -> Result<Release> {
     let output = curl()?.args([
         "--max-time",
         "20",
@@ -131,7 +131,7 @@ fn latest() -> Result<Release> {
     let sha256 = asset["digest"]
         .as_str()
         .and_then(|digest| digest.strip_prefix("sha256:"))
-        .filter(|hex| hex.len() == 64)
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .context("GitHub не прислал контрольную сумму — обновление пропущено.")?;
     Ok(Release {
         version: version.trim_start_matches('v').to_string(),
@@ -139,6 +139,51 @@ fn latest() -> Result<Release> {
         sha256: sha256.to_ascii_lowercase(),
         size: asset["size"].as_u64().unwrap_or(0),
     })
+}
+
+fn manifest_digest(manifest: &str) -> Result<String> {
+    let mut digests = manifest.lines().filter_map(|line| {
+        let (digest, file) = line.split_once(char::is_whitespace)?;
+        (file.trim_start() == ASSET).then_some(digest)
+    });
+    let digest = digests.next().context("В списке контрольных сумм нет DuoLink.exe.")?;
+    ensure!(
+        digests.next().is_none() && digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Неверная контрольная сумма DuoLink.exe."
+    );
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn latest_from_manifest() -> Result<Release> {
+    let origin = format!("https://github.com/{REPOSITORY}/releases");
+    let redirect = curl()?.args([
+        "--no-location", "--max-time", "15", "--output", "NUL", "--write-out", "%{redirect_url}",
+        &format!("{origin}/latest"),
+    ]).output()?;
+    ensure!(redirect.status.success(), "Не удалось открыть страницу обновлений.");
+    let location = std::str::from_utf8(&redirect.stdout)?;
+    let tag_prefix = format!("{origin}/tag/");
+    let tag = location.trim().strip_prefix(&tag_prefix).context("Нет версии на странице обновлений.")?;
+    let version = tag.strip_prefix('v').context("Неверная версия на странице обновлений.")?;
+    let (major, minor, patch) = parse_version(version).context("Неверная версия на странице обновлений.")?;
+    ensure!(version == format!("{major}.{minor}.{patch}"), "Неверная версия на странице обновлений.");
+
+    let assets = format!("{origin}/download/{tag}");
+    let manifest = curl()?.args(["--max-time", "20", &format!("{assets}/SHA256SUMS.txt")]).output()?;
+    ensure!(manifest.status.success(), "Не удалось скачать список контрольных сумм.");
+    Ok(Release {
+        version: version.to_string(),
+        url: format!("{assets}/{ASSET}"),
+        sha256: manifest_digest(std::str::from_utf8(&manifest.stdout)?)?,
+        size: 0,
+    })
+}
+
+fn latest() -> Result<Release> {
+    match latest_from_api() {
+        Ok(release) => Ok(release),
+        Err(api) => latest_from_manifest().with_context(|| format!("Не удалось проверить обновления: {api:#}")),
+    }
 }
 
 fn sha256(path: &Path) -> Result<String> {
@@ -358,6 +403,17 @@ mod tests {
         assert!(update_lock(&exe.with_file_name("Other.exe")).unwrap().is_some());
         drop(lock);
         assert!(update_lock(&exe).unwrap().is_some());
+    }
+
+    #[test]
+    fn release_manifest_requires_unique_valid_exe_digest() {
+        let digest = "A0".repeat(32);
+        let entry = format!("{digest}  {ASSET}");
+        let manifest = format!("{}  DuoLink-portable.zip\r\n{entry}\r\n", "b".repeat(64));
+        assert_eq!(manifest_digest(&manifest).unwrap(), digest.to_ascii_lowercase());
+        assert!(manifest_digest("123  DuoLink.exe").is_err());
+        assert!(manifest_digest(&format!("{entry}\n{entry}")).is_err());
+        assert!(manifest_digest(&format!("{digest}  Other.exe")).is_err());
     }
 
     #[test]
