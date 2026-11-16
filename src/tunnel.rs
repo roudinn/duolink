@@ -1931,11 +1931,12 @@ mod tests {
                 endpoint,
                 candidates: Vec::new(),
                 reflexive: Reflexive::default(),
-                forwarded: false,
+                forwarded: AtomicBool::new(false),
+                mapping: Mutex::new(None),
+                mapping_rx: Mutex::new(None),
                 links,
                 probes,
                 alive: Arc::new(AtomicBool::new(true)),
-                _mapping: None,
                 _signal: None,
             };
             let join = async || {

@@ -403,24 +403,54 @@ pub fn announce(name: &str, public: &[u8; 32]) -> Result<()> {
 pub fn publish_nickname(name: &str, public: &[u8; 32]) -> Result<()> {
     let topic = directory_topic(name, tag(public));
     let envelope = URL_SAFE_NO_PAD.encode(public);
-    match infra::post(&topic, &envelope, "5")? {
-        200..=299 => Ok(()),
-        0 => bail!("Connection or DNS lookup timed out"),
-        status => bail!("HTTP {status}"),
+    let mut last_status = 0u16;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_secs(2 * attempt));
+        }
+        match infra::post(&topic, &envelope, "5") {
+            Ok(status) if (200..=299).contains(&status) => return Ok(()),
+            Ok(status) if (500..=599).contains(&status) || status == 429 => last_status = status,
+            Ok(0) => {
+                if attempt == 2 {
+                    bail!("Connection or DNS lookup timed out");
+                }
+            }
+            Ok(status) => bail!("HTTP {status}"),
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => {}
+        }
     }
+    if last_status == 429 {
+        bail!("Лимит отправки. Попробуйте позже.");
+    }
+    bail!("Сервис временно недоступен. Попробуйте позже.")
 }
 
 /// Finds the public key behind `name#tag`.
 pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
     let topic = directory_topic(name, wanted);
-    let keys: HashSet<[u8; 32]> = infra::history(&topic, "10")?
-        .into_iter()
-        .filter(|event| event.topic == topic)
-        .filter_map(|event| URL_SAFE_NO_PAD.decode(event.message.trim()).ok())
-        .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-        // The tag is a function of the key: an entry that does not match is forged.
-        .filter(|key| tag(key) == wanted)
-        .collect();
+    let mut keys: HashSet<[u8; 32]> = HashSet::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_secs(2 * attempt));
+        }
+        match infra::history(&topic, "10") {
+            Ok(events) => {
+                keys = events
+                    .into_iter()
+                    .filter(|event| event.topic == topic)
+                    .filter_map(|event| URL_SAFE_NO_PAD.decode(event.message.trim()).ok())
+                    .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    // The tag is a function of the key: an entry that does not match is forged.
+                    .filter(|key| tag(key) == wanted)
+                    .collect();
+                break;
+            }
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => {}
+        }
+    }
     match keys.len() {
         1 => Ok(keys.into_iter().next().unwrap()),
         0 => bail!("Ник не найден. Попросите друга открыть DuoLink или прислать код друга из настроек."),
