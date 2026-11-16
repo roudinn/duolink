@@ -295,7 +295,7 @@ dialog h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
 .sheet .row > button { flex: none; }
 .sheet .row > .label, .sheet .row-text { min-width: 0; }
 .sheet #video-feedback { padding: 4px 16px 0; }
-.btn.settings-foot { flex: none; height: 56px; margin-block-start: -1px; border-color: rgb(255 255 255 / .045); background: var(--surface); }
+.btn.settings-foot { flex: none; height: 56px; margin-block-start: 4px; border-color: rgb(255 255 255 / .045); background: var(--surface); }
 .settings-foot svg { width: 15px; height: 15px; }
 .dialog-feedback { padding: 12px 24px; border-top: 1px solid var(--sep); color: var(--muted); font-size: 14px; }
 .sheet > *, .view > *, .stack > * { flex-shrink: 0; }
