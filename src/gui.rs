@@ -148,7 +148,6 @@ enum Action {
     ClearCodeError,
     Paste,
     Graphics,
-    VirtualHid,
     CheckUpdate,
     Restart,
     Logs,
@@ -788,10 +787,6 @@ impl App {
             }
             Action::Graphics => open_or_toast(view, OsStr::new(GRAPHICS))?,
             Action::Support => open_or_toast(view, OsStr::new(SUPPORT_URL))?,
-            Action::VirtualHid if self.session_idle() => {
-                self.driver_setup = true;
-                self.setup.begin(setup::install_virtualhid(self.data.clone()), "Проверяем драйвер геймпада…");
-            }
             Action::Logs => {
                 let directory = self.data.join("logs");
                 let _ = fs::create_dir_all(&directory);

@@ -400,7 +400,6 @@ function renderSettings(next) {
   $("autostart").checked = next.autostart;
   const u = next.update;
   const busy = sessionBusy(next);
-  $("virtual-hid").disabled = busy;
   const ready = u.state === "ready";
   const notes = {
     checking: tr("Проверяем…"),
@@ -514,10 +513,6 @@ document.addEventListener("click", (e) => {
       $("video-title").scrollIntoView({ block: "start" });
       break;
     case "close_settings": settings.close(); break;
-    case "virtual_hid":
-      settings.close();
-      send(action);
-      break;
     case "toggle_view": go(view === "friends" ? "play" : "friends"); break;
     case "ask_remove":
       confirmRemove = id;

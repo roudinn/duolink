@@ -193,11 +193,6 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
     };
     // A second pass tightens the per-frame bitrate on links that already lose packets.
     let nvenc_twopass = if fec >= 40 { "quarter_res" } else { "disabled" };
-    // ViGEmBus only. "all" would let Sunshine create virtual pads through every
-    // driver at once (ViGEmBus + Virtual HID), so a guest's single gamepad shows
-    // up as several controllers or collides with the host's own pad. A single
-    // backend keeps one virtual pad per guest and preserves the XInput slots.
-    let gamepad_driver = "vigembus";
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -210,7 +205,7 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
          lan_encryption_mode = 0\n\
          wan_encryption_mode = 0\n\
          controller = enabled\n\
-         gamepad_driver = {gamepad_driver}\n\
+         gamepad_driver = vigembus\n\
          gamepad = x360\n\
          back_button_timeout = -1\n\
          keyboard = disabled\n\

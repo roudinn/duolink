@@ -28,7 +28,7 @@ use crate::{
     },
     platform::{
         KeepAwake, ProcessLock, StreamingTiming, WifiQuiet, background_recording, close_windows,
-        display_max_refresh, display_mode, vigem_present, virtualhid_running,
+        display_max_refresh, display_mode, vigem_present,
     },
     protocol::{
         CONTROL_PORT, ClientKey, Identity, Invite, MEDIA_PORT, Mode, Reply, Request, StreamBandwidth, Wire,
@@ -341,8 +341,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         .context("Не удалось зарезервировать сессию хоста.")?
         .context("На этом ПК уже открыта сессия DuoLink.")?;
     reserve_check(address)?;
-    let broker = virtualhid_running();
-    if !vigem_present() && !broker {
+    if !vigem_present() {
         worker.fact("Геймпады", "Нет драйвера");
     }
     if !SUNSHINE.path(&data).is_file() {

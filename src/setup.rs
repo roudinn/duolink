@@ -23,7 +23,7 @@ use windows_sys::Win32::{
 
 use crate::{
     infra,
-    platform::{system_tool, vigem_present, virtualhid_running},
+    platform::{system_tool, vigem_present},
     session::{Session, Worker},
     tunnel::TUNNEL_PORT,
 };
@@ -46,14 +46,6 @@ pub const VIGEM: Download = Download {
     sha256: "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a",
     file: "ViGEmBus_1.22.0_x64_x86_arm64.exe",
     mirror: Some("ViGEmBus_1.22.0_x64_x86_arm64.exe"),
-};
-
-const VIRTUALHID: Download = Download {
-    name: "Virtual HID Broker",
-    url: "https://github.com/LizardByte/libvirtualhid/releases/download/v2026.914.1218.10/libvirtualhid-Windows-AMD64-driver-installer.msi",
-    sha256: "bc31539a41f71939c13decb171ccbd4306fae1fed63273434a4f5ceccaf3e71c",
-    file: "libvirtualhid-2026.914.1218.10-amd64.msi",
-    mirror: None,
 };
 
 /// Downloads `item` into the cache once and verifies it before every use.
@@ -94,36 +86,6 @@ fn firewall_ready(powershell: &Path, program: &Path) -> Result<bool> {
 /// Checks the host's requirements and installs missing components.
 pub fn prepare(data: PathBuf) -> Session {
     Session::start(move |worker, _| run_install(worker, &data))
-}
-
-pub fn install_virtualhid(data: PathBuf) -> Session {
-    Session::start(move |worker, _| {
-        let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
-        if !virtualhid_running() {
-            worker.status("Скачиваем драйвер геймпада…");
-            let msi = fetch(&data, &VIRTUALHID, || worker.check())?;
-            worker.status("Подтвердите в окне Windows…");
-            let script = data.join("setup").join("install.ps1");
-            write_script(&script, INSTALL_SCRIPT)?;
-            let params = format!(
-                "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\" -VirtualHid \"{}\" -VirtualHidSha {} -Log \"{}\"",
-                script.display(), msi.display(), VIRTUALHID.sha256, data.join("logs/setup-virtualhid.log").display(),
-            );
-            let code = run_elevated(&powershell, &params, || worker.check())?;
-            ensure!(matches!(code, 0 | 20), "Не удалось установить Virtual HID Broker. Подробности в setup-virtualhid.log.");
-            ensure!(code != 20, "Перезагрузите ПК, чтобы закончить установку драйвера геймпада.");
-        }
-        ensure!(virtualhid_running(), "Windows не запустила Virtual HID Broker.");
-        open_virtualhid()?;
-        Ok("Активируйте лицензию Virtual HID Broker в открывшемся окне.".into())
-    })
-}
-
-fn open_virtualhid() -> Result<()> {
-    let path = PathBuf::from(std::env::var_os("ProgramFiles").context("Папка Program Files недоступна.")?)
-        .join(r"libvirtualhid\tools\windows\virtualhid_control.exe");
-    ensure!(path.is_file(), "Не найдено приложение Virtual HID Broker.");
-    crate::platform::open(path.as_os_str())
 }
 
 fn run_install(worker: &Worker, data: &Path) -> Result<String> {

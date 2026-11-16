@@ -311,29 +311,6 @@ impl Drop for StreamingTiming {
     }
 }
 
-pub(crate) fn virtualhid_running() -> bool {
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
-        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
-    };
-    let name: Vec<u16> = "libvirtualhid_broker\0".encode_utf16().collect();
-    unsafe {
-        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-        if manager.is_null() {
-            return false;
-        }
-        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS);
-        let mut status = SERVICE_STATUS::default();
-        let running = !service.is_null() && QueryServiceStatus(service, &mut status) != 0
-            && status.dwCurrentState == SERVICE_RUNNING;
-        if !service.is_null() {
-            CloseServiceHandle(service);
-        }
-        CloseServiceHandle(manager);
-        running
-    }
-}
-
 /// For the threads that move stream packets.
 pub fn prioritize_thread() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
