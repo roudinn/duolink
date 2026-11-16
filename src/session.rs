@@ -366,7 +366,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     // someone joins, it is already listening.
     let start_engine = |fec: u8| {
         HostStream::start(
-            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz, broker,
+            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz,
         )
     };
     let mut stream = start_engine(fec)?;

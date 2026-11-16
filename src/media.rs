@@ -186,14 +186,18 @@ pub fn fec_for_loss(loss: f64, local: bool) -> u8 {
     }
 }
 
-fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>, broker: bool) -> String {
+fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -> String {
     let refresh = match refresh_hz {
         Some(hz) => format!("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = {hz}\n"),
         None => "dd_refresh_rate_option = disabled\n".into(),
     };
     // A second pass tightens the per-frame bitrate on links that already lose packets.
     let nvenc_twopass = if fec >= 40 { "quarter_res" } else { "disabled" };
-    let gamepad_driver = if broker { "all" } else { "vigembus" };
+    // ViGEmBus only. "all" would let Sunshine create virtual pads through every
+    // driver at once (ViGEmBus + Virtual HID), so a guest's single gamepad shows
+    // up as several controllers or collides with the host's own pad. A single
+    // backend keeps one virtual pad per guest and preserves the XInput slots.
+    let gamepad_driver = "vigembus";
     format!(
         "sunshine_name = {DESKTOP}\n\
          port = {MEDIA_PORT}\n\
@@ -311,7 +315,6 @@ impl HostStream {
         peer_cert: &str,
         fec: u8,
         refresh_hz: Option<u32>,
-        broker: bool,
     ) -> Result<Self> {
         let root = exe.parent().context("Не найдена папка Sunshine.")?;
         let config = root.join("config");
@@ -338,7 +341,7 @@ impl HostStream {
         )?;
         fs::write(
             directory.path().join("sunshine.conf"),
-            host_config(rel, address, fec, refresh_hz, broker),
+            host_config(rel, address, fec, refresh_hz),
         )?;
         let (output, output_path) = create_log(data, "host")?;
         let process = Process::spawn(
@@ -946,10 +949,10 @@ mod tests {
         assert_eq!(fec_for_loss(0.02, false), 25);
         assert_eq!(fec_for_loss(0.05, false), 40);
         assert_eq!(fec_for_loss(0.2, false), 50);
-        let config = host_config("x", Ipv4Addr::LOCALHOST, 90, None, true);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, 90, None);
         assert!(config.contains("fec_percentage = 60"));
         assert!(config.contains("nvenc_twopass = quarter_res"));
-        assert!(config.contains("gamepad_driver = all"));
+        assert!(config.contains("gamepad_driver = vigembus"));
     }
 
     #[test]
@@ -964,7 +967,7 @@ mod tests {
         let smooth = guest_args(false, mode, false, Preferences { smooth: true, ..Preferences::default() }, PACKET_SIZE);
         assert!(smooth.iter().any(|arg| arg == "--vsync"));
         assert!(smooth.iter().any(|arg| arg == "--frame-pacing"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None, false);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
         assert!(config.contains("nvenc_twopass = disabled"));
         assert!(config.contains("nvenc_split_encode = enabled"));
         assert!(config.contains("amd_usage = ultralowlatency"));
@@ -992,9 +995,9 @@ mod tests {
 
     #[test]
     fn monitor_refresh_is_independent_of_stream_fps() {
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, Some(165), false);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, Some(165));
         assert!(config.contains("dd_refresh_rate_option = manual\ndd_manual_refresh_rate = 165\n"));
-        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None, false);
+        let config = host_config("x", Ipv4Addr::LOCALHOST, DEFAULT_FEC, None);
         assert!(config.contains("dd_refresh_rate_option = disabled\n"));
 
         let stream = Mode { width: 1920, height: 1080, fps: 60 };
