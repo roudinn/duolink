@@ -288,16 +288,15 @@ dialog[open] { display: flex; flex-direction: column; animation: sheet 200ms var
 dialog::backdrop { background: rgb(0 0 0 / .62); }
 .settings-panel > header { display: flex; flex: none; align-items: center; justify-content: space-between; padding: 10px 16px 0 24px; }
 dialog h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
-.sheet { min-height: 0; overflow-y: auto; margin-block-end: 12px; padding: 15px 12px 10px; display: flex; flex-direction: column; gap: 10px; scrollbar-gutter: stable both-edges; scroll-padding-block-start: 20px; mask-image: linear-gradient(to bottom, transparent, rgb(0 0 0 / .4) calc(var(--sheet-fade, 0px) * .45), #000 var(--sheet-fade, 0px)); }
+.sheet { min-height: 0; overflow-y: auto; padding: 15px 12px 22px; display: flex; flex-direction: column; gap: 10px; scrollbar-gutter: stable both-edges; scroll-padding-block-start: 20px; mask-image: linear-gradient(to bottom, transparent, rgb(0 0 0 / .4) calc(var(--sheet-fade, 0px) * .45), #000 var(--sheet-fade, 0px)); }
 .sheet .section { margin-top: 14px; font-size: 17px; }
 .sheet .label { font-weight: 400; }
 #update-check:not(.primary) { border-color: var(--rim); }
 .sheet .row > button { flex: none; }
 .sheet .row > .label, .sheet .row-text { min-width: 0; }
 .sheet #video-feedback { padding: 4px 16px 0; }
-.settings-foot { display: flex; flex: none; justify-content: center; margin-block-start: -1px; padding: 5px 16px; border-color: rgb(255 255 255 / .045); }
-.settings-foot .btn { height: 44px; padding-inline: 24px; font-size: 15px; }
-.settings-foot .btn svg { width: 15px; height: 15px; }
+.btn.settings-foot { flex: none; height: 56px; margin-block-start: -1px; border-color: rgb(255 255 255 / .045); background: var(--surface); }
+.settings-foot svg { width: 15px; height: 15px; }
 .dialog-feedback { padding: 12px 24px; border-top: 1px solid var(--sep); color: var(--muted); font-size: 14px; }
 .sheet > *, .view > *, .stack > * { flex-shrink: 0; }
 
