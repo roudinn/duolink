@@ -16,3 +16,5 @@
 <!-- Укажите, что изменилось для пользователя и когда это заметно. -->
 
 [Быстрый старт](https://github.com/roudinn/duolink#первая-игра) · [Сообщить об ошибке](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
+
+[Поддержать DuoLink через CloudTips](https://pay.cloudtips.ru/p/2d792cfa)

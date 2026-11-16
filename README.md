@@ -102,3 +102,7 @@
 ## Документация
 
 [Архитектура и сеть](docs/ARCHITECTURE.md) · [Конфиденциальность](docs/PRIVACY.md) · [Сообщить об ошибке](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
+
+## Поддержать DuoLink
+
+[Разовый донат через CloudTips](https://pay.cloudtips.ru/p/2d792cfa) помогает оплачивать сервер и развивать DuoLink.

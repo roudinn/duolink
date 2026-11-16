@@ -102,3 +102,7 @@ Open **Friends**, save a nickname and add your friend by their nickname and tag 
 ## Documentation
 
 [Architecture and networking](docs/ARCHITECTURE.md) · [Privacy (Russian)](docs/PRIVACY.md) · [Report a bug](https://github.com/roudinn/duolink/issues/new?template=bug_report.yml)
+
+## Support DuoLink
+
+[A one-time donation through CloudTips](https://pay.cloudtips.ru/p/2d792cfa) helps cover server costs and development.
