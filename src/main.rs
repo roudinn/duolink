@@ -7,6 +7,7 @@ mod friends;
 mod gui;
 mod infra;
 mod media;
+mod pairing;
 mod platform;
 mod presence;
 mod protocol;

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     infra,
+    pairing::Pairing,
     platform::{PrivateDir, Process, ProcessLock, display_refresh_would_drop, run_tool, system_tool},
     protocol::{Identity, MEDIA_PORT, Mode},
 };
@@ -229,6 +230,7 @@ fn host_config(rel: &str, address: Ipv4Addr, fec: u8, refresh_hz: Option<u32>) -
          {ENCODER}\
          file_apps = {rel}/apps.json\n\
          file_state = {rel}/state.json\n\
+         credentials_file = {rel}/credentials.json\n\
          pkey = {rel}/server.key\n\
          cert = {rel}/server.pem\n\
          log_path = {rel}/sunshine.log\n",
@@ -289,6 +291,7 @@ fn session_folder(config: &Path) -> Result<(PrivateDir, String, String)> {
 pub struct HostStream {
     process: Process,
     _directory: PrivateDir,
+    pub pairing: Pairing,
     output: PathBuf,
     offset: u64,
     tail: String,
@@ -306,8 +309,6 @@ impl HostStream {
         address: Ipv4Addr,
         identity: &Identity,
         host: Uuid,
-        peer: &str,
-        peer_cert: &str,
         fec: u8,
         refresh_hz: Option<u32>,
     ) -> Result<Self> {
@@ -316,6 +317,7 @@ impl HostStream {
         fs::create_dir_all(&config)?;
         let (directory, rel, conf_arg) = session_folder(&config)?;
         let rel = rel.as_str();
+        let pairing = Pairing::configure(address, identity, &directory.path().join("credentials.json"))?;
         fs::write(directory.path().join("server.pem"), &identity.cert_pem)?;
         fs::write(directory.path().join("server.key"), &identity.key_pem)?;
         fs::write(
@@ -330,7 +332,7 @@ impl HostStream {
             serde_json::to_vec(&json!({
                 "root": {
                     "uniqueid": host,
-                    "named_devices": [{ "name": peer, "uuid": Uuid::new_v4(), "cert": peer_cert, "enabled": true }]
+                    "named_devices": []
                 }
             }))?,
         )?;
@@ -351,6 +353,7 @@ impl HostStream {
         Ok(Self {
             process,
             _directory: directory,
+            pairing,
             output: output_path,
             offset: 0,
             tail: String::new(),

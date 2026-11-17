@@ -352,9 +352,6 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let _timing = StreamingTiming::hold();
 
     let identity = Identity::generate("DuoLink Host")?;
-    // One client identity for every guest: Sunshine trusts it from the start,
-    // so a new guest never waits for a restart.
-    let client = Identity::generate("DuoLink Guest")?;
     let host_id = Uuid::new_v4();
     let mut mode = display_mode()?;
     let current_hz = mode.fps;
@@ -365,7 +362,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     // someone joins, it is already listening.
     let start_engine = |fec: u8| {
         HostStream::start(
-            &engine, &data, address, &identity, host_id, "DuoLink", &client.cert_pem, fec, refresh_hz,
+            &engine, &data, address, &identity, host_id, fec, refresh_hz,
         )
     };
     let mut stream = start_engine(fec)?;
@@ -422,6 +419,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
     let mut joined_once = false;
     let mut knocks: Vec<Knock> = Vec::new();
     let mut guests: Vec<Guest> = Vec::new();
+    let mut paired = HashMap::<u32, String>::new();
     let mut capacity_by_network = HashMap::<PeerNetwork, u32>::new();
     let mut next_id = 1u32;
     let mut shown: Vec<Player> = Vec::new();
@@ -685,6 +683,18 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     close(&mut guest.wire, "Канал хоста занят. Снизьте битрейт или подключитесь позже.");
                     continue;
                 }
+                let client = match stream.pairing.add(&identity) {
+                    Ok((client, name)) => {
+                        paired.insert(guest.id, name);
+                        client
+                    }
+                    Err(error) => {
+                        worker.fact("Геймпады", format!("Guest pairing failed: {error:#}"));
+                        let mut guest = guests.remove(at);
+                        close(&mut guest.wire, "Не удалось подготовить отдельный геймпад. Попробуйте подключиться ещё раз.");
+                        continue;
+                    }
+                };
                 let reply = Reply::Ready {
                     host: host_id,
                     certificate: identity.cert_pem.clone(),
@@ -693,7 +703,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                     audio_opus: own_audio && guest.audio_opus,
                     auto_bitrate_kbps,
                     video_packet_size: Some(PACKET_SIZE),
-                    client: Some(ClientKey { certificate: client.cert_pem.clone(), key: client.key_pem.clone() }),
+                    client: Some(client),
                 };
                 if let Some(guest) = reply_to_guest(&mut guests, at, &reply) {
                     launch_released = true;
@@ -792,6 +802,15 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
         // A removed lobby entry must also stop video and virtual input, even
         // when its client ignores Closed or loses only the control connection.
         tunnel.retain_guests(&guests.iter().map(|guest| guest.port).collect::<Vec<_>>());
+        paired.retain(|id, name| {
+            if guests.iter().any(|guest| guest.id == *id) {
+                return true;
+            }
+            if let Err(error) = stream.pairing.remove(name) {
+                worker.fact("Геймпады", format!("Guest unpair failed: {error:#}"));
+            }
+            false
+        });
         if guests.iter().all(|guest| !guest.sent_ready) {
             tunnel.resume_probes();
             capacity_by_network.clear();

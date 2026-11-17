@@ -1,12 +1,14 @@
 [package]
 name = "duolink"
-version = "1.15.14"
+version = "1.15.15"
 edition = "2024"
 rust-version = "1.88"
 publish = false
 
 [dependencies]
 anyhow = "1"
+aes = "0.8"
+hex = "0.4"
 base64 = "0.22"
 rand = "0.8"
 rcgen = "0.14"
