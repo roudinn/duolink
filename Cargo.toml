@@ -1,6 +1,6 @@
 [package]
 name = "duolink"
-version = "1.15.15"
+version = "1.15.16"
 edition = "2024"
 rust-version = "1.88"
 publish = false

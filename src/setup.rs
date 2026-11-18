@@ -64,7 +64,19 @@ pub fn fetch(data: &Path, item: &Download, check: impl Fn() -> Result<()>) -> Re
     Ok(target)
 }
 
-fn firewall_ready(powershell: &Path, program: &Path) -> Result<bool> {
+/// The state of DuoLink's Windows Firewall rules.
+enum Firewall {
+    /// The rules are present and enabled; nothing to do.
+    Ready,
+    /// The rules are missing; add them (elevated) before hosting.
+    Missing,
+    /// The firewall service is down, denied, or the check failed. With the
+    /// service off the ports are not filtered, so hosting still works; the
+    /// caller should just note a warning and continue.
+    Unavailable,
+}
+
+fn firewall_state(powershell: &Path, program: &Path) -> Firewall {
     let status = Command::new(powershell)
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(include_str!("../scripts/check-firewall.ps1"))
@@ -74,12 +86,12 @@ fn firewall_ready(powershell: &Path, program: &Path) -> Result<bool> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .context("Не удалось проверить брандмауэр Windows.")?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!("Не удалось проверить брандмауэр Windows."),
+        .status();
+    match status.ok().and_then(|status| status.code()) {
+        Some(0) => Firewall::Ready,
+        Some(1) => Firewall::Missing,
+        // Any failure to run or a firewall-service error: never block hosting.
+        _ => Firewall::Unavailable,
     }
 }
 
@@ -91,9 +103,18 @@ pub fn prepare(data: PathBuf) -> Session {
 fn run_install(worker: &Worker, data: &Path) -> Result<String> {
     let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe")?;
     let program = std::env::current_exe()?;
-    let firewall = firewall_ready(&powershell, &program)?;
+    let firewall = firewall_state(&powershell, &program);
+    // A failed or denied firewall check must never stop hosting: with the
+    // firewall service off the ports are not filtered, so we just log it.
+    if let Firewall::Unavailable = firewall {
+        let _ = log_host_warning(
+            data,
+            "Проверка брандмауэра Windows недоступна (служба отключена или нет прав). \
+             Порты не блокируются, сессия продолжается.",
+        );
+    }
     let have_driver = vigem_present();
-    if have_driver && firewall {
+    if have_driver && matches!(firewall, Firewall::Ready | Firewall::Unavailable) {
         return Ok(String::new());
     }
     worker.check()?;
@@ -116,7 +137,7 @@ fn run_install(worker: &Worker, data: &Path) -> Result<String> {
     if let Some(path) = &vigem {
         params += &format!(" -ViGEm \"{}\" -ViGEmSha {}", path.display(), VIGEM.sha256);
     }
-    if !firewall {
+    if matches!(firewall, Firewall::Missing) {
         params += &format!(
             " -Firewall -Port {TUNNEL_PORT} -Program \"{}\"",
             program.display()
@@ -135,9 +156,20 @@ fn run_install(worker: &Worker, data: &Path) -> Result<String> {
         }
         ensure!(vigem_present(), "Windows не запустила драйвер геймпада. Подробности в setup.log.");
     }
-    ensure!(firewall || firewall_ready(&powershell, &program)?,
-        "Правила DuoLink не действуют. Проверьте политику брандмауэра Windows.");
+    // Firewall rules are best-effort: if the check now fails, the service is
+    // down (ports open) — host anyway. If it reports missing, we already asked
+    // to add them above; do not block the session on it either way.
     Ok(String::new())
+}
+
+/// Appends a warning to the host log without failing if the log cannot be written.
+fn log_host_warning(data: &Path, message: &str) -> Result<()> {
+    use std::io::Write;
+    let logs = data.join("logs");
+    fs::create_dir_all(&logs)?;
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(logs.join("host.log"))?;
+    writeln!(file, "[DuoLink] {message}")?;
+    Ok(())
 }
 
 /// Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page.
@@ -224,8 +256,8 @@ mod tests {
     fn finds_active_firewall_rules_by_internal_name() {
         let powershell = system_tool("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
         let program = installed_exe().unwrap();
-        assert!(firewall_ready(&powershell, &program).unwrap());
-        assert!(!firewall_ready(&powershell, &program.with_file_name("other.exe")).unwrap());
+        assert!(matches!(firewall_state(&powershell, &program), Firewall::Ready));
+        assert!(matches!(firewall_state(&powershell, &program.with_file_name("other.exe")), Firewall::Missing));
     }
 }
 

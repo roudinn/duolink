@@ -30,19 +30,27 @@ try {
     }
     if ($Firewall) {
         Write-Output 'Configuring firewall'
-        Get-NetFirewallRule -Name 'DuoLink-v1-*', 'DuoLink-v2-*', 'DuoLink-v3-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-        # A rule left over from a dismissed Windows prompt would block DuoLink outright.
-        if ($Program) {
-            Get-NetFirewallApplicationFilter -Program $Program -ErrorAction SilentlyContinue |
-                Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' } |
-                Remove-NetFirewallRule
+        # Firewall setup is best-effort: if the service is disabled or the call
+        # is denied, the ports are not being filtered, so streaming still works.
+        # Never let a firewall error abort the install/stream start.
+        try {
+            Get-NetFirewallRule -Name 'DuoLink-v1-*', 'DuoLink-v2-*', 'DuoLink-v3-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+            # A rule left over from a dismissed Windows prompt would block DuoLink outright.
+            if ($Program) {
+                Get-NetFirewallApplicationFilter -Program $Program -ErrorAction SilentlyContinue |
+                    Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' } |
+                    Remove-NetFirewallRule
+            }
+            # One UDP port carries the whole stream. Sunshine itself only listens on 127.0.0.1.
+            New-NetFirewallRule -Name 'DuoLink-v3-Tunnel' -DisplayName 'DuoLink' -Direction Inbound -Action Allow `
+                -Protocol UDP -LocalPort $Port -Profile Any | Out-Null
+            if ($Program) {
+                New-NetFirewallRule -Name 'DuoLink-v3-App' -DisplayName 'DuoLink (приложение)' -Direction Inbound -Action Allow `
+                    -Program $Program -Protocol UDP -Profile Any | Out-Null
+            }
         }
-        # One UDP port carries the whole stream. Sunshine itself only listens on 127.0.0.1.
-        New-NetFirewallRule -Name 'DuoLink-v3-Tunnel' -DisplayName 'DuoLink' -Direction Inbound -Action Allow `
-            -Protocol UDP -LocalPort $Port -Profile Any | Out-Null
-        if ($Program) {
-            New-NetFirewallRule -Name 'DuoLink-v3-App' -DisplayName 'DuoLink (приложение)' -Direction Inbound -Action Allow `
-                -Program $Program -Protocol UDP -Profile Any | Out-Null
+        catch {
+            Write-Output "Firewall setup skipped (not fatal): $($_.Exception.Message)"
         }
     }
     if ($restartNeeded) { exit 20 }
