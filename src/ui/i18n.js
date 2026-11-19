@@ -194,7 +194,7 @@ const EN = Object.freeze({
   "Ник — от 3 до 16 символов.": "Use a nickname of 3–16 characters.",
   "Только латинские буквы, цифры и _ . -": "Use only A–Z, numbers and _ . -",
   "Нужен ник с тегом: name#1234": "Use a nickname with a tag, like name#1234",
-  "После # — четыре цифры.": "Use four digits after #.",
+  "После # — до четырёх цифр.": "Use up to four digits after #.",
   "Это не код друга.": "Invalid friend code.",
   "Код друга повреждён.": "Invalid friend code.",
   "Ключ друга недействителен.": "The friend's key is invalid.",

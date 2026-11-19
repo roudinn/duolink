@@ -528,7 +528,7 @@ impl App {
     fn sync(&mut self) {
         self.me = MeView {
             name: self.identity.name.clone(),
-            tag: format!("{:04}", friends::tag(&self.identity.public)),
+            tag: friends::tag_label(&self.identity.name, &self.identity.public),
             chosen: self.identity.chosen,
         };
         self.friends = self
@@ -540,7 +540,7 @@ impl App {
                 Some(FriendView {
                     id: f.id(),
                     name: f.name.clone(),
-                    tag: format!("{:04}", friends::tag(&key)),
+                    tag: friends::tag_label(&f.name, &key),
                     status: f.status.clone(),
                     sending: self.sending_requests.contains(&key),
                 })

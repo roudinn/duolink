@@ -78,17 +78,42 @@ pub fn tag(key: &[u8; 32]) -> u16 {
     (u32::from_be_bytes(hash[..4].try_into().unwrap()) % 10_000) as u16
 }
 
-pub fn handle(name: &str, key: &[u8; 32]) -> String {
-    format!("{name}#{:04}", tag(key))
+/// Creator nicknames get a fixed, memorable tag instead of the key-derived one.
+/// Everyone else keeps the tag derived from their public key.
+const CREATORS: [(&str, &str); 2] = [("roud", "1"), ("maxudgorade", "05")];
+
+fn creator_tag(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    CREATORS.iter().find(|(nick, _)| *nick == lower).map(|(_, tag)| *tag)
 }
 
-/// Parses `nickname#1234`.
+/// The numeric tag used in the directory: fixed for creators, key-derived otherwise.
+pub fn tag_for(name: &str, key: &[u8; 32]) -> u16 {
+    match creator_tag(name) {
+        Some(fixed) => fixed.parse().unwrap_or_else(|_| tag(key)),
+        None => tag(key),
+    }
+}
+
+/// The tag as shown after `#`: creators keep their short form, others use 4 digits.
+pub fn tag_label(name: &str, key: &[u8; 32]) -> String {
+    match creator_tag(name) {
+        Some(fixed) => fixed.to_string(),
+        None => format!("{:04}", tag(key)),
+    }
+}
+
+pub fn handle(name: &str, key: &[u8; 32]) -> String {
+    format!("{name}#{}", tag_label(name, key))
+}
+
+/// Parses `nickname#1234` (creators may use a short `#1` / `#05`).
 pub fn parse_handle(text: &str) -> Result<(String, u16)> {
     let (name, number) = text.trim().rsplit_once('#').context("Нужен ник с тегом: name#1234")?;
     let name = valid_nickname(name)?;
     ensure!(
-        number.len() == 4 && number.chars().all(|c| c.is_ascii_digit()),
-        "После # — четыре цифры."
+        (1..=4).contains(&number.len()) && number.chars().all(|c| c.is_ascii_digit()),
+        "После # — до четырёх цифр."
     );
     Ok((name, number.parse()?))
 }
@@ -396,12 +421,12 @@ pub fn deliver(envelope: &str, to: &[u8; 32]) -> Result<()> {
 
 /// Lists us in the directory under `name#tag`. Call off the UI thread.
 pub fn announce(name: &str, public: &[u8; 32]) -> Result<()> {
-    post(&directory_topic(name, tag(public)), &URL_SAFE_NO_PAD.encode(public))
+    post(&directory_topic(name, tag_for(name, public)), &URL_SAFE_NO_PAD.encode(public))
 }
 
 /// The directory commits a successful POST before replying.
 pub fn publish_nickname(name: &str, public: &[u8; 32]) -> Result<()> {
-    let topic = directory_topic(name, tag(public));
+    let topic = directory_topic(name, tag_for(name, public));
     let envelope = URL_SAFE_NO_PAD.encode(public);
     let mut last_status = 0u16;
     for attempt in 0..3 {
@@ -443,7 +468,7 @@ pub fn lookup(name: &str, wanted: u16) -> Result<[u8; 32]> {
                     .filter_map(|event| URL_SAFE_NO_PAD.decode(event.message.trim()).ok())
                     .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
                     // The tag is a function of the key: an entry that does not match is forged.
-                    .filter(|key| tag(key) == wanted)
+                    .filter(|key| tag_for(name, key) == wanted)
                     .collect();
                 break;
             }
@@ -603,10 +628,15 @@ mod tests {
         assert!(valid_nickname("player_one.2-x").is_ok());
         assert!(valid_nickname("seventeen_chars_x").is_err());
         let key = [3u8; 32];
-        let text = handle("roud", &key);
-        assert_eq!(parse_handle(&text).unwrap(), ("roud".into(), tag(&key)));
-        assert!(parse_handle("roud#12").is_err());
-        assert!(parse_handle("roud").is_err());
+        let text = handle("bob", &key);
+        assert_eq!(parse_handle(&text).unwrap(), ("bob".into(), tag(&key)));
+        assert!(parse_handle("bob#12345").is_err());
+        assert!(parse_handle("bob").is_err());
+        // Creators keep their short, fixed tags.
+        assert_eq!(handle("roud", &key), "roud#1");
+        assert_eq!(parse_handle("roud#1").unwrap(), ("roud".into(), 1));
+        assert_eq!(handle("maxudgorade", &key), "maxudgorade#05");
+        assert_eq!(parse_handle("maxudgorade#05").unwrap(), ("maxudgorade".into(), 5));
         // Different keys almost always get different tags.
         let tags: HashSet<u16> = (0u8..50).map(|i| tag(&[i; 32])).collect();
         assert!(tags.len() > 45);
