@@ -41,10 +41,6 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
 const SILENCE: Duration = Duration::from_secs(6);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(90);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-/// The automatic bitrate restart reopens Moonlight, which recreates the virtual
-/// gamepad. Games commonly stop reacting to pads after that, so only allow it
-/// while the stream is still warming up.
-const BITRATE_RESTART_WINDOW: Duration = Duration::from_secs(60);
 const CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(9);
 const MEDIA_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -617,16 +613,7 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
             && let Some((at, kbps)) = guests.iter().enumerate()
                 .find_map(|(at, guest)| guest.pending_bitrate.map(|kbps| (at, kbps)))
         {
-            // Reopening Moonlight destroys and recreates the virtual gamepad,
-            // and many games (EA FC, fighting games) stop reacting to pads for
-            // the rest of the match when that happens. Only allow the bitrate
-            // restart while the stream is still warming up.
-            if guests[at].since.elapsed() < BITRATE_RESTART_WINDOW {
-                start_backoff(&mut guests, at, kbps, disconnected);
-            } else {
-                guests[at].pending_bitrate = None;
-                guests[at].backoff = None;
-            }
+            start_backoff(&mut guests, at, kbps, disconnected);
         }
         if let Some(at) = guests.iter().position(|g| {
             matches!(g.restart, Some(StreamRestart::Waiting { after, disconnected: before, .. })
