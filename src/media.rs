@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -440,66 +440,15 @@ impl Codec {
     }
 }
 
-/// Sunshine advertises codec support after probing the encoder it will use.
-fn sunshine_codecs(address: Ipv4Addr) -> Result<u32> {
-    let mut socket = TcpStream::connect_timeout(&(address, MEDIA_PORT).into(), Duration::from_secs(1))?;
-    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
-    socket.write_all(b"GET /serverinfo HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
-    let mut reply = String::new();
-    socket.take(16 * 1024).read_to_string(&mut reply)?;
-    let (_, field) = reply.split_once("<ServerCodecModeSupport>").context("Missing Sunshine codec flags")?;
-    let (value, _) = field.split_once("</ServerCodecModeSupport>").context("Invalid Sunshine codec flags")?;
-    Ok(value.parse()?)
-}
-
-pub(crate) fn automatic_codec(address: Ipv4Addr, mode: Mode, prefs: Preferences) -> Codec {
+pub(crate) fn automatic_codec(_address: Ipv4Addr, _mode: Mode, prefs: Preferences) -> Codec {
     if prefs.codec != Codec::Auto || prefs.yuv444 {
         return prefs.codec;
     }
-    let Ok(codecs) = sunshine_codecs(address) else { return Codec::Auto };
-    use windows::Win32::Graphics::{
-        Direct3D::D3D_DRIVER_TYPE_HARDWARE,
-        Direct3D11::{
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0,
-            D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
-            D3D11_SDK_VERSION, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11VideoDevice,
-        },
-        Dxgi::{IDXGIAdapter, Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010}},
-    };
-    use windows::core::Interface;
-
-    let mut device = None;
-    if unsafe { D3D11CreateDevice(None::<&IDXGIAdapter>, D3D_DRIVER_TYPE_HARDWARE,
-        Default::default(), D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION,
-        Some(&mut device), None, None) }.is_err()
-    {
-        return Codec::Auto;
-    }
-    let Some(video) = device.and_then(|device| device.cast::<ID3D11VideoDevice>().ok()) else {
-        return Codec::Auto;
-    };
-    // Flags from moonlight-common-c. Keep Sunshine's auto advertisement so it
-    // can expose HDR profiles and keep its preferred hardware encoder.
-    let (av1, hevc, hevc_profile, format) = if prefs.hdr {
-        (0x20000, 0x200, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010)
-    } else {
-        (0x10000, 0x100, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_NV12)
-    };
-    for (codec, flag, profile) in [
-        (Codec::Av1, av1, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0),
-        (Codec::Hevc, hevc, hevc_profile),
-    ] {
-        let desc = D3D11_VIDEO_DECODER_DESC {
-            Guid: profile,
-            SampleWidth: mode.width,
-            SampleHeight: mode.height,
-            OutputFormat: format,
-        };
-        if codecs & flag != 0 && unsafe { video.GetVideoDecoderConfigCount(&desc) }.is_ok_and(|count| count > 0) {
-            return codec;
-        }
-    }
+    // Pre-selecting AV1/HEVC from a local D3D11 probe is unreliable: some
+    // drivers report a decoder and then fail on the actual stream, so Moonlight
+    // exits during startup and DuoLink restarts it on H.264 — the guest sees a
+    // brief flash. Let Moonlight's own `--video-codec auto` negotiate instead,
+    // which falls back to H.264 within the same session, without a restart.
     Codec::Auto
 }
 
