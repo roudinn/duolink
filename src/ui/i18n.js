@@ -81,6 +81,7 @@ const EN = Object.freeze({
   "Открывает игру…": "Opening the game…",
   "Отключить": "Remove",
   "Позван": "Invited",
+  "Позвать снова": "Invite again",
   "Игроки": "Players",
   "Хост отключил вас.": "The host removed you.",
   "Канал хоста занят. Снизьте битрейт или подключитесь позже.": "The host's upload is full. Lower the bitrate or try again later.",

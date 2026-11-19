@@ -851,9 +851,15 @@ impl App {
                         self.host_for.clear();
                         self.host_for.push(HostFor { name: friend.handle(), key, sent_at: None, joined: false });
                         self.begin_hosting();
-                    } else if lobby_open && !self.host_for.iter().any(|t| t.key == key) {
-                        // More friends into the running lobby.
-                        self.host_for.push(HostFor { name: friend.handle(), key, sent_at: None, joined: false });
+                    } else if lobby_open {
+                        // More friends into the running lobby; inviting again
+                        // re-sends the code even if the first invite was missed.
+                        if let Some(target) = self.host_for.iter_mut().find(|t| t.key == key) {
+                            target.sent_at = None;
+                            target.joined = false;
+                        } else {
+                            self.host_for.push(HostFor { name: friend.handle(), key, sent_at: None, joined: false });
+                        }
                     }
                 }
             }
@@ -959,6 +965,13 @@ impl App {
         // Friend invite: hand the session code to the friend once it exists.
         let mut invites_to_send = Vec::new();
         let lobby_ready = matches!(self.host.phase, Phase::Invite | Phase::Live) && !self.host.code.is_empty();
+        let present: std::collections::HashSet<String> =
+            self.host.players.iter().map(|p| p.name.clone()).collect();
+        // A guest who joined and then left may be invited again.
+        self.host_for.retain(|target| {
+            let nick = target.name.split('#').next().unwrap_or_default();
+            !target.joined || present.contains(nick)
+        });
         for target in &mut self.host_for {
             if target.sent_at.is_none() && lobby_ready {
                 let at = friends::now();
@@ -966,7 +979,7 @@ impl App {
                 invites_to_send.push((target.key, at));
             }
             let nick = target.name.split('#').next().unwrap_or_default();
-            target.joined |= self.host.players.iter().any(|p| p.name == nick);
+            target.joined |= present.contains(nick);
         }
         for (key, at) in invites_to_send {
             let message = Message::Invite { name: self.identity.name.clone(), code: self.host.code.clone(), at };

@@ -305,7 +305,7 @@ function friendRow(friend, busy, invited) {
     }
     row.append(removeButton(friend));
   } else {
-    const invite = button(invited ? "Позван" : "Позвать", "invite_friend", friend.id, false, busy || invited);
+    const invite = button(invited ? "Позвать снова" : "Позвать", "invite_friend", friend.id, false, busy);
     if (busy) invite.title = tr("Сначала завершите сессию");
     row.append(invite, removeButton(friend));
   }
