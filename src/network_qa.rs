@@ -211,10 +211,7 @@ async fn shaped_run(
         let (host, _) = connections[0].clone();
         let pinger = Pinger::new();
         // The receiver below echoes pings and updates this same host clock.
-        let sender = DatagramSender::new(host.clone());
-        let sending = sender.clone();
-        tasks.spawn(async move { sending.run().await });
-        tasks.spawn(ping_loop(host.clone(), pinger.clone(), sender));
+        tasks.spawn(ping_loop(host.clone(), pinger.clone()));
         let reader = pinger.clone();
         let stats = host.clone();
         tasks.spawn(async move {

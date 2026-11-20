@@ -500,7 +500,8 @@ fn host(worker: &Worker, commands: Receiver<Command>, data: PathBuf) -> Result<S
                             }),
                             bandwidth: None,
                             bitrate_kbps: 0,
-                            bitrate_restart,
+                            // Changing Moonlight bitrate requires closing the live stream.
+                            bitrate_restart: cfg!(test) && bitrate_restart,
                             backoff: None,
                             pending_bitrate: None,
                             restart: None,

@@ -722,11 +722,11 @@ impl UploadSample {
 }
 
 /// Answers and times pings; true when the datagram was one.
-fn ping_datagram(sender: &DatagramSender, pool: &mut PacketPool, pinger: &Pinger, port: u16, payload: &[u8]) -> bool {
+fn ping_datagram(conn: &Connection, pinger: &Pinger, port: u16, payload: &[u8]) -> bool {
     match port {
         PING_PORT => {
             if payload.len() == 8 {
-                sender.enqueue(pool, PONG_PORT, payload, true);
+                let _ = conn.send_datagram(tag(PONG_PORT, payload));
             }
             true
         }
@@ -738,10 +738,10 @@ fn ping_datagram(sender: &DatagramSender, pool: &mut PacketPool, pinger: &Pinger
     }
 }
 
-async fn ping_loop(conn: Connection, pinger: Arc<Pinger>, sender: Arc<DatagramSender>) {
-    let mut pool = PacketPool::new(false);
+async fn ping_loop(conn: Connection, pinger: Arc<Pinger>) {
+    // Keep RTT probes out of the media forwarding queue.
     while conn.close_reason().is_none() {
-        sender.enqueue(&mut pool, PING_PORT, &pinger.stamp(), true);
+        let _ = conn.send_datagram(tag(PING_PORT, &pinger.stamp()));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -809,7 +809,7 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
     let sender = DatagramSender::new(conn.clone());
     let sending = sender.clone();
     tasks.spawn(async move { sending.run().await });
-    tasks.spawn(ping_loop(conn.clone(), pinger.clone(), sender.clone()));
+    tasks.spawn(ping_loop(conn.clone(), pinger.clone()));
     let mut sockets = HashMap::new();
     for port in UDP_PORTS {
         let Ok(socket) = UdpSocket::bind((HOST_LOOPBACK, 0)).await else { return };
@@ -839,13 +839,12 @@ async fn serve_host(conn: Connection, pinger: Arc<Pinger>, ports: Arc<Mutex<Link
     {
         let conn = conn.clone();
         tasks.spawn(async move {
-            let mut pings = PacketPool::new(false);
             while let Ok(datagram) = conn.read_datagram().await {
                 if datagram.len() < 2 {
                     continue;
                 }
                 let port = u16::from_be_bytes([datagram[0], datagram[1]]);
-                if ping_datagram(&sender, &mut pings, &pinger, port, &datagram[2..]) {
+                if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
                     continue;
                 }
                 // The guest's audio hello registers its local playback socket.
@@ -910,7 +909,7 @@ async fn serve_guest(
     let sender = DatagramSender::new(conn.clone());
     let sending = sender.clone();
     tasks.spawn(async move { sending.run().await });
-    tasks.spawn(ping_loop(conn.clone(), pinger.clone(), sender.clone()));
+    tasks.spawn(ping_loop(conn.clone(), pinger.clone()));
     for (port, listener) in listeners {
         let conn = conn.clone();
         tasks.spawn(async move {
@@ -948,14 +947,13 @@ async fn serve_guest(
             }
         });
     }
-    let mut pings = PacketPool::new(false);
     let mut video_batch = 0;
     while let Ok(datagram) = conn.read_datagram().await {
         if datagram.len() < 2 {
             continue;
         }
         let port = u16::from_be_bytes([datagram[0], datagram[1]]);
-        if ping_datagram(&sender, &mut pings, &pinger, port, &datagram[2..]) {
+        if ping_datagram(&conn, &pinger, port, &datagram[2..]) {
             continue;
         }
         if port == PROBE_PORT {
