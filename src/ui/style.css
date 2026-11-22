@@ -303,7 +303,53 @@ dialog h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
 #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); width: max-content; max-width: calc(100vw - 48px); padding: 12px 20px; border-radius: var(--group); text-align: center; background: var(--press); box-shadow: 0 10px 30px rgb(0 0 0 / .5); font-size: 14px; font-weight: 500; animation: toast 200ms var(--ease-out); }
 @keyframes toast { from { opacity: 0; transform: translate(-50%, 8px); } }
 
+/* Feedback for controls and panels that change state in place. */
+.btn, .round, .inner {
+  transition: background-color 150ms, border-color 150ms, color 150ms, opacity 150ms, scale 160ms var(--ease-out);
+}
+:is(.btn, .round, .inner):not(:disabled):active { scale: .97; }
+.field, .inline { transition: border-color 150ms, outline-color 150ms, background-color 150ms; }
+input[role="switch"]::after { transition: transform 180ms var(--ease-out); }
+input[role="switch"]:active::after { scale: 1.08 .94; }
+
+button:is([data-action="copy"], [data-action="copy_code"], #me-chip, #update-check) { position: relative; }
+.is-copied::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  pointer-events: none;
+  border: 1px solid currentColor;
+  border-radius: inherit;
+  animation: copy-confirm 200ms var(--ease-out) both;
+  opacity: .35;
+}
+@keyframes copy-confirm { from { opacity: 0; scale: .96; } }
+
+#update-check:is([data-update-state="checking"], [data-update-state="downloading"])::before {
+  content: "";
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 800ms linear infinite;
+}
+#update-check:is([data-update-state="current"], [data-update-state="ready"])::before {
+  content: "";
+  width: 9px;
+  height: 5px;
+  flex: none;
+  margin-top: -3px;
+  border: solid currentColor;
+  border-width: 0 0 1.5px 1.5px;
+  rotate: -45deg;
+  animation: control-confirm 180ms var(--ease-out) both;
+}
+@keyframes control-confirm { from { opacity: 0; scale: .6; } }
+
 @media (prefers-reduced-motion: reduce) {
+  input[role="switch"]:active::after, :is(.btn, .round, .inner):active { scale: none !important; }
   *, *::before, *::after, details::details-content { animation: none !important; transition: none !important; }
 }
 

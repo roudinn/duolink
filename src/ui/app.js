@@ -410,9 +410,12 @@ function renderSettings(next) {
   };
   text("update-note", notes[u.state] ?? pick(`Версия ${next.version}`, `Version ${next.version}`));
   text("update-check", tr(ready ? "Перезапустить" : "Проверить"));
-  $("update-check").dataset.action = ready ? "restart" : "check_update";
-  $("update-check").classList.toggle("primary", ready && !busy);
-  $("update-check").disabled = ["checking", "downloading"].includes(u.state) || (ready && busy);
+  const updateButton = $("update-check");
+  const updatePending = ["checking", "downloading"].includes(u.state);
+  updateButton.dataset.action = ready ? "restart" : "check_update";
+  if (updateButton.dataset.updateState !== u.state) updateButton.dataset.updateState = u.state;
+  updateButton.classList.toggle("primary", ready && !busy);
+  updateButton.disabled = updatePending || (ready && busy);
   const downloading = u.state === "downloading";
   show("update-banner", (ready || downloading) && !busy);
   show("update-restart", ready);
@@ -479,7 +482,21 @@ function updateState(next) {
   if (next.guest.codeError && !prev?.guest.codeError && !settings.open && view === "play") guestCode.focus();
 }
 
+const copyFeedbackTargets = new Map([
+  ["Код скопирован", 'button[data-action="copy"]'],
+  ["Ник скопирован", "#me-chip"],
+  ["Код друга скопирован", 'button[data-action="copy_code"]'],
+]);
+const copyFeedbackTimers = new WeakMap();
+
 function toast(message) {
+  const target = copyFeedbackTargets.get(message);
+  const button = target && document.querySelector(target);
+  if (button) {
+    clearTimeout(copyFeedbackTimers.get(button));
+    button.classList.add("is-copied");
+    copyFeedbackTimers.set(button, setTimeout(() => button.classList.remove("is-copied"), 900));
+  }
   message = notice(message);
   if (settings.open) {
     line("settings-feedback", message);
